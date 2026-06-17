@@ -12,7 +12,7 @@ import (
 	"github.com/free5gc/pcf/internal/logger"
 	"github.com/free5gc/pcf/internal/util"
 	"github.com/free5gc/util/metrics/sbi"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/pcf/internal/dbtrace"
 )
 
 func (p *Processor) HandleAmfStatusChangeNotify(
@@ -99,7 +99,7 @@ func (p *Processor) HandleInfluenceDataUpdateNotify(
 				"dnn":    "",
 				"filter": "",
 			}
-			chargingInterface, err := mongoapi.RestfulAPIGetOne(chargingDataColl, filterCharging, 2)
+			chargingInterface, err := dbtrace.RestfulAPIGetOne(chargingDataColl, filterCharging, 2)
 			if err != nil {
 				logger.SmPolicyLog.Errorf("Fail to get charging data to mongoDB err: %+v", err)
 				chgData = nil
@@ -134,7 +134,7 @@ func (p *Processor) HandleInfluenceDataUpdateNotify(
 
 				chargingInterface["ratingGroup"] = chgData.RatingGroup
 				logger.SmPolicyLog.Tracef("put ratingGroup[%+v] for [%+v] to MongoDB", chgData.RatingGroup, ue.Supi)
-				if _, err = mongoapi.RestfulAPIPutOne(
+				if _, err = dbtrace.RestfulAPIPutOne(
 					chargingDataColl, chargingInterface, chargingInterface, 2); err != nil {
 					logger.SmPolicyLog.Errorf("Fail to put charging data to mongoDB err: %+v", err)
 				} else {

@@ -18,7 +18,7 @@ import (
 	"github.com/free5gc/pcf/internal/util"
 	"github.com/free5gc/util/flowdesc"
 	"github.com/free5gc/util/metrics/sbi"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/pcf/internal/dbtrace"
 )
 
 const (
@@ -174,7 +174,7 @@ func (p *Processor) HandleCreateSmPolicyRequest(
 	}
 
 	filter := bson.M{"ueId": ue.Supi, "snssai": util.SnssaiModelsToHex(*request.SliceInfo), "dnn": request.Dnn}
-	qosFlowInterface, err := mongoapi.RestfulAPIGetMany(qosFlowDataColl, filter, queryStrength)
+	qosFlowInterface, err := dbtrace.RestfulAPIGetMany(qosFlowDataColl, filter, queryStrength)
 	if err != nil {
 		logger.SmPolicyLog.Errorf("createSMPolicyProcedure error: %+v", err)
 	}
@@ -189,7 +189,7 @@ func (p *Processor) HandleCreateSmPolicyRequest(
 	}
 
 	// get flow rules from databases
-	flowRulesInterface, err := mongoapi.RestfulAPIGetMany(flowRuleDataColl, filter, queryStrength)
+	flowRulesInterface, err := dbtrace.RestfulAPIGetMany(flowRuleDataColl, filter, queryStrength)
 	if err != nil {
 		logger.SmPolicyLog.Errorf("createSMPolicyProcedure error: %+v", err)
 	}
@@ -204,7 +204,7 @@ func (p *Processor) HandleCreateSmPolicyRequest(
 		"filter": "",
 	}
 
-	chargingInterface, err := mongoapi.RestfulAPIGetOne(chargingDataColl, filterCharging, queryStrength)
+	chargingInterface, err := dbtrace.RestfulAPIGetOne(chargingDataColl, filterCharging, queryStrength)
 
 	if err != nil {
 		logger.SmPolicyLog.Errorf("Fail to get charging data to mongoDB err: %+v", err)
@@ -238,7 +238,7 @@ func (p *Processor) HandleCreateSmPolicyRequest(
 
 		chargingInterface["ratingGroup"] = chgData.RatingGroup
 		logger.SmPolicyLog.Tracef("put ratingGroup[%+v] for [%+v] to MongoDB", chgData.RatingGroup, ue.Supi)
-		if _, err = mongoapi.RestfulAPIPutOne(
+		if _, err = dbtrace.RestfulAPIPutOne(
 			chargingDataColl, chargingInterface, chargingInterface, queryStrength); err != nil {
 			logger.SmPolicyLog.Errorf("Fail to put charging data to mongoDB err: %+v", err)
 		}
@@ -304,7 +304,7 @@ func (p *Processor) HandleCreateSmPolicyRequest(
 				"filter": val,
 			}
 			var chargingInterface map[string]interface{}
-			chargingInterface, err = mongoapi.RestfulAPIGetOne(chargingDataColl, filterCharging, 2)
+			chargingInterface, err = dbtrace.RestfulAPIGetOne(chargingDataColl, filterCharging, 2)
 			if err != nil {
 				logger.SmPolicyLog.Errorf("Fail to get charging data to mongoDB err: %+v", err)
 			} else {
@@ -338,7 +338,7 @@ func (p *Processor) HandleCreateSmPolicyRequest(
 
 				chargingInterface["ratingGroup"] = chgData.RatingGroup
 				logger.SmPolicyLog.Tracef("put ratingGroup[%+v] for [%+v] to MongoDB", chgData.RatingGroup, ue.Supi)
-				if _, err = mongoapi.RestfulAPIPutOne(
+				if _, err = dbtrace.RestfulAPIPutOne(
 					chargingDataColl, chargingInterface, chargingInterface, queryStrength); err != nil {
 					logger.SmPolicyLog.Errorf("Fail to put charging data to mongoDB err: %+v", err)
 				} else {
@@ -406,7 +406,7 @@ func (p *Processor) HandleCreateSmPolicyRequest(
 				"dnn":    "",
 				"filter": "",
 			}
-			chargingInterface, err = mongoapi.RestfulAPIGetOne(chargingDataColl, filterCharging, queryStrength)
+			chargingInterface, err = dbtrace.RestfulAPIGetOne(chargingDataColl, filterCharging, queryStrength)
 			if err != nil {
 				logger.SmPolicyLog.Errorf("Fail to get charging data to mongoDB err: %+v", err)
 				chgData = nil
@@ -441,7 +441,7 @@ func (p *Processor) HandleCreateSmPolicyRequest(
 
 				chargingInterface["ratingGroup"] = chgData.RatingGroup
 				logger.SmPolicyLog.Tracef("put ratingGroup[%+v] for [%+v] to MongoDB", chgData.RatingGroup, ue.Supi)
-				if _, err = mongoapi.RestfulAPIPutOne(
+				if _, err = dbtrace.RestfulAPIPutOne(
 					chargingDataColl, chargingInterface, chargingInterface, queryStrength); err != nil {
 					logger.SmPolicyLog.Errorf("Fail to put charging data to mongoDB err: %+v", err)
 				} else {
@@ -574,7 +574,7 @@ func (p *Processor) HandleDeleteSmPolicyContextRequest(
 		filterCharging := bson.M{
 			"ratingGroup": ratingGroup,
 		}
-		err := mongoapi.RestfulAPIDeleteMany(chargingDataColl, filterCharging)
+		err := dbtrace.RestfulAPIDeleteMany(chargingDataColl, filterCharging)
 		if err != nil {
 			logger.SmPolicyLog.Errorf("Fail to delete charging data, ratingGroup: %+v, err: %+v", ratingGroup, err)
 		}

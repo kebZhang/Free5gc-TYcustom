@@ -20,7 +20,7 @@ import (
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/udr/internal/util"
 	"github.com/free5gc/util/metrics/sbi"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/udr/internal/dbtrace"
 )
 
 func (p *Processor) CreateSmfContextNon3gppProcedure(c *gin.Context, SmfRegistration models.SmfRegistration,
@@ -31,7 +31,7 @@ func (p *Processor) CreateSmfContextNon3gppProcedure(c *gin.Context, SmfRegistra
 	putData["pduSessionId"] = int32(pduSessionIdInt)
 
 	filter := bson.M{"ueId": ueId, "pduSessionId": pduSessionIdInt}
-	existed, err := mongoapi.RestfulAPIPutOne(collName, filter, putData)
+	existed, err := dbtrace.RestfulAPIPutOne(collName, filter, putData)
 	if err != nil {
 		logger.DataRepoLog.Errorf("CreateSmfContextNon3gppProcedure err: %+v", err)
 		problemDetails := util.ProblemDetailsSystemFailure(err.Error())

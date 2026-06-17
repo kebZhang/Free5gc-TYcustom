@@ -19,7 +19,7 @@ import (
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/oauth"
 	timedecode "github.com/free5gc/util/mapstruct"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/nrf/internal/dbtrace"
 )
 
 func (p *Processor) HandleNFDeregisterRequest(c *gin.Context, nfInstanceId string) {
@@ -157,7 +157,7 @@ func (p *Processor) CreateSubscriptionProcedure(
 	}
 
 	// TODO: need to store Condition !
-	existed, err := mongoapi.RestfulAPIPost("Subscriptions", bson.M{"subscriptionId": subscription.SubscriptionId},
+	existed, err := dbtrace.RestfulAPIPost("Subscriptions", bson.M{"subscriptionId": subscription.SubscriptionId},
 		putData) // subscription id not exist before
 	if err != nil || existed {
 		if err != nil {
@@ -176,10 +176,10 @@ func (p *Processor) UpdateSubscriptionProcedure(subscriptionID string, patchJSON
 	collName := "Subscriptions"
 	filter := bson.M{"subscriptionId": subscriptionID}
 
-	if err := mongoapi.RestfulAPIJSONPatch(collName, filter, patchJSON); err != nil {
+	if err := dbtrace.RestfulAPIJSONPatch(collName, filter, patchJSON); err != nil {
 		return nil
 	} else {
-		if response, err1 := mongoapi.RestfulAPIGetOne(collName, filter); err1 == nil {
+		if response, err1 := dbtrace.RestfulAPIGetOne(collName, filter); err1 == nil {
 			return response
 		}
 		return nil
@@ -190,7 +190,7 @@ func (p *Processor) RemoveSubscriptionProcedure(subscriptionID string) {
 	collName := "Subscriptions"
 	filter := bson.M{"subscriptionId": subscriptionID}
 
-	if err := mongoapi.RestfulAPIDeleteMany(collName, filter); err != nil {
+	if err := dbtrace.RestfulAPIDeleteMany(collName, filter); err != nil {
 		logger.NfmLog.Errorf("RemoveSubscriptionProcedure err: %+v", err)
 	}
 }
@@ -203,7 +203,7 @@ func (p *Processor) GetNFInstancesProcedure(nfType string, limit int) (*nrf_cont
 		filter = bson.M{}
 	}
 
-	ULs, err := mongoapi.RestfulAPIGetMany(collName, filter)
+	ULs, err := dbtrace.RestfulAPIGetMany(collName, filter)
 	if err != nil {
 		logger.NfmLog.Errorf("GetNFInstancesProcedure err: %+v", err)
 		problemDetail := &models.ProblemDetails{
@@ -242,7 +242,7 @@ func (p *Processor) NFDeregisterProcedure(nfInstanceID string) *models.ProblemDe
 	collName := nrf_context.NfProfileCollName
 	filter := bson.M{"nfInstanceId": nfInstanceID}
 
-	nfProfilesRaw, err := mongoapi.RestfulAPIGetMany(collName, filter)
+	nfProfilesRaw, err := dbtrace.RestfulAPIGetMany(collName, filter)
 	if err != nil {
 		logger.NfmLog.Errorf("NFDeregisterProcedure err: %+v", err)
 		problemDetail := &models.ProblemDetails{
@@ -256,7 +256,7 @@ func (p *Processor) NFDeregisterProcedure(nfInstanceID string) *models.ProblemDe
 	const dbWaitTime = time.Duration(500) * time.Millisecond
 	time.Sleep(dbWaitTime)
 
-	if err = mongoapi.RestfulAPIDeleteMany(collName, filter); err != nil {
+	if err = dbtrace.RestfulAPIDeleteMany(collName, filter); err != nil {
 		logger.NfmLog.Errorf("NFDeregisterProcedure err: %+v", err)
 		problemDetail := &models.ProblemDetails{
 			Title:  "System failure",
@@ -305,7 +305,7 @@ func (p *Processor) NFDeregisterProcedure(nfInstanceID string) *models.ProblemDe
 	collNameURI := "urilist"
 	filterURI := bson.M{"nfType": nfProfiles[0].NfType}
 	putData := bson.M{"_link.item": bson.M{"href": nfInstanceUri}, "multi": true}
-	if err = mongoapi.RestfulAPIPullOne(collNameURI, filterURI, putData); err != nil {
+	if err = dbtrace.RestfulAPIPullOne(collNameURI, filterURI, putData); err != nil {
 		logger.NfmLog.Errorf("NFDeregisterProcedure err: %+v", err)
 		problemDetail := &models.ProblemDetails{
 			Title:  "System failure",
@@ -331,12 +331,12 @@ func (p *Processor) UpdateNFInstanceProcedure(nfInstanceID string, patchJSON []b
 	collName := nrf_context.NfProfileCollName
 	filter := bson.M{"nfInstanceId": nfInstanceID}
 
-	if err := mongoapi.RestfulAPIJSONPatch(collName, filter, patchJSON); err != nil {
+	if err := dbtrace.RestfulAPIJSONPatch(collName, filter, patchJSON); err != nil {
 		logger.NfmLog.Errorf("UpdateNFInstanceProcedure err: %+v", err)
 		return nil
 	}
 
-	nf, err := mongoapi.RestfulAPIGetOne(collName, filter)
+	nf, err := dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		logger.NfmLog.Errorf("UpdateNFInstanceProcedure err: %+v", err)
 		return nil
@@ -371,7 +371,7 @@ func (p *Processor) UpdateNFInstanceProcedure(nfInstanceID string, patchJSON []b
 func (p *Processor) GetNFInstanceProcedure(c *gin.Context, nfInstanceID string) {
 	collName := nrf_context.NfProfileCollName
 	filter := bson.M{"nfInstanceId": nfInstanceID}
-	response, err := mongoapi.RestfulAPIGetOne(collName, filter)
+	response, err := dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		logger.NfmLog.Errorf("GetNFInstanceProcedure err: %+v", err)
 		return
@@ -440,7 +440,7 @@ func (p *Processor) NFRegisterProcedure(
 	filter := bson.M{"nfInstanceId": nfInstanceId}
 
 	// Update NF Profile case
-	existed, err := mongoapi.RestfulAPIPutOne(collName, filter, putData)
+	existed, err := dbtrace.RestfulAPIPutOne(collName, filter, putData)
 	if err != nil {
 		logger.NfmLog.Errorf("NFRegisterProcedure err: %+v", err)
 		problemDetails := &models.ProblemDetails{

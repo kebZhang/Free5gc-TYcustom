@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/free5gc/ausf/internal/accesslog"
 	ausf_context "github.com/free5gc/ausf/internal/context"
 	"github.com/free5gc/ausf/internal/logger"
 	"github.com/free5gc/openapi/models"
@@ -33,6 +34,7 @@ func (s *nudmService) getUdmUeauClient(uri string) *Nudm_UEAU.APIClient {
 	configuration := Nudm_UEAU.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Nudm_UEAU.NewAPIClient(configuration)
 
 	s.ueauMu.RUnlock()

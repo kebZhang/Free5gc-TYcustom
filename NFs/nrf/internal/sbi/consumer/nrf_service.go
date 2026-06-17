@@ -9,6 +9,7 @@ import (
 	"github.com/free5gc/nrf/internal/logger"
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/nrf/NFManagement"
+	"github.com/free5gc/nrf/internal/accesslog"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
 )
 
@@ -34,6 +35,7 @@ func (s *nnrfService) getNFManagementClient(uri string) *NFManagement.APIClient 
 	configuration := NFManagement.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = NFManagement.NewAPIClient(configuration)
 
 	s.nfMngmntMu.RUnlock()

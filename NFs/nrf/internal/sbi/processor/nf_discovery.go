@@ -18,7 +18,7 @@ import (
 	"github.com/free5gc/nrf/internal/util"
 	"github.com/free5gc/openapi/models"
 	timedecode "github.com/free5gc/util/mapstruct"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/nrf/internal/dbtrace"
 	"github.com/free5gc/util/validator"
 )
 
@@ -139,7 +139,7 @@ func (p *Processor) NFDiscoveryProcedure(c *gin.Context, queryParameters url.Val
 	logger.DiscLog.Traceln("Query filter: ", filter)
 
 	// Use the filter to find documents
-	nfProfilesRaw, err := mongoapi.RestfulAPIGetMany(nrf_context.NfProfileCollName, filter)
+	nfProfilesRaw, err := dbtrace.RestfulAPIGetMany(nrf_context.NfProfileCollName, filter)
 	if err != nil {
 		logger.DiscLog.Errorf("NFDiscoveryProcedure err: %+v", err)
 		problemDetails := &models.ProblemDetails{

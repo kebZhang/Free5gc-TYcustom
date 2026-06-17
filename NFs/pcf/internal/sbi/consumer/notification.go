@@ -9,6 +9,7 @@ import (
 	pcf_context "github.com/free5gc/pcf/internal/context"
 	"github.com/free5gc/pcf/internal/logger"
 	"github.com/free5gc/pcf/internal/util"
+	"github.com/free5gc/pcf/internal/accesslog"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
 )
 
@@ -34,6 +35,7 @@ func (s *npcfService) getAMPolicyControl(uri string) *AMPolicyControl.APIClient 
 	configuration := AMPolicyControl.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = AMPolicyControl.NewAPIClient(configuration)
 
 	s.nfAMPolicyControlMu.RUnlock()

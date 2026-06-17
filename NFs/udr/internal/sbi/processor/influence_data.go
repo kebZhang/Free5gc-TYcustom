@@ -20,7 +20,7 @@ import (
 	"github.com/free5gc/openapi/models"
 	udr_context "github.com/free5gc/udr/internal/context"
 	"github.com/free5gc/udr/internal/logger"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/udr/internal/dbtrace"
 )
 
 func (p *Processor) ApplicationDataInfluenceDataGetProcedure(c *gin.Context, collName string, filter []bson.M) (
@@ -29,7 +29,7 @@ func (p *Processor) ApplicationDataInfluenceDataGetProcedure(c *gin.Context, col
 	influenceDataArray := make([]map[string]interface{}, 0)
 	if len(filter) != 0 {
 		var err error
-		influenceDataArray, err = mongoapi.RestfulAPIGetMany(collName, bson.M{"$and": filter})
+		influenceDataArray, err = dbtrace.RestfulAPIGetMany(collName, bson.M{"$and": filter})
 		if err != nil {
 			logger.DataRepoLog.Errorf("ApplicationDataInfluenceDataGetProcedure err: %+v", err)
 			return nil

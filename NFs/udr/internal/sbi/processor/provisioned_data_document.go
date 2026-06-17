@@ -19,6 +19,7 @@ import (
 
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/udr/internal/dbtrace"
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/udr/internal/util"
 	"github.com/free5gc/util/metrics/sbi"
@@ -99,8 +100,7 @@ func (p *Processor) QueryProvisionedDataProcedure(c *gin.Context, ueId string, s
 
 	collName = "subscriptionData.provisionedData.smData"
 	filter = bson.M{"ueId": ueId, "servingPlmnId": servingPlmnId}
-	sessionManagementSubscriptionDatas, err := mongoapi.
-		RestfulAPIGetMany(collName, filter, mongoapi.COLLATION_STRENGTH_IGNORE_CASE)
+	sessionManagementSubscriptionDatas, err := dbtrace.RestfulAPIGetMany(collName, filter, mongoapi.COLLATION_STRENGTH_IGNORE_CASE)
 	if err != nil {
 		logger.DataRepoLog.Errorf("QueryProvisionedDataProcedure get sessionManagementSubscriptionDatas err: %+v", err)
 		problemDetails := openapi.ProblemDetailsSystemFailure(err.Error())

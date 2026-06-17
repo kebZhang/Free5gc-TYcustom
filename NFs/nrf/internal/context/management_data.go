@@ -15,7 +15,7 @@ import (
 	"github.com/free5gc/nrf/pkg/factory"
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/nrf/internal/dbtrace"
 )
 
 const NRF_NFINST_RES_URI_PREFIX = factory.NrfNfmResUriPrefix + "/nf-instances/"
@@ -425,7 +425,7 @@ func SetLocationHeader(nfprofile *models.NrfNfManagementNfProfile) string {
 	nfType := nfprofile.NfType
 	filter := bson.M{"nfType": nfType}
 
-	ul, err := mongoapi.RestfulAPIGetOne(collName, filter)
+	ul, err := dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		logger.NfmLog.Errorf("SetLocationHeader err: %+v", err)
 	}
@@ -449,7 +449,7 @@ func SetLocationHeader(nfprofile *models.NrfNfManagementNfProfile) string {
 		logger.NfmLog.Errorf("SetLocationHeader err: %+v", err)
 	}
 
-	existed, err := mongoapi.RestfulAPIPutOne(collName, filter, putData)
+	existed, err := dbtrace.RestfulAPIPutOne(collName, filter, putData)
 	if err != nil {
 		logger.NfmLog.Errorf("SetLocationHeader err: %+v", err)
 	} else {
@@ -464,7 +464,7 @@ func SetLocationHeader(nfprofile *models.NrfNfManagementNfProfile) string {
 }
 
 func setUriListByFilter(filter bson.M, uriList *[]string) {
-	filterNfTypeResultsRaw, err := mongoapi.RestfulAPIGetMany("Subscriptions", filter)
+	filterNfTypeResultsRaw, err := dbtrace.RestfulAPIGetMany("Subscriptions", filter)
 	if err != nil {
 		logger.NfmLog.Errorf("setUriListByFilter err: %+v", err)
 	}

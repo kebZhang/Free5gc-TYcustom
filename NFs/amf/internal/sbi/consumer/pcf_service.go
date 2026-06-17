@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sync"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
 	"github.com/free5gc/amf/pkg/factory"
@@ -35,6 +36,7 @@ func (s *npcfService) getAMPolicyClient(uri string) *Npcf_AMPolicy.APIClient {
 	configuration := Npcf_AMPolicy.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Npcf_AMPolicy.NewAPIClient(configuration)
 
 	s.AMPolicyMu.RUnlock()

@@ -7,10 +7,10 @@ import (
 
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/udr/internal/dbtrace"
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/udr/internal/util"
 	"github.com/free5gc/udr/pkg/factory"
-	"github.com/free5gc/util/mongoapi"
 )
 
 type MongoDbConnector struct {
@@ -26,7 +26,7 @@ func NewMongoDbConnector(mongo *factory.Mongodb) MongoDbConnector {
 func (m MongoDbConnector) PatchDataToDBAndNotify(
 	collName string, ueId string, patchItem []models.PatchItem, filter bson.M,
 ) (origValue, newValue map[string]interface{}, err error) {
-	origValue, err = mongoapi.RestfulAPIGetOne(collName, filter)
+	origValue, err = dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		return
 	}
@@ -36,11 +36,11 @@ func (m MongoDbConnector) PatchDataToDBAndNotify(
 		return
 	}
 
-	if err = mongoapi.RestfulAPIJSONPatch(collName, filter, patchJSON); err != nil {
+	if err = dbtrace.RestfulAPIJSONPatch(collName, filter, patchJSON); err != nil {
 		return
 	}
 
-	newValue, err = mongoapi.RestfulAPIGetOne(collName, filter)
+	newValue, err = dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		return
 	}
@@ -52,7 +52,7 @@ func (m MongoDbConnector) GetDataFromDB(
 	collName string, filter bson.M) (
 	map[string]interface{}, *models.ProblemDetails,
 ) {
-	data, err := mongoapi.RestfulAPIGetOne(collName, filter)
+	data, err := dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		return nil, openapi.ProblemDetailsSystemFailure(err.Error())
 	}
@@ -65,7 +65,7 @@ func (m MongoDbConnector) GetDataFromDB(
 func (m MongoDbConnector) GetDataFromDBWithArg(collName string, filter bson.M, strength int) (
 	map[string]interface{}, *models.ProblemDetails,
 ) {
-	data, err := mongoapi.RestfulAPIGetOne(collName, filter, strength)
+	data, err := dbtrace.RestfulAPIGetOne(collName, filter, strength)
 	if err != nil {
 		return nil, openapi.ProblemDetailsSystemFailure(err.Error())
 	}
@@ -78,7 +78,7 @@ func (m MongoDbConnector) GetDataFromDBWithArg(collName string, filter bson.M, s
 }
 
 func (m MongoDbConnector) DeleteDataFromDB(collName string, filter bson.M) {
-	if err := mongoapi.RestfulAPIDeleteOne(collName, filter); err != nil {
+	if err := dbtrace.RestfulAPIDeleteOne(collName, filter); err != nil {
 		logger.DataRepoLog.Errorf("deleteDataFromDB: %+v", err)
 	}
 }

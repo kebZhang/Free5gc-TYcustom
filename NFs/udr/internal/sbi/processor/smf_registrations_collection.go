@@ -15,13 +15,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
 
+	"github.com/free5gc/udr/internal/dbtrace"
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/util/mongoapi"
 )
 
 func (p *Processor) QuerySmfRegListProcedure(c *gin.Context, collName string, ueId string) {
 	filter := bson.M{"ueId": ueId}
-	smfRegList, err := mongoapi.RestfulAPIGetMany(collName, filter, mongoapi.COLLATION_STRENGTH_IGNORE_CASE)
+	smfRegList, err := dbtrace.RestfulAPIGetMany(collName, filter, mongoapi.COLLATION_STRENGTH_IGNORE_CASE)
 	if err != nil {
 		logger.DataRepoLog.Errorf("QuerySmfRegListProcedure err: %+v", err)
 		c.JSON(http.StatusOK, nil)

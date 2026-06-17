@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
 	"github.com/free5gc/nas/nasMessage"
@@ -35,6 +36,7 @@ func (s *namfService) getComClient(uri string) *Namf_Communication.APIClient {
 	configuration := Namf_Communication.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Namf_Communication.NewAPIClient(configuration)
 
 	s.ComMu.RUnlock()

@@ -17,6 +17,7 @@ import (
 	"github.com/free5gc/openapi/pcf/SMPolicyControl"
 	"github.com/free5gc/openapi/udr/DataRepository"
 	"github.com/free5gc/pcf/internal/context"
+	"github.com/free5gc/pcf/internal/accesslog"
 	"github.com/free5gc/pcf/internal/logger"
 )
 
@@ -57,18 +58,21 @@ var (
 
 func GetNpcfAMPolicyCallbackClient() *AMPolicyControl.APIClient {
 	configuration := AMPolicyControl.NewConfiguration()
+	configuration.SetHTTPClient(accesslog.Client())
 	client := AMPolicyControl.NewAPIClient(configuration)
 	return client
 }
 
 func GetNpcfSMPolicyCallbackClient() *SMPolicyControl.APIClient {
 	configuration := SMPolicyControl.NewConfiguration()
+	configuration.SetHTTPClient(accesslog.Client())
 	client := SMPolicyControl.NewAPIClient(configuration)
 	return client
 }
 
 func GetNpcfPolicyAuthorizationCallbackClient() *PolicyAuthorization.APIClient {
 	configuration := PolicyAuthorization.NewConfiguration()
+	configuration.SetHTTPClient(accesslog.Client())
 	client := PolicyAuthorization.NewAPIClient(configuration)
 	return client
 }
@@ -76,6 +80,7 @@ func GetNpcfPolicyAuthorizationCallbackClient() *PolicyAuthorization.APIClient {
 func GetNudrClient(uri string) *DataRepository.APIClient {
 	configuration := DataRepository.NewConfiguration()
 	configuration.SetBasePath(uri)
+	configuration.SetHTTPClient(accesslog.Client())
 	client := DataRepository.NewAPIClient(configuration)
 	return client
 }
@@ -84,6 +89,7 @@ func GetNudrClient(uri string) *DataRepository.APIClient {
 func GetNbsfClient(uri string) *Management.APIClient {
 	configuration := Management.NewConfiguration()
 	configuration.SetBasePath(uri)
+	configuration.SetHTTPClient(accesslog.Client())
 	client := Management.NewAPIClient(configuration)
 	return client
 }
@@ -91,6 +97,7 @@ func GetNbsfClient(uri string) *Management.APIClient {
 func GetNamfClient(uri string) *Communication.APIClient {
 	configuration := Communication.NewConfiguration()
 	configuration.SetBasePath(uri)
+	configuration.SetHTTPClient(accesslog.Client())
 	client := Communication.NewAPIClient(configuration)
 	return client
 }

@@ -3,6 +3,7 @@ package consumer
 import (
 	"sync"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
@@ -32,6 +33,7 @@ func (s *nssfService) getNSSelectionClient(uri string) *Nnssf_NSSelection.APICli
 	configuration := Nnssf_NSSelection.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Nnssf_NSSelection.NewAPIClient(configuration)
 
 	s.NSSelectionMu.RUnlock()

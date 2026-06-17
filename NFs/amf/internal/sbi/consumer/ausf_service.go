@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
 	"github.com/free5gc/nas/nasType"
@@ -39,6 +40,7 @@ func (s *nausfService) getUEAuthenticationClient(uri string) *Nausf_UEAuthentica
 	configuration := Nausf_UEAuthentication.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Nausf_UEAuthentication.NewAPIClient(configuration)
 
 	s.UEAuthenticationMu.RUnlock()

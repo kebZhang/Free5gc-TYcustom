@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/util"
 	"github.com/free5gc/amf/pkg/factory"
@@ -43,6 +44,7 @@ func (s *nsmfService) getPDUSessionClient(uri string) *Nsmf_PDUSession.APIClient
 	configuration := Nsmf_PDUSession.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Nsmf_PDUSession.NewAPIClient(configuration)
 
 	s.PDUSessionMu.RUnlock()

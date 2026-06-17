@@ -18,7 +18,7 @@ import (
 	"github.com/free5gc/openapi/oauth"
 	"github.com/free5gc/util/mapstruct"
 	"github.com/free5gc/util/metrics/sbi"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/nrf/internal/dbtrace"
 )
 
 func (p *Processor) HandleAccessTokenRequest(c *gin.Context, accessTokenReq models.NrfAccessTokenAccessTokenReq) {
@@ -116,7 +116,7 @@ func (p *Processor) AccessTokenScopeCheck(req models.NrfAccessTokenAccessTokenRe
 
 	logger.AccTokenLog.Debugf("reqNfInstanceId: %s", reqNfInstanceId)
 	filter := bson.M{"nfInstanceId": reqNfInstanceId}
-	consumerNfInfo, err := mongoapi.RestfulAPIGetOne(collName, filter)
+	consumerNfInfo, err := dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		logger.AccTokenLog.Errorln("mongoapi RestfulAPIGetOne error: " + err.Error())
 		return &models.AccessTokenErr{
@@ -214,7 +214,7 @@ func (p *Processor) AccessTokenScopeCheck(req models.NrfAccessTokenAccessTokenRe
 	}
 
 	filter = bson.M{"nfType": reqTargetNfType}
-	producerNfInfo, err := mongoapi.RestfulAPIGetOne(collName, filter)
+	producerNfInfo, err := dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		logger.AccTokenLog.Errorln("mongoapi.RestfulApiGetOne error: " + err.Error())
 		return &models.AccessTokenErr{

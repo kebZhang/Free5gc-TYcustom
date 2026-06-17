@@ -23,7 +23,7 @@ import (
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/udr/internal/util"
 	"github.com/free5gc/util/metrics/sbi"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/udr/internal/dbtrace"
 )
 
 func (p *Processor) ApplicationDataInfluenceDataInfluenceIdPutProcedure(
@@ -35,7 +35,7 @@ func (p *Processor) ApplicationDataInfluenceDataInfluenceIdPutProcedure(
 
 	var original *models.TrafficInfluData
 
-	if mapData, err := mongoapi.RestfulAPIGetOne(collName, filter); err != nil {
+	if mapData, err := dbtrace.RestfulAPIGetOne(collName, filter); err != nil {
 		logger.DataRepoLog.Error(err.Error())
 		problemDetails := &models.ProblemDetails{
 			Status: http.StatusInternalServerError,
@@ -72,7 +72,7 @@ func (p *Processor) ApplicationDataInfluenceDataInfluenceIdPutProcedure(
 		}
 	}
 
-	isExisted, err := mongoapi.RestfulAPIPutOne(collName, filter, putData)
+	isExisted, err := dbtrace.RestfulAPIPutOne(collName, filter, putData)
 	if err != nil {
 		logger.DataRepoLog.Errorf("ApplicationDataInfluenceDataInfluenceIdPutProcedure err: %+v", err)
 		problemDetails := &models.ProblemDetails{

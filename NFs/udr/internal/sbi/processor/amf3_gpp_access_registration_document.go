@@ -16,10 +16,10 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/udr/internal/dbtrace"
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/udr/internal/util"
 	"github.com/free5gc/util/metrics/sbi"
-	"github.com/free5gc/util/mongoapi"
 )
 
 func (p *Processor) AmfContext3gppProcedure(
@@ -47,7 +47,7 @@ func (p *Processor) CreateAmfContext3gppProcedure(c *gin.Context, collName strin
 	putData := util.ToBsonM(Amf3GppAccessRegistration)
 	putData["ueId"] = ueId
 
-	if _, err := mongoapi.RestfulAPIPutOne(collName, filter, putData); err != nil {
+	if _, err := dbtrace.RestfulAPIPutOne(collName, filter, putData); err != nil {
 		logger.DataRepoLog.Errorf("CreateAmfContext3gppProcedure err: %+v", err)
 	}
 	c.Status(http.StatusNoContent)

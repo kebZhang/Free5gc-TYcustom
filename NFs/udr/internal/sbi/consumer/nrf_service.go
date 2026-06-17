@@ -10,6 +10,7 @@ import (
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/nrf/NFDiscovery"
 	"github.com/free5gc/openapi/nrf/NFManagement"
+	"github.com/free5gc/udr/internal/accesslog"
 	udr_context "github.com/free5gc/udr/internal/context"
 	"github.com/free5gc/udr/internal/logger"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
@@ -35,6 +36,7 @@ func (ns *NrfService) getNFManagementClient(uri string) *NFManagement.APIClient 
 	configuration := NFManagement.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = NFManagement.NewAPIClient(configuration)
 
 	ns.nfMngmntMu.RUnlock()
@@ -162,6 +164,7 @@ func (ns *NrfService) SendSearchNFInstances(nrfUri string,
 	configuration := NFDiscovery.NewConfiguration()
 	configuration.SetBasePath(nrfUri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client := NFDiscovery.NewAPIClient(configuration)
 
 	ctx, _, err := udr_context.GetSelf().GetTokenCtx(models.ServiceName_NNRF_DISC, models.NrfNfManagementNfType_NRF)

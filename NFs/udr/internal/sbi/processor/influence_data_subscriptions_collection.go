@@ -23,7 +23,7 @@ import (
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/udr/internal/util"
 	"github.com/free5gc/util/metrics/sbi"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/udr/internal/dbtrace"
 )
 
 func (p *Processor) ApplicationDataInfluenceDataSubsToNotifyGetProcedure(
@@ -104,7 +104,7 @@ func (p *Processor) ApplicationDataInfluenceDataInfluenceIdDeleteProcedure(
 ) {
 	filter := bson.M{"influenceId": influenceId}
 
-	mapData, err := mongoapi.RestfulAPIGetOne(collName, filter)
+	mapData, err := dbtrace.RestfulAPIGetOne(collName, filter)
 	if err != nil {
 		logger.DataRepoLog.Errorf("ApplicationDataInfluenceDataInfluenceIdDeleteProcedure err: %+v", err)
 		pd := util.ProblemDetailsUpspecified("")
@@ -133,7 +133,7 @@ func (p *Processor) ApplicationDataInfluenceDataInfluenceIdDeleteProcedure(
 		}
 	}
 
-	if err := mongoapi.RestfulAPIDeleteOne(collName, filter); err != nil {
+	if err := dbtrace.RestfulAPIDeleteOne(collName, filter); err != nil {
 		logger.DataRepoLog.Errorf("InfluIdDelProcedure: %+v", err)
 		pd := util.ProblemDetailsUpspecified(err.Error())
 		c.Set(sbi.IN_PB_DETAILS_CTX_STR, pd.Cause)

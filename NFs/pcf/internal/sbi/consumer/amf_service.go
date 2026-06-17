@@ -11,6 +11,7 @@ import (
 	pcf_context "github.com/free5gc/pcf/internal/context"
 	"github.com/free5gc/pcf/internal/logger"
 	"github.com/free5gc/pcf/pkg/factory"
+	"github.com/free5gc/pcf/internal/accesslog"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
 )
 
@@ -36,6 +37,7 @@ func (s *namfService) getNFCommunicationClient(uri string) *Communication.APICli
 	configuration := Communication.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Communication.NewAPIClient(configuration)
 
 	s.nfComMu.RUnlock()

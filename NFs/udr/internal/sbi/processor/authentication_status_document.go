@@ -17,14 +17,14 @@ import (
 
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/util/metrics/sbi"
-	"github.com/free5gc/util/mongoapi"
+	"github.com/free5gc/udr/internal/dbtrace"
 )
 
 func (p *Processor) CreateAuthenticationStatusProcedure(c *gin.Context, collName string, ueId string, putData bson.M) {
 	filter := bson.M{"ueId": ueId}
 	putData["ueId"] = ueId
 
-	if _, err := mongoapi.RestfulAPIPutOne(collName, filter, putData); err != nil {
+	if _, err := dbtrace.RestfulAPIPutOne(collName, filter, putData); err != nil {
 		logger.DataRepoLog.Errorf("CreateAuthenticationStatusProcedure err: %+v", err)
 	}
 

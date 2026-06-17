@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/pkg/factory"
 	"github.com/free5gc/openapi"
@@ -37,6 +38,7 @@ func (s *nudmService) getSubscriberDMngmntClients(uri string) *Nudm_SubscriberDa
 	configuration := Nudm_SubscriberDataManagement.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Nudm_SubscriberDataManagement.NewAPIClient(configuration)
 
 	s.SubscriberDMngmntMu.RUnlock()
@@ -59,6 +61,7 @@ func (s *nudmService) getUEContextMngmntClient(uri string) *Nudm_UEContextManage
 
 	configuration := Nudm_UEContextManagement.NewConfiguration()
 	configuration.SetBasePath(uri)
+	configuration.SetHTTPClient(accesslog.Client())
 	client = Nudm_UEContextManagement.NewAPIClient(configuration)
 
 	s.UEContextMngmntMu.RUnlock()

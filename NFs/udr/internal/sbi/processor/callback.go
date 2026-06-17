@@ -8,6 +8,7 @@ import (
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/udr/DataRepository"
 	udr_context "github.com/free5gc/udr/internal/context"
+	"github.com/free5gc/udr/internal/accesslog"
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/udr/internal/util"
 )
@@ -87,6 +88,7 @@ func SendOnDataChangeNotify(ueId string, notifyItems []models.NotifyItem) {
 
 	udrSelf := udr_context.GetSelf()
 	configuration := DataRepository.NewConfiguration()
+	configuration.SetHTTPClient(accesslog.Client())
 	client := DataRepository.NewAPIClient(configuration)
 
 	for _, subscriptionDataSubscription := range udrSelf.SubscriptionDataSubscriptions {
@@ -128,6 +130,7 @@ func SendPolicyDataChangeNotification(policyDataChangeNotification models.Policy
 		policyDataChangeNotificationUrl := policyDataSubscription.NotificationUri
 
 		configuration := DataRepository.NewConfiguration()
+		configuration.SetHTTPClient(accesslog.Client())
 		client := DataRepository.NewAPIClient(configuration)
 
 		req := DataRepository.CreateIndividualPolicyDataSubscriptionPolicyDataChangeNotificationPostRequest{
@@ -151,6 +154,7 @@ func SendInfluenceDataUpdateNotification(resUri string, original, modified *mode
 	udrSelf := udr_context.GetSelf()
 
 	configuration := DataRepository.NewConfiguration()
+	configuration.SetHTTPClient(accesslog.Client())
 	client := DataRepository.NewAPIClient(configuration)
 
 	var trafficInfluDataNotif models.TrafficInfluDataNotif
