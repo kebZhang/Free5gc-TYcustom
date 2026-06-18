@@ -260,15 +260,18 @@ func formatTime(t time.Time) string {
 //   - dstNF:    destination NF name (best-effort, derived from URL host)
 //   - method:   HTTP method
 //   - uri:      full request URI
+//   - ueID:     UE id this request is for (may be ""); used for requests whose
+//     URI does not carry the UE id but whose body does
 //   - reqTime:  when the request was sent
 //   - respTime: when the response (or error) was received
-func LogHTTP(dstNF, method, uri string, reqTime, respTime time.Time) {
+func LogHTTP(dstNF, method, uri, ueID string, reqTime, respTime time.Time) {
 	b := make([]byte, 0, 256)
 	b = append(b, '{')
 	b = appendKV(b, "src", srcNF, true)
 	b = appendKV(b, "dst", dstNF, false)
 	b = appendKV(b, "method", method, false)
 	b = appendKV(b, "uri", uri, false)
+	b = appendKV(b, "ue_id", ueID, false)
 	b = appendKV(b, "req_time", formatTime(reqTime), false)
 	b = appendKV(b, "resp_time", formatTime(respTime), false)
 	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))

@@ -1,8 +1,11 @@
 package accesslog
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -10,6 +13,11 @@ import (
 
 	"golang.org/x/net/http2"
 )
+
+// maxSniffBody caps how many bytes of a request body we will read to extract a
+// UE id. The bodies we sniff (AuthenticationInfo, PolicyAssociationRequest) are
+// well under 1 KiB; this guards against ever buffering a large/unexpected body.
+const maxSniffBody = 8 << 10 // 8 KiB
 
 // These mirror the timeouts used by free5gc/openapi's internal HTTP/2 clients
 // so behaviour is unchanged apart from the added logging.
@@ -60,13 +68,91 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		uri = req.URL.String()
 	}
 
+	// For the few request types whose UE id lives only in the request body
+	// (not the URI), sniff the body before sending and recover the UE id. The
+	// body is fully buffered and restored so the outgoing request is unchanged.
+	ueID := sniffUEID(req)
+
 	reqTime := time.Now()
 	resp, err := base.RoundTrip(req)
 	respTime := time.Now()
 
 	// Always log, even on transport error, so failed attempts are visible.
-	LogHTTP(dst, method, uri, reqTime, respTime)
+	LogHTTP(dst, method, uri, ueID, reqTime, respTime)
 	return resp, err
+}
+
+// sniffUEID returns the UE id (e.g. "imsi-999700000000001" / "suci-0-999-...")
+// for request types that carry it only in the body, or "" otherwise. It only
+// buffers the body for the small set of known endpoints, so every other request
+// is untouched and pays no cost. When it does read the body, it restores it so
+// the request can still be sent normally.
+func sniffUEID(req *http.Request) string {
+	if req.Method != http.MethodPost || req.URL == nil || req.Body == nil {
+		return ""
+	}
+	field, ok := bodyUEIDField(req.URL.Path)
+	if !ok {
+		return ""
+	}
+
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxSniffBody))
+	_ = req.Body.Close()
+	// Restore the body (and GetBody, used by the HTTP/2 transport when it has to
+	// retry the request) from the bytes we buffered, so the outgoing request is
+	// byte-for-byte unchanged whether or not it is later retried.
+	restoreBody(req, body)
+	if err != nil {
+		return ""
+	}
+
+	return extractStringField(body, field)
+}
+
+// restoreBody resets req.Body, req.GetBody and req.ContentLength to serve the
+// given bytes. The HTTP/2 transport calls GetBody() to obtain a fresh reader
+// when it retries an idempotent request after a connection-level error, so both
+// Body and GetBody must point at the same buffered bytes.
+func restoreBody(req *http.Request, body []byte) {
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+}
+
+// bodyUEIDField maps a request path to the JSON field that holds the UE id in
+// that request's body, for the endpoints whose URI does not carry the UE id.
+//   - POST /nausf-auth/v1/ue-authentications        -> AuthenticationInfo.supiOrSuci
+//   - POST /npcf-am-policy-control/v1/policies       -> PolicyAssociationRequest.supi
+func bodyUEIDField(path string) (string, bool) {
+	switch {
+	case strings.HasSuffix(path, "/nausf-auth/v1/ue-authentications"):
+		return "supiOrSuci", true
+	case strings.HasSuffix(path, "/npcf-am-policy-control/v1/policies"):
+		return "supi", true
+	}
+	return "", false
+}
+
+// extractStringField pulls a single top-level string field out of a small JSON
+// object body. Returns "" if the body is not valid JSON or the field is absent.
+func extractStringField(body []byte, field string) string {
+	// Decode into a generic map; these bodies are tiny so this is cheap and
+	// robust to field ordering / extra fields.
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	raw, ok := obj[field]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // Client returns an *http.Client that logs every request and otherwise behaves

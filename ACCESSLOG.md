@@ -18,13 +18,30 @@ Recorded by the NF that **sends** the request (client view).
 | `dst`        | destination NF (derived from the SBI service prefix) |
 | `method`     | HTTP method                                          |
 | `uri`        | full request URI                                     |
+| `ue_id`      | UE id this request is for (may be ""); see note below |
 | `req_time`   | when the request was sent (RFC3339Nano, UTC)         |
 | `resp_time`  | when the response/error was received (RFC3339Nano)   |
 | `latency_us` | resp_time − req_time, in microseconds                |
 
+`ue_id` note: for most requests the UE id is already in the `uri`
+(e.g. `.../nudm-sdm/v2/imsi-208930000000001/...`), so `ue_id` is left empty —
+extract it from the `uri` instead. For the few request types whose UE id is
+carried **only in the request body**, the transport sniffs the body and fills
+`ue_id` so the request can still be attributed to a UE:
+
+| request                                          | body field   |
+|--------------------------------------------------|--------------|
+| `POST /nausf-auth/v1/ue-authentications`         | `supiOrSuci` |
+| `POST /npcf-am-policy-control/v1/policies`       | `supi`       |
+
+Infrastructure requests that do not belong to any UE (e.g.
+`GET /nnrf-disc/v1/nf-instances`, NF registration/heartbeat under `nnrf-nfm`)
+always have an empty `ue_id` — by design, not because it was missed.
+
 Example:
 ```json
-{"src":"AMF","dst":"UDM","method":"GET","uri":"http://udm:8000/nudm-sdm/v2/imsi-208930000000001/am-data?plmn-id=...","req_time":"2026-06-17T09:00:00.123456Z","resp_time":"2026-06-17T09:00:00.124900Z","latency_us":1444}
+{"src":"AMF","dst":"UDM","method":"GET","uri":"http://udm:8000/nudm-sdm/v2/imsi-208930000000001/am-data?plmn-id=...","ue_id":"","req_time":"2026-06-17T09:00:00.123456Z","resp_time":"2026-06-17T09:00:00.124900Z","latency_us":1444}
+{"src":"AMF","dst":"AUSF","method":"POST","uri":"http://ausf:8000/nausf-auth/v1/ue-authentications","ue_id":"suci-0-999-70-0-0-0-0000000001","req_time":"2026-06-17T09:00:00.130000Z","resp_time":"2026-06-17T09:00:00.135000Z","latency_us":5000}
 ```
 
 ### `DB_log.txt` — one JSON object per line (JSON Lines)
