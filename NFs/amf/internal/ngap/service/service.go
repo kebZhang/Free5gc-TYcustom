@@ -6,6 +6,7 @@ import (
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/free5gc/amf/internal/logger"
@@ -32,6 +33,10 @@ var readTimeout syscall.Timeval = syscall.Timeval{Sec: 2, Usec: 0}
 var (
 	sctpListener *sctp.SCTPListener
 	connections  sync.Map
+	// activeConns tracks the number of live SCTP associations. It is the signal
+	// used to auto-detect the dGNB scenario (>= 2 associations). Maintained next
+	// to connections so it stays O(1) on the dispatch hot path.
+	activeConns int32
 )
 
 func NewSctpConfig(cfg *factory.Sctp) *sctp.SocketConfig {
@@ -158,6 +163,15 @@ func listenAndServe(addr *sctp.SCTPAddr, handler NGAPHandler, sctpConfig *sctp.S
 		logger.NgapLog.Infof("[AMF] SCTP Accept from: %+v", newConn.RemoteAddr())
 		connections.Store(newConn, newConn)
 
+		// Detect dGNB the moment associations are established, before any NGAP
+		// message (including NGSetup) arrives: once >= 2 SCTP associations are
+		// accepted, the scheduler latches into per-association routing. This does
+		// not depend on any UE registration being sent.
+		nowActive := atomic.AddInt32(&activeConns, 1)
+		if scheduler, errSched := ngap_internal.GetScheduler(); errSched == nil {
+			scheduler.NotifyActiveConns(int(nowActive))
+		}
+
 		go handleConnection(newConn, readBufSize, handler)
 	}
 }
@@ -192,6 +206,13 @@ func handleConnection(conn *sctp.SCTPConn, bufsize uint32, handler NGAPHandler) 
 			logger.NgapLog.Errorf("close connection error: %+v", err)
 		}
 		connections.Delete(conn)
+		atomic.AddInt32(&activeConns, -1)
+
+		// Drop this SCTP association's worker mapping so it does not leak.
+		// (No-op in non-dGNB mode where the map is unused.)
+		if scheduler, err := ngap_internal.GetScheduler(); err == nil {
+			scheduler.ReleaseConn(conn)
+		}
 	}()
 
 	for {
@@ -242,8 +263,17 @@ func handleConnection(conn *sctp.SCTPConn, bufsize uint32, handler NGAPHandler) 
 	}
 }
 
-// dispatchToWorkerPool extracts the UE ID and dispatches the task to the appropriate worker.
-// For non-UE messages (e.g., NGSetupRequest), it dispatches to a default worker (worker 0).
+// dispatchToWorkerPool routes the NGAP message to the worker pool. The
+// scheduler auto-selects its routing strategy:
+//   - non-dGNB (single SCTP association): hash by the extracted UE ID, so
+//     different UEs of the same gNB run in parallel (the original behaviour).
+//   - dGNB (>= 2 associations, latched): pin by SCTP association, so each gNB's
+//     messages stay ordered on one worker and the (non-unique) RAN-UE-NGAP-ID
+//     is not used for routing.
+//
+// The dGNB scenario is detected at SCTP accept time (see listenAndServe), so by
+// the time any NGAP message arrives the mode is already latched; this function
+// only reads the latched decision and never flips it mid-association.
 func dispatchToWorkerPool(conn net.Conn, msg []byte, handler NGAPHandler) {
 	scheduler, err := ngap_internal.GetScheduler()
 	if err != nil {
@@ -253,17 +283,14 @@ func dispatchToWorkerPool(conn net.Conn, msg []byte, handler NGAPHandler) {
 		return
 	}
 
-	// Extract UE ID from the message
+	// Extract the UE ID; only used by the non-dGNB (hash-by-UE) routing branch.
+	// For non-UE messages (e.g. NGSetupRequest) or on failure, fall back to 0
+	// so such connection-level messages share a fixed worker, as before.
 	ueID, found := ngap_internal.ExtractUEID(msg)
-
-	// For non-UE messages or if extraction fails, use a fixed worker (worker 0)
-	// to handle connection-level messages like NGSetupRequest
 	if !found {
-		logger.NgapLog.Tracef("Non-UE message or UE ID not found, using default worker (0)")
 		ueID = 0
 	}
 
-	// Create and dispatch task
 	task := ngap_internal.Task{
 		UEID:    ueID,
 		Conn:    conn,
@@ -272,6 +299,7 @@ func dispatchToWorkerPool(conn net.Conn, msg []byte, handler NGAPHandler) {
 
 	// Attempt to dispatch to worker pool
 	if !scheduler.DispatchTask(task) {
-		logger.NgapLog.Warnf("Drop packet for UE ID %d (Scheduler is shutting down)", ueID)
+		logger.NgapLog.Warnf("Drop packet from %v (UE ID %d, Scheduler is shutting down)",
+			conn.RemoteAddr(), ueID)
 	}
 }

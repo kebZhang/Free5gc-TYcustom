@@ -3,17 +3,26 @@ package ngap
 import (
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/free5gc/amf/internal/logger"
 )
 
 // Task represents a work item to be processed by a worker.
-// It contains the UE identifier and the raw NGAP message.
+// It carries the SCTP connection, the raw NGAP message, and the UE identifier
+// extracted from it. Routing uses one of two strategies depending on the
+// detected scenario (see UEScheduler):
+//   - non-dGNB (single SCTP association): hash by UEID, so different UEs of the
+//     same gNB run in parallel on different workers (the original behaviour).
+//   - dGNB (>= 2 associations): pin by SCTP association, so each gNB's messages
+//     stay ordered on a single worker and the RAN-UE-NGAP-ID (which is not
+//     unique across gNBs) is not used for routing.
 type Task struct {
-	UEID    uint64   // AMF-UE-NGAP-ID or RAN-UE-NGAP-ID
-	Conn    net.Conn // The network connection for this message
+	UEID    uint64   // AMF-UE-NGAP-ID or RAN-UE-NGAP-ID (used only in non-dGNB mode)
+	Conn    net.Conn // The SCTP association this message arrived on
 	Message []byte   // The raw NGAP message bytes
 }
 
@@ -54,8 +63,8 @@ func (w *Worker) run() {
 	for {
 		select {
 		case task := <-w.taskChan:
-			logger.NgapLog.Debugf("Worker %d processing task for UE ID %d (ensuring per-UE sequentiality)",
-				w.ID, task.UEID)
+			logger.NgapLog.Debugf("Worker %d processing message from %v (per-association ordering)",
+				w.ID, task.Conn.RemoteAddr())
 			w.handler(task.Conn, task.Message)
 
 		case <-w.stopChan:
@@ -71,7 +80,7 @@ func (w *Worker) drainAndExit() {
 	for {
 		select {
 		case task := <-w.taskChan:
-			logger.NgapLog.Debugf("Worker %d processing residual task for UE ID %d", w.ID, task.UEID)
+			logger.NgapLog.Debugf("Worker %d processing residual message from %v", w.ID, task.Conn.RemoteAddr())
 			w.handler(task.Conn, task.Message)
 		default:
 			// Channel is empty, exit safely
@@ -90,7 +99,7 @@ func (w *Worker) Submit(task Task) bool {
 		return true
 	case <-w.stopChan:
 		// Worker stopped (either before submission or while waiting). Unblock and return false.
-		logger.NgapLog.Warnf("Worker %d stopped, rejecting task for UE ID %d", w.ID, task.UEID)
+		logger.NgapLog.Warnf("Worker %d stopped, rejecting message from %v", w.ID, task.Conn.RemoteAddr())
 		return false
 	}
 }
@@ -102,24 +111,68 @@ func (w *Worker) Stop() {
 	})
 }
 
-// UEScheduler distributes NGAP tasks to workers based on UE ID.
+// UEScheduler distributes NGAP tasks to workers using one of two strategies,
+// selected automatically by the number of active SCTP associations.
+//
+// Non-dGNB (the default, single association): tasks are hashed by UEID, so
+// different UEs of the same gNB are spread across workers and processed in
+// parallel. This is the original AMF behaviour and is preserved unchanged.
+//
+// dGNB (>= 2 associations observed): each SCTP association is pinned to a single
+// worker the first time a message is seen on it, so all NGAP messages of one
+// gNB are processed in arrival order by that worker, while new connections are
+// assigned round-robin to spread load. Routing then does not depend on the
+// RAN-UE-NGAP-ID, which is not unique across gNBs.
+//
+// The dGNB decision is sticky: once >= 2 active associations are observed the
+// scheduler latches into dGNB mode for the rest of the process lifetime and
+// never falls back, so that the tail of a dGNB run (where associations close
+// one by one and the active count drops back towards 1) cannot flip routing
+// mid-association and reorder messages.
 type UEScheduler struct {
 	workers    []*Worker
 	numWorkers int
 	wg         sync.WaitGroup
+
+	// dGNBLatched is 0 until >= 2 active SCTP associations are observed, then 1
+	// permanently. Read/written with atomics so the dispatch hot path is lock-free.
+	dGNBLatched int32
+
+	mu           sync.Mutex       // Guards connToWorker and nextWorker
+	connToWorker map[net.Conn]int // SCTP association -> assigned worker index (dGNB mode)
+	nextWorker   int              // Round-robin cursor for new associations (dGNB mode)
+
+	// usedFlags[i] is 0 until worker i processes its first task, then 1. Used to
+	// count, without double-counting, how many distinct workers have actually
+	// been exercised during the run (e.g. while PacketRusher registers UEs).
+	usedFlags []int32
+	usedCount int32 // Number of distinct workers used so far (atomic).
 }
 
-// NewUEScheduler creates a new UE scheduler with the specified number of workers.
-func NewUEScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Conn, msg []byte)) *UEScheduler {
-	if numWorkers <= 0 {
-		numWorkers = runtime.NumCPU()
+// ResolveWorkerPoolSize returns the effective NGAP worker count for a configured
+// value. A configured value > 0 is used as-is; otherwise it falls back to
+// runtime.NumCPU() * 3. This is the single source of truth for the default rule,
+// so callers (e.g. init.go) can log the real worker count before the scheduler
+// is built.
+func ResolveWorkerPoolSize(configured int) int {
+	if configured > 0 {
+		return configured
 	}
+	return runtime.NumCPU() * 3
+}
 
-	logger.NgapLog.Infof("Initializing UE Scheduler with %d workers", numWorkers)
+// NewUEScheduler creates a new scheduler with the specified number of workers.
+func NewUEScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Conn, msg []byte)) *UEScheduler {
+	numWorkers = ResolveWorkerPoolSize(numWorkers)
+
+	logger.NgapLog.Infof("Initializing NGAP Scheduler with %d workers "+
+		"(hash-by-UE by default; auto-switches to per-association on >=2 SCTP associations)", numWorkers)
 
 	scheduler := &UEScheduler{
-		workers:    make([]*Worker, numWorkers),
-		numWorkers: numWorkers,
+		workers:      make([]*Worker, numWorkers),
+		numWorkers:   numWorkers,
+		connToWorker: make(map[net.Conn]int),
+		usedFlags:    make([]int32, numWorkers),
 	}
 
 	for i := 0; i < numWorkers; i++ {
@@ -129,25 +182,119 @@ func NewUEScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Co
 	return scheduler
 }
 
-// DispatchTask dispatches a task to the appropriate worker based on UE ID hashing.
-func (s *UEScheduler) DispatchTask(task Task) bool {
-	workerIndex := s.hashUEID(task.UEID)
-	worker := s.workers[workerIndex]
-
-	logger.NgapLog.Debugf("Dispatching UE ID %d to Worker %d (hash-based routing)",
-		task.UEID, workerIndex)
-	return worker.Submit(task)
+// NotifyActiveConns reports the current number of active SCTP associations to
+// the scheduler. Once it observes >= 2, it latches permanently into dGNB mode.
+// Called from the NGAP read path before each dispatch; cheap and lock-free in
+// the common (already-latched) case.
+func (s *UEScheduler) NotifyActiveConns(active int) {
+	if active >= 2 && atomic.LoadInt32(&s.dGNBLatched) == 0 {
+		if atomic.CompareAndSwapInt32(&s.dGNBLatched, 0, 1) {
+			logger.NgapLog.Infof("Detected %d active SCTP associations: latching into dGNB mode "+
+				"(per-association routing)", active)
+		}
+	}
 }
 
-// hashUEID computes a hash of the UE ID and maps it to a worker index.
-// This ensures all messages for the same UE go to the same worker.
+// IsDGNBMode reports whether the scheduler has latched into dGNB mode.
+func (s *UEScheduler) IsDGNBMode() bool {
+	return atomic.LoadInt32(&s.dGNBLatched) == 1
+}
+
+// hashUEID maps a UE ID to a worker index. Used in non-dGNB mode so that all
+// messages of the same UE go to the same worker (per-UE ordering) while
+// different UEs spread across workers.
 func (s *UEScheduler) hashUEID(ueID uint64) int {
 	return int(ueID % uint64(s.numWorkers))
 }
 
+// workerForConn returns the worker index assigned to the given SCTP association,
+// assigning one round-robin on first sight. The assignment is sticky for the
+// lifetime of the connection so that one gNB's messages stay ordered.
+func (s *UEScheduler) workerForConn(conn net.Conn) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if idx, ok := s.connToWorker[conn]; ok {
+		return idx
+	}
+
+	idx := s.nextWorker
+	s.nextWorker = (s.nextWorker + 1) % s.numWorkers
+	s.connToWorker[conn] = idx
+
+	logger.NgapLog.Infof("Assigned SCTP association %v to Worker %d (%d active associations)",
+		conn.RemoteAddr(), idx, len(s.connToWorker))
+	return idx
+}
+
+// DispatchTask routes a task to a worker. In dGNB mode it pins by SCTP
+// association; otherwise it hashes by UEID (original behaviour).
+func (s *UEScheduler) DispatchTask(task Task) bool {
+	var workerIndex int
+	if s.IsDGNBMode() {
+		workerIndex = s.workerForConn(task.Conn)
+		logger.NgapLog.Debugf("Dispatching message from %v to Worker %d (per-association routing)",
+			task.Conn.RemoteAddr(), workerIndex)
+	} else {
+		workerIndex = s.hashUEID(task.UEID)
+		logger.NgapLog.Debugf("Dispatching UE ID %d to Worker %d (hash-based routing)",
+			task.UEID, workerIndex)
+	}
+
+	s.markWorkerUsed(workerIndex)
+
+	worker := s.workers[workerIndex]
+	return worker.Submit(task)
+}
+
+// markWorkerUsed records that worker idx has handled at least one task. The
+// first time a given worker is used, the distinct-used count is incremented and
+// the new total is written to worker_num.txt. This makes the file reflect the
+// peak number of workers actually exercised during a run (e.g. how many of the
+// pool PacketRusher's registrations end up spreading across). Subsequent hits on
+// an already-counted worker are a single atomic load and do no I/O.
+func (s *UEScheduler) markWorkerUsed(idx int) {
+	if atomic.CompareAndSwapInt32(&s.usedFlags[idx], 0, 1) {
+		used := atomic.AddInt32(&s.usedCount, 1)
+		logger.NgapLog.Infof("NGAP worker %d used for the first time; %d/%d workers now in use",
+			idx, used, s.numWorkers)
+		s.writeUsedWorkerCount(int(used))
+	}
+}
+
+// UsedWorkerCount returns how many distinct workers have processed at least one
+// task so far.
+func (s *UEScheduler) UsedWorkerCount() int {
+	return int(atomic.LoadInt32(&s.usedCount))
+}
+
+// writeUsedWorkerCount overwrites worker_num.txt with the current distinct-used
+// worker count. Called only when the count changes (at most numWorkers times per
+// run), so it does not add per-message I/O on the dispatch hot path.
+func (s *UEScheduler) writeUsedWorkerCount(used int) {
+	content := fmt.Sprintf("used_workers=%d\npool_size=%d\n", used, s.numWorkers)
+	if err := os.WriteFile("worker_num.txt", []byte(content), 0o644); err != nil {
+		logger.NgapLog.Warnf("Failed to write worker_num.txt: %v", err)
+	}
+}
+
+// ReleaseConn removes the worker mapping for a closed SCTP association.
+// It must be called when a gNB connection is torn down so the map does not grow
+// without bound. Pending tasks already queued for the worker are unaffected.
+func (s *UEScheduler) ReleaseConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if idx, ok := s.connToWorker[conn]; ok {
+		delete(s.connToWorker, conn)
+		logger.NgapLog.Infof("Released SCTP association %v from Worker %d (%d active associations)",
+			conn.RemoteAddr(), idx, len(s.connToWorker))
+	}
+}
+
 // Shutdown gracefully shuts down all workers.
 func (s *UEScheduler) Shutdown() {
-	logger.NgapLog.Info("Shutting down UE Scheduler and all workers...")
+	logger.NgapLog.Info("Shutting down NGAP Scheduler and all workers...")
 
 	for i, worker := range s.workers {
 		logger.NgapLog.Infof("Closing task channel for Worker %d", i)
@@ -165,14 +312,12 @@ var (
 	schedulerMutex      sync.RWMutex
 )
 
-// InitScheduler initializes the global UE scheduler.
+// InitScheduler initializes the global NGAP scheduler.
 // Should be called once during AMF startup.
 func InitScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Conn, msg []byte)) {
 	globalSchedulerOnce.Do(func() {
 		// Apply sensible defaults if invalid values provided
-		if numWorkers <= 0 {
-			numWorkers = runtime.NumCPU()
-		}
+		numWorkers = ResolveWorkerPoolSize(numWorkers)
 		if taskBufferSize <= 0 {
 			taskBufferSize = 4096 // Default buffer size
 		}
@@ -181,7 +326,7 @@ func InitScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Con
 		defer schedulerMutex.Unlock()
 
 		globalScheduler = NewUEScheduler(numWorkers, taskBufferSize, handler)
-		logger.NgapLog.Infof("Global UE Scheduler initialized with %d workers, buffer size %d",
+		logger.NgapLog.Infof("Global NGAP Scheduler initialized with %d workers, buffer size %d",
 			numWorkers, taskBufferSize)
 	})
 }
