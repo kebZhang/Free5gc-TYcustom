@@ -156,14 +156,14 @@ type UEScheduler struct {
 
 // ResolveWorkerPoolSize returns the effective NGAP worker count for a configured
 // value. A configured value > 0 is used as-is; otherwise it falls back to
-// runtime.NumCPU() * 3. This is the single source of truth for the default rule,
+// runtime.NumCPU() * 30. This is the single source of truth for the default rule,
 // so callers (e.g. init.go) can log the real worker count before the scheduler
 // is built.
 func ResolveWorkerPoolSize(configured int) int {
 	if configured > 0 {
 		return configured
 	}
-	return runtime.NumCPU() * 3
+	return runtime.NumCPU() * 30
 }
 
 // NewUEScheduler creates a new scheduler with the specified number of workers.
