@@ -280,17 +280,20 @@ func LogHTTP(dstNF, method, uri, ueID string, reqTime, respTime time.Time) {
 }
 
 // LogDB records one NF<->MongoDB request/response from this NF's view.
-//   - mongo:    mongodb endpoint/identifier
-//   - resource: collection / table name
-//   - ueID:     the UE id involved (may be empty)
-//   - reqTime:  when the DB request was issued
-//   - respTime: when the DB reply was received
-func LogDB(mongo, resource, ueID string, reqTime, respTime time.Time) {
+//   - mongo:     mongodb endpoint/identifier
+//   - resource:  collection / table name
+//   - operation: the kind of DB operation performed (find/update/else, e.g.
+//     "GetOne", "PutOne", "DeleteOne", ...) so each line states its op type
+//   - ueID:      the UE id involved (may be empty)
+//   - reqTime:   when the DB request was issued
+//   - respTime:  when the DB reply was received
+func LogDB(mongo, resource, operation, ueID string, reqTime, respTime time.Time) {
 	b := make([]byte, 0, 256)
 	b = append(b, '{')
 	b = appendKV(b, "nf", srcNF, true)
 	b = appendKV(b, "mongo", mongo, false)
 	b = appendKV(b, "resource", resource, false)
+	b = appendKV(b, "operation", operation, false)
 	b = appendKV(b, "ue_id", ueID, false)
 	b = appendKV(b, "req_time", formatTime(reqTime), false)
 	b = appendKV(b, "resp_time", formatTime(respTime), false)

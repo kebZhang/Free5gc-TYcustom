@@ -11,6 +11,11 @@ import (
 	"github.com/free5gc/amf/internal/logger"
 )
 
+// workerNumFilePath is where the peak (maximum) number of distinct NGAP workers
+// exercised during a run is written. Pinned to an absolute path so it lands in
+// the AMF pod's /tmp regardless of the process working directory.
+const workerNumFilePath = "/tmp/worker_num.txt"
+
 // Task represents a work item to be processed by a worker.
 // It carries the SCTP connection, the raw NGAP message, and the UE identifier
 // extracted from it. Routing uses one of two strategies depending on the
@@ -268,13 +273,15 @@ func (s *UEScheduler) UsedWorkerCount() int {
 	return int(atomic.LoadInt32(&s.usedCount))
 }
 
-// writeUsedWorkerCount overwrites worker_num.txt with the current distinct-used
-// worker count. Called only when the count changes (at most numWorkers times per
-// run), so it does not add per-message I/O on the dispatch hot path.
+// writeUsedWorkerCount overwrites workerNumFilePath with the current
+// distinct-used worker count. The count is monotonically increasing, so the file
+// always reflects the peak (i.e. the maximum) number of workers exercised so far.
+// Called only when the count changes (at most numWorkers times per run), so it
+// does not add per-message I/O on the dispatch hot path.
 func (s *UEScheduler) writeUsedWorkerCount(used int) {
 	content := fmt.Sprintf("used_workers=%d\npool_size=%d\n", used, s.numWorkers)
-	if err := os.WriteFile("worker_num.txt", []byte(content), 0o644); err != nil {
-		logger.NgapLog.Warnf("Failed to write worker_num.txt: %v", err)
+	if err := os.WriteFile(workerNumFilePath, []byte(content), 0o644); err != nil {
+		logger.NgapLog.Warnf("Failed to write %s: %v", workerNumFilePath, err)
 	}
 }
 

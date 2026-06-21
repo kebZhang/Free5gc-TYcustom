@@ -45,22 +45,23 @@ func ueIDFromFilter(filter bson.M) string {
 }
 
 // logDB emits one DB record. start is captured by the caller right before the
-// real call; we stamp the end here.
-func logDB(collName string, filter bson.M, start time.Time) {
-	accesslog.LogDB(mongoTarget, collName, ueIDFromFilter(filter), start, time.Now())
+// real call; we stamp the end here. operation names the mongoapi call made so
+// each log line records its operation type (find/update/else).
+func logDB(collName, operation string, filter bson.M, start time.Time) {
+	accesslog.LogDB(mongoTarget, collName, operation, ueIDFromFilter(filter), start, time.Now())
 }
 
 func RestfulAPIGetOne(collName string, filter bson.M, argOpt ...interface{}) (map[string]interface{}, error) {
 	start := time.Now()
 	res, err := mongoapi.RestfulAPIGetOne(collName, filter, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "GetOne", filter, start)
 	return res, err
 }
 
 func RestfulAPIGetMany(collName string, filter bson.M, argOpt ...interface{}) ([]map[string]interface{}, error) {
 	start := time.Now()
 	res, err := mongoapi.RestfulAPIGetMany(collName, filter, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "GetMany", filter, start)
 	return res, err
 }
 
@@ -69,21 +70,21 @@ func RestfulAPIPutOne(
 ) (bool, error) {
 	start := time.Now()
 	existed, err := mongoapi.RestfulAPIPutOne(collName, filter, putData, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "PutOne", filter, start)
 	return existed, err
 }
 
 func RestfulAPIDeleteOne(collName string, filter bson.M, argOpt ...interface{}) error {
 	start := time.Now()
 	err := mongoapi.RestfulAPIDeleteOne(collName, filter, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "DeleteOne", filter, start)
 	return err
 }
 
 func RestfulAPIDeleteMany(collName string, filter bson.M, argOpt ...interface{}) error {
 	start := time.Now()
 	err := mongoapi.RestfulAPIDeleteMany(collName, filter, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "DeleteMany", filter, start)
 	return err
 }
 
@@ -92,14 +93,14 @@ func RestfulAPIMergePatch(
 ) error {
 	start := time.Now()
 	err := mongoapi.RestfulAPIMergePatch(collName, filter, patchData, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "MergePatch", filter, start)
 	return err
 }
 
 func RestfulAPIJSONPatch(collName string, filter bson.M, patchJSON []byte, argOpt ...interface{}) error {
 	start := time.Now()
 	err := mongoapi.RestfulAPIJSONPatch(collName, filter, patchJSON, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "JSONPatch", filter, start)
 	return err
 }
 
@@ -108,7 +109,7 @@ func RestfulAPIJSONPatchExtend(
 ) error {
 	start := time.Now()
 	err := mongoapi.RestfulAPIJSONPatchExtend(collName, filter, patchJSON, dataName, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "JSONPatchExtend", filter, start)
 	return err
 }
 
@@ -117,7 +118,7 @@ func RestfulAPIPullOne(
 ) error {
 	start := time.Now()
 	err := mongoapi.RestfulAPIPullOne(collName, filter, putData, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "PullOne", filter, start)
 	return err
 }
 
@@ -126,6 +127,6 @@ func RestfulAPIPost(
 ) (bool, error) {
 	start := time.Now()
 	existed, err := mongoapi.RestfulAPIPost(collName, filter, postData, argOpt...)
-	logDB(collName, filter, start)
+	logDB(collName, "Post", filter, start)
 	return existed, err
 }

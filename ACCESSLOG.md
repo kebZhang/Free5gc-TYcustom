@@ -53,10 +53,17 @@ Recorded by the NF that issues the MongoDB operation.
 | `nf`         | NF that issued the query (this NF)               |
 | `mongo`      | database peer identifier (`mongodb`)             |
 | `resource`   | collection / table name                          |
+| `operation`  | DB operation type (find/update/else): `GetOne`, `GetMany`, `PutOne`, `DeleteOne`, `DeleteMany`, `MergePatch`, `JSONPatch`, `JSONPatchExtend`, `PullOne`, `Post` |
 | `ue_id`      | UE id extracted from the query filter (may be "")|
 | `req_time`   | when the DB request was issued (RFC3339Nano, UTC)|
 | `resp_time`  | when the DB reply was received (RFC3339Nano)     |
 | `latency_us` | resp_time − req_time, in microseconds            |
+
+Example:
+```json
+{"nf":"UDR","mongo":"mongodb","resource":"subscriptionData.authenticationData.authenticationSubscription","operation":"GetOne","ue_id":"imsi-208930000000001","req_time":"2026-06-17T09:00:00.123456Z","resp_time":"2026-06-17T09:00:00.124000Z","latency_us":544}
+{"nf":"UDR","mongo":"mongodb","resource":"subscriptionData.authenticationData.authenticationStatus","operation":"PutOne","ue_id":"imsi-208930000000001","req_time":"2026-06-17T09:00:00.130000Z","resp_time":"2026-06-17T09:00:00.130800Z","latency_us":800}
+```
 
 Order of lines is **not** significant — analyze by timestamp.
 
