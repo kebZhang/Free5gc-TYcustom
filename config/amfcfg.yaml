@@ -143,7 +143,7 @@ configuration:
     maxInitTimeout: 2 # the maximum init timeout of each sctp connection
   defaultUECtxReq: false # the default value of UE Context Request to decide when triggering Initial Context Setup procedure
 
-  ngapWorkerPoolSize: 1000 # (int), default equal to runtime.NumCPU() * 3
+  ngapWorkerPoolSize: 2000 # (int), default equal to runtime.NumCPU() * 3
   ngapTaskBufferSize: 256 # (int)
 
 logger: # log output setting

@@ -154,16 +154,27 @@ type UEScheduler struct {
 	usedCount int32 // Number of distinct workers used so far (atomic).
 }
 
+// maxWorkerPoolSize is the hard upper bound on the NGAP worker pool size. Both a
+// configured value and the auto-detected default are clamped to this, so the pool
+// can never grow without bound (which would blow up memory: each worker owns a
+// channel of ngapTaskBufferSize Task slots). 10000 is far above any realistic UE
+// fan-out and exists purely as a safety ceiling.
+const maxWorkerPoolSize = 10000
+
 // ResolveWorkerPoolSize returns the effective NGAP worker count for a configured
 // value. A configured value > 0 is used as-is; otherwise it falls back to
-// runtime.NumCPU() * 30. This is the single source of truth for the default rule,
-// so callers (e.g. init.go) can log the real worker count before the scheduler
-// is built.
+// runtime.NumCPU() * 60. The result is clamped to maxWorkerPoolSize. This is the
+// single source of truth for the default rule, so callers (e.g. init.go) can log
+// the real worker count before the scheduler is built.
 func ResolveWorkerPoolSize(configured int) int {
-	if configured > 0 {
-		return configured
+	size := configured
+	if size <= 0 {
+		size = runtime.NumCPU() * 60
 	}
-	return runtime.NumCPU() * 30
+	if size > maxWorkerPoolSize {
+		size = maxWorkerPoolSize
+	}
+	return size
 }
 
 // NewUEScheduler creates a new scheduler with the specified number of workers.

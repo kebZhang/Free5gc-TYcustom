@@ -194,13 +194,13 @@ func (a *AmfApp) Start() {
 	taskBufferSize := a.cfg.GetNgapTaskBufferSize()
 
 	// Resolve to the effective worker count so the log reflects the real number
-	// actually used (auto-detect returns runtime.NumCPU()*3 instead of 0).
+	// actually used (auto-detect returns runtime.NumCPU()*60 instead of 0).
 	effectiveWorkerPoolSize := ngap.ResolveWorkerPoolSize(workerPoolSize)
 	if workerPoolSize > 0 {
 		logger.InitLog.Infof("Initializing NGAP worker pool with %d workers (configured; buffer size: %d)",
 			effectiveWorkerPoolSize, taskBufferSize)
 	} else {
-		logger.InitLog.Infof("Initializing NGAP worker pool with %d workers (auto-detected = runtime.NumCPU()*3; buffer size: %d)",
+		logger.InitLog.Infof("Initializing NGAP worker pool with %d workers (auto-detected = runtime.NumCPU()*60, capped at 10000; buffer size: %d)",
 			effectiveWorkerPoolSize, taskBufferSize)
 	}
 

@@ -1040,7 +1040,7 @@ func (c *Config) GetNgapWorkerPoolSize() int {
 	if c.Configuration != nil && c.Configuration.NgapWorkerPoolSize > 0 {
 		return c.Configuration.NgapWorkerPoolSize
 	}
-	// 0 indicates that the caller (e.g., InitScheduler) should auto-detect (runtime.NumCPU() * 3)
+	// 0 indicates that the caller (e.g., InitScheduler) should auto-detect (runtime.NumCPU() * 60, capped at 10000)
 	return 0
 }
 

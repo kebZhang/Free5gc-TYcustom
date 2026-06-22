@@ -242,8 +242,8 @@ func TestScheduler_WorkerCount(t *testing.T) {
 		{"Single worker", 1, 1},
 		{"Four workers", 4, 4},
 		{"Eight workers", 8, 8},
-		{"Auto-detect (0)", 0, runtime.NumCPU() * 3}, // 0 => runtime.NumCPU() * 3
-		{"Auto-detect (negative)", -1, runtime.NumCPU() * 3},
+		{"Auto-detect (0)", 0, runtime.NumCPU() * 60}, // 0 => runtime.NumCPU() * 60
+		{"Auto-detect (negative)", -1, runtime.NumCPU() * 60},
 	}
 
 	for _, tc := range testCases {
@@ -303,8 +303,8 @@ func TestResolveWorkerPoolSize(t *testing.T) {
 	}{
 		{"Explicit positive", 8, 8},
 		{"Explicit one", 1, 1},
-		{"Auto-detect (0)", 0, runtime.NumCPU() * 3},
-		{"Auto-detect (negative)", -1, runtime.NumCPU() * 3},
+		{"Auto-detect (0)", 0, runtime.NumCPU() * 60},
+		{"Auto-detect (negative)", -1, runtime.NumCPU() * 60},
 	}
 
 	for _, tc := range testCases {
