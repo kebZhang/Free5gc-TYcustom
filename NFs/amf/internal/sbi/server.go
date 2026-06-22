@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
 	"github.com/free5gc/amf/internal/sbi/consumer"
@@ -69,6 +70,7 @@ func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 
 	router.Use(metrics.InboundMetrics())
+	router.Use(accesslog.InboundLogger())
 	amfHttpCallBackGroup := router.Group(factory.AmfCallbackResUriPrefix)
 	amfHttpCallBackRoutes := s.getHttpCallBackRoutes()
 	applyRoutes(amfHttpCallBackGroup, amfHttpCallBackRoutes)

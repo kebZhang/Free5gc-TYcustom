@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"golang.org/x/net/http2"
 )
 
@@ -153,6 +154,79 @@ func extractStringField(body []byte, field string) string {
 		return ""
 	}
 	return s
+}
+
+// InboundLogger returns a gin middleware that records one HTTP access-log entry
+// per *incoming* request from the receiver's (this NF's, the server's) point of
+// view. It is the server-side counterpart of the loggingRoundTripper and writes
+// to the SAME HTTP_log.txt with the SAME fields (src is "NaN" because the sender
+// NF cannot be identified server-side; dst is this NF).
+//
+// Register it once, right after the existing inbound middleware, e.g.:
+//
+//	router.Use(metrics.InboundMetrics())
+//	router.Use(accesslog.InboundLogger())
+func InboundLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		method := c.Request.Method
+		uri := inboundURI(c.Request)
+
+		// For the few request types whose UE id lives only in the body, sniff it
+		// before the handler runs and restore the body so the handler is
+		// unaffected. Every other request is untouched and pays no cost.
+		ueID := sniffInboundUEID(c.Request)
+
+		reqTime := time.Now()
+		c.Next()
+		respTime := time.Now()
+
+		LogHTTPInbound(method, uri, ueID, reqTime, respTime)
+	}
+}
+
+// inboundURI reconstructs a full request URI for an incoming server request so
+// it matches the client-view "uri" (which is req.URL.String(), i.e. scheme + host
+// + path + query). Server requests have an empty URL.Scheme/Host, so we fill them
+// from the connection (TLS => https) and the Host header.
+func inboundURI(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return ""
+	}
+	u := *req.URL // shallow copy; do not mutate the request's URL
+	if u.Host == "" {
+		u.Host = req.Host
+	}
+	if u.Scheme == "" {
+		if req.TLS != nil {
+			u.Scheme = "https"
+		} else {
+			u.Scheme = "http"
+		}
+	}
+	return u.String()
+}
+
+// sniffInboundUEID returns the UE id for incoming request types that carry it
+// only in the body, or "" otherwise. Mirrors sniffUEID but reads the server-side
+// request body and restores it so the gin handler can still read it.
+func sniffInboundUEID(req *http.Request) string {
+	if req == nil || req.Method != http.MethodPost || req.URL == nil || req.Body == nil {
+		return ""
+	}
+	field, ok := bodyUEIDField(req.URL.Path)
+	if !ok {
+		return ""
+	}
+
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxSniffBody))
+	_ = req.Body.Close()
+	// Restore the body so the downstream handler reads the same bytes.
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	if err != nil {
+		return ""
+	}
+	return extractStringField(body, field)
 }
 
 // Client returns an *http.Client that logs every request and otherwise behaves

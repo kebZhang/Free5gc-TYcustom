@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/free5gc/nssf/internal/accesslog"
 	"github.com/free5gc/nssf/internal/logger"
 	"github.com/free5gc/nssf/internal/sbi/processor"
 	"github.com/free5gc/nssf/internal/util"
@@ -101,6 +102,7 @@ func bindRouter(nssf app.NssfApp, router *gin.Engine, tlsKeyLogPath string) (*ht
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
+	router.Use(accesslog.InboundLogger())
 
 	for _, serviceName := range s.Config().Configuration.ServiceNameList {
 		switch serviceName {

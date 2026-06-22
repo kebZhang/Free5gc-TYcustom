@@ -13,6 +13,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/udm/internal/accesslog"
 	"github.com/free5gc/udm/internal/logger"
 	"github.com/free5gc/udm/internal/sbi/consumer"
 	"github.com/free5gc/udm/internal/sbi/processor"
@@ -141,6 +142,7 @@ func (s *Server) shutdownHttpServer() {
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
+	router.Use(accesslog.InboundLogger())
 
 	// EE
 	udmEERoutes := s.getEventExposureRoutes()

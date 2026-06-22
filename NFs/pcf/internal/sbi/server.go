@@ -13,6 +13,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/pcf/internal/accesslog"
 	"github.com/free5gc/pcf/internal/logger"
 	"github.com/free5gc/pcf/internal/sbi/consumer"
 	"github.com/free5gc/pcf/internal/sbi/processor"
@@ -69,6 +70,7 @@ func NewServer(pcf pcf, tlsKeyLogPath string) (*Server, error) {
 	}
 
 	s.router.Use(metrics.InboundMetrics())
+	s.router.Use(accesslog.InboundLogger())
 
 	smPolicyRoutes := s.getSmPolicyRoutes()
 	smPolicyGroup := s.router.Group(factory.PcfSMpolicyCtlResUriPrefix)

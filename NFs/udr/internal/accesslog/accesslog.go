@@ -279,6 +279,35 @@ func LogHTTP(dstNF, method, uri, ueID string, reqTime, respTime time.Time) {
 	enqueue(kindHTTP, b)
 }
 
+// LogHTTPInbound records one *incoming* HTTP request/response from the
+// receiver's (this NF's, the server's) point of view. It is the server-side
+// counterpart of LogHTTP and is written to the SAME HTTP_log.txt with the SAME
+// fields, so client-view and server-view lines can be analyzed together.
+//
+// The sender NF cannot be reliably identified from the server side (the SBI URI
+// does not carry it, and direct communication carries no token), so "src" is
+// recorded as the literal "NaN". "dst" is this NF (the receiver).
+//   - method:   HTTP method
+//   - uri:      request URI
+//   - ueID:     UE id this request is for (may be ""); for requests whose URI
+//     does not carry the UE id but whose body does
+//   - reqTime:  when the request arrived at this server
+//   - respTime: when the response was sent back
+func LogHTTPInbound(method, uri, ueID string, reqTime, respTime time.Time) {
+	b := make([]byte, 0, 256)
+	b = append(b, '{')
+	b = appendKV(b, "src", "NaN", true)
+	b = appendKV(b, "dst", srcNF, false)
+	b = appendKV(b, "method", method, false)
+	b = appendKV(b, "uri", uri, false)
+	b = appendKV(b, "ue_id", ueID, false)
+	b = appendKV(b, "req_time", formatTime(reqTime), false)
+	b = appendKV(b, "resp_time", formatTime(respTime), false)
+	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))
+	b = append(b, '}')
+	enqueue(kindHTTP, b)
+}
+
 // LogDB records one NF<->MongoDB request/response from this NF's view.
 //   - mongo:     mongodb endpoint/identifier
 //   - resource:  collection / table name

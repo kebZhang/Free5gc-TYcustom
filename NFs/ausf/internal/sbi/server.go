@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 
+	"github.com/free5gc/ausf/internal/accesslog"
 	ausf_context "github.com/free5gc/ausf/internal/context"
 	"github.com/free5gc/ausf/internal/logger"
 	"github.com/free5gc/ausf/internal/sbi/consumer"
@@ -62,6 +63,7 @@ func NewServer(ausf ServerAusf, tlsKeyLogPath string) (*Server, error) {
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
+	router.Use(accesslog.InboundLogger())
 
 	for _, serviceName := range factory.AusfConfig.Configuration.ServiceNameList {
 		switch models.ServiceName(serviceName) {

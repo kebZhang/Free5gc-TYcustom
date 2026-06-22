@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/udr/internal/accesslog"
 	"github.com/free5gc/udr/internal/logger"
 	"github.com/free5gc/udr/internal/sbi/processor"
 	"github.com/free5gc/udr/internal/util"
@@ -95,6 +96,7 @@ func bindRouter(udr app.App, router *gin.Engine, tlsKeyLogPath string) (*http.Se
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
+	router.Use(accesslog.InboundLogger())
 
 	dataRepositoryGroup := router.Group(factory.UdrDrResUriPrefix)
 	dataRepositoryGroup.Use(func(c *gin.Context) {
