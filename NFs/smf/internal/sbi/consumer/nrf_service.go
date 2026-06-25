@@ -15,6 +15,7 @@ import (
 	"github.com/free5gc/openapi/nrf/NFManagement"
 	"github.com/free5gc/openapi/udm/SubscriberDataManagement"
 	smf_context "github.com/free5gc/smf/internal/context"
+	"github.com/free5gc/smf/internal/disccache"
 	"github.com/free5gc/smf/internal/logger"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
 )
@@ -187,6 +188,13 @@ func (s *nnrfService) SendSearchNFInstances(
 	targetNfType, requestNfType models.NrfNfManagementNfType,
 	param *NFDiscovery.SearchNFInstancesRequest,
 ) (*models.SearchResult, error) {
+	// Discovery cache: on a hit, return the cached result without contacting the
+	// NRF (no nnrf-disc, no NRF->Mongo read).
+	cacheKey := disccache.Key(targetNfType, requestNfType, param.ServiceNames)
+	if cached, ok := disccache.Get(cacheKey); ok {
+		return cached, nil
+	}
+
 	// Set client and set url
 	smfContext := s.consumer.Context()
 	client := s.getNFDiscoveryClient(smfContext.NrfUri)
@@ -206,6 +214,7 @@ func (s *nnrfService) SendSearchNFInstances(
 		return nil, err
 	}
 	result := res.SearchResult
+	disccache.Put(cacheKey, &result)
 	return &result, err
 }
 

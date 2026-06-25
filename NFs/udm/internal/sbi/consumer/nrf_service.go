@@ -13,6 +13,7 @@ import (
 	Nnrf_NFDiscovery "github.com/free5gc/openapi/nrf/NFDiscovery"
 	Nnrf_NFManagement "github.com/free5gc/openapi/nrf/NFManagement"
 	udm_context "github.com/free5gc/udm/internal/context"
+	"github.com/free5gc/udm/internal/disccache"
 	"github.com/free5gc/udm/internal/logger"
 	"github.com/free5gc/udm/internal/util"
 	"github.com/free5gc/udm/internal/accesslog"
@@ -81,6 +82,21 @@ func (s *nnrfService) SendSearchNFInstances(
 	nrfUri string, param Nnrf_NFDiscovery.SearchNFInstancesRequest) (
 	*models.SearchResult, error,
 ) {
+	// Discovery cache: on a hit, return the cached result without contacting the
+	// NRF (no nnrf-disc, no NRF->Mongo read). target/requester live in the param
+	// (set by the caller); supi and other per-UE fields are excluded from the key.
+	var targetNfType, requesterNfType models.NrfNfManagementNfType
+	if param.TargetNfType != nil {
+		targetNfType = *param.TargetNfType
+	}
+	if param.RequesterNfType != nil {
+		requesterNfType = *param.RequesterNfType
+	}
+	cacheKey := disccache.Key(targetNfType, requesterNfType, param.ServiceNames)
+	if cached, ok := disccache.Get(cacheKey); ok {
+		return cached, nil
+	}
+
 	// Set client and set url
 	udmContext := s.consumer.Context()
 
@@ -102,6 +118,7 @@ func (s *nnrfService) SendSearchNFInstances(
 	}
 	result := searchNfInstancesRsp.SearchResult
 
+	disccache.Put(cacheKey, &result)
 	return &result, nil
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/free5gc/openapi/nrf/NFManagement"
 	"github.com/free5gc/udr/internal/accesslog"
 	udr_context "github.com/free5gc/udr/internal/context"
+	"github.com/free5gc/udr/internal/disccache"
 	"github.com/free5gc/udr/internal/logger"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
 )
@@ -160,6 +161,21 @@ func (ns *NrfService) SendDeregisterNFInstance() (err error) {
 func (ns *NrfService) SendSearchNFInstances(nrfUri string,
 	param NFDiscovery.SearchNFInstancesRequest,
 ) (*NFDiscovery.SearchNFInstancesResponse, error) {
+	// Discovery cache: on a hit, rebuild the response from the cached SearchResult
+	// without contacting the NRF (no nnrf-disc, no NRF->Mongo read). target/
+	// requester live in the param; supi and other per-UE fields are excluded.
+	var targetNfType, requesterNfType models.NrfNfManagementNfType
+	if param.TargetNfType != nil {
+		targetNfType = *param.TargetNfType
+	}
+	if param.RequesterNfType != nil {
+		requesterNfType = *param.RequesterNfType
+	}
+	cacheKey := disccache.Key(targetNfType, requesterNfType, param.ServiceNames)
+	if cached, ok := disccache.Get(cacheKey); ok {
+		return &NFDiscovery.SearchNFInstancesResponse{SearchResult: *cached}, nil
+	}
+
 	// Set client and set url
 	configuration := NFDiscovery.NewConfiguration()
 	configuration.SetBasePath(nrfUri)
@@ -173,6 +189,9 @@ func (ns *NrfService) SendSearchNFInstances(nrfUri string,
 	}
 
 	result, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, &param)
+	if err == nil && result != nil {
+		disccache.Put(cacheKey, &result.SearchResult)
+	}
 
 	return result, err
 }

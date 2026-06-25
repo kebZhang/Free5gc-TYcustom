@@ -11,6 +11,7 @@ import (
 
 	"github.com/free5gc/ausf/internal/accesslog"
 	ausf_context "github.com/free5gc/ausf/internal/context"
+	"github.com/free5gc/ausf/internal/disccache"
 	"github.com/free5gc/ausf/internal/logger"
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
@@ -84,6 +85,13 @@ func (s *nnrfService) SendSearchNFInstances(
 ) (
 	*models.SearchResult, error,
 ) {
+	// Discovery cache: on a hit, return the cached result without contacting the
+	// NRF (no nnrf-disc, no NRF->Mongo read).
+	cacheKey := disccache.Key(targetNfType, requestNfType, param.ServiceNames)
+	if cached, ok := disccache.Get(cacheKey); ok {
+		return cached, nil
+	}
+
 	// Set client and set url
 	client := s.getNFDiscClient(nrfUri)
 	if client == nil {
@@ -103,6 +111,7 @@ func (s *nnrfService) SendSearchNFInstances(
 	}
 
 	result := res.SearchResult
+	disccache.Put(cacheKey, &result)
 	return &result, err
 }
 

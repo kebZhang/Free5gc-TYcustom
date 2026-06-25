@@ -13,6 +13,7 @@ import (
 	"github.com/free5gc/openapi/nrf/NFDiscovery"
 	"github.com/free5gc/openapi/nrf/NFManagement"
 	pcf_context "github.com/free5gc/pcf/internal/context"
+	"github.com/free5gc/pcf/internal/disccache"
 	"github.com/free5gc/pcf/internal/logger"
 	"github.com/free5gc/pcf/internal/util"
 	"github.com/free5gc/pcf/internal/accesslog"
@@ -81,6 +82,17 @@ func (s *nnrfService) SendSearchNFInstances(
 	nrfUri string, targetNfType, requestNfType models.NrfNfManagementNfType, param NFDiscovery.SearchNFInstancesRequest) (
 	*models.SearchResult, error,
 ) {
+	param.TargetNfType = &targetNfType
+	param.RequesterNfType = &requestNfType
+
+	// Discovery cache: build the key after the full query is set so it reflects
+	// exactly what would be sent to the NRF. On a hit, return the cached result
+	// without contacting the NRF (no nnrf-disc, no NRF->Mongo read).
+	cacheKey := disccache.Key(targetNfType, requestNfType, param.ServiceNames)
+	if cached, ok := disccache.Get(cacheKey); ok {
+		return cached, nil
+	}
+
 	// Set client and set url
 	client := s.getNFDiscClient(nrfUri)
 
@@ -88,8 +100,6 @@ func (s *nnrfService) SendSearchNFInstances(
 	if err != nil {
 		return nil, err
 	}
-	param.TargetNfType = &targetNfType
-	param.RequesterNfType = &requestNfType
 	res, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, &param)
 	if err != nil {
 		logger.ConsumerLog.Errorf("SearchNFInstances failed: %+v", err)
@@ -98,6 +108,7 @@ func (s *nnrfService) SendSearchNFInstances(
 
 	result := res.SearchResult
 
+	disccache.Put(cacheKey, &result)
 	return &result, nil
 }
 

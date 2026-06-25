@@ -9,6 +9,7 @@ import (
 
 	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
+	"github.com/free5gc/amf/internal/disccache"
 	"github.com/free5gc/amf/internal/logger"
 	"github.com/free5gc/amf/internal/util"
 	"github.com/free5gc/amf/pkg/factory"
@@ -83,6 +84,15 @@ func (s *nnrfService) SendSearchNFInstances(nrfUri string, targetNfType, request
 	// Set client and set url
 	param.TargetNfType = &targetNfType
 	param.RequesterNfType = &requestNfType
+
+	// Discovery cache: build the key after the full query is set so it reflects
+	// exactly what would be sent to the NRF. On a hit, return the cached result
+	// without contacting the NRF (no nnrf-disc, no NRF->Mongo read).
+	cacheKey := disccache.Key(targetNfType, requestNfType, param.ServiceNames)
+	if cached, ok := disccache.Get(cacheKey); ok {
+		return cached, nil
+	}
+
 	client := s.getNFDiscClient(nrfUri)
 	if client == nil {
 		return nil, openapi.ReportError("nrf not found")
@@ -99,6 +109,7 @@ func (s *nnrfService) SendSearchNFInstances(nrfUri string, targetNfType, request
 	}
 	if res != nil {
 		result = &res.SearchResult
+		disccache.Put(cacheKey, result)
 	}
 	return result, err
 }

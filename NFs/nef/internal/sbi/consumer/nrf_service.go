@@ -11,6 +11,7 @@ import (
 	"time"
 
 	nef_context "github.com/free5gc/nef/internal/context"
+	"github.com/free5gc/nef/internal/disccache"
 	"github.com/free5gc/nef/internal/logger"
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
@@ -237,14 +238,24 @@ func (s *nnrfService) SearchNFInstances(nrfUri string, srvName models.ServiceNam
 
 	param.TargetNfType = &targetNfType
 	param.RequesterNfType = &requestNfType
-	res, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, param)
+
+	// Discovery cache: build the key after the full query is set. On a hit, reuse
+	// the cached SearchResult (and re-derive profile/uri for the requested
+	// service) without contacting the NRF.
+	cacheKey := disccache.Key(targetNfType, requestNfType, param.ServiceNames)
 	var result *models.SearchResult
-	if err != nil {
-		logger.ConsumerLog.Errorf("SearchNFInstances failed: %+v", err)
-		return nil, "", err
-	}
-	if res != nil {
-		result = &res.SearchResult
+	if cached, ok := disccache.Get(cacheKey); ok {
+		result = cached
+	} else {
+		res, errSearch := client.NFInstancesStoreApi.SearchNFInstances(ctx, param)
+		if errSearch != nil {
+			logger.ConsumerLog.Errorf("SearchNFInstances failed: %+v", errSearch)
+			return nil, "", errSearch
+		}
+		if res != nil {
+			result = &res.SearchResult
+			disccache.Put(cacheKey, result)
+		}
 	}
 
 	nfProf, uri, err := getProfileAndUri(result, srvName)
