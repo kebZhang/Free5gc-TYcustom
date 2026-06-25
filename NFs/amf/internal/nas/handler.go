@@ -3,10 +3,12 @@ package nas
 import (
 	"fmt"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	gmm_common "github.com/free5gc/amf/internal/gmm/common"
 	"github.com/free5gc/amf/internal/logger"
 	"github.com/free5gc/amf/internal/nas/nas_security"
+	"github.com/free5gc/amf/internal/recvtime"
 	"github.com/free5gc/nas"
 	nas_metrics "github.com/free5gc/util/metrics/nas"
 )
@@ -58,6 +60,11 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 
 	nasMsg = msg
 
+	// AMF_log: record the SCTP-read time for the uplink NAS messages of interest.
+	// The read time was captured at SCTPRead and carried (goroutine-local) to here;
+	// logging is asynchronous and never blocks this path.
+	logUplinkNAS(ranUe, msg)
+
 	ranUe.AmfUe.NasPduValue = nasPdu
 	ranUe.AmfUe.MacFailed = !integrityProtected
 
@@ -72,6 +79,48 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 		ranUe.AmfUe.NASLog.Errorf("Handle NAS Error: %v", errDispatch)
 		isNasMsgRcv = false
 	}
+}
+
+// logUplinkNAS asynchronously records the SCTP-read time of the uplink NAS
+// messages we care about (Registration Request, Authentication Response,
+// Security Mode Complete) to AMF_log. It is the uplink counterpart of the
+// downlink logging in the ngap/message send path.
+//
+// The read time was captured at SCTPRead and carried goroutine-locally to here.
+// All work is cheap (a type switch + an async enqueue); if no read time is
+// present (e.g. unexpected call path) the message is simply skipped.
+func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message) {
+	if msg == nil || msg.GmmMessage == nil {
+		return
+	}
+
+	var nasType string
+	switch msg.GmmMessage.GmmHeader.GetMessageType() {
+	case nas.MsgTypeRegistrationRequest:
+		nasType = "RegistrationRequest"
+	case nas.MsgTypeAuthenticationResponse:
+		nasType = "AuthenticationResponse"
+	case nas.MsgTypeSecurityModeComplete:
+		nasType = "SecurityModeComplete"
+	default:
+		return // not a message of interest
+	}
+
+	t, ok := recvtime.Current()
+	if !ok {
+		return
+	}
+
+	var ueID string
+	if amfUe := ranUe.AmfUe; amfUe != nil {
+		if amfUe.Supi != "" {
+			ueID = amfUe.Supi
+		} else {
+			ueID = amfUe.Suci
+		}
+	}
+
+	accesslog.LogNGAP("UL", nasType, ueID, t)
 }
 
 // Get5GSMobileIdentityFromNASPDU is used to find MobileIdentity from plain nas

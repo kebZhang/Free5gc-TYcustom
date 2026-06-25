@@ -7,12 +7,26 @@ import (
 	gmm_common "github.com/free5gc/amf/internal/gmm/common"
 	"github.com/free5gc/amf/internal/logger"
 	ngap_message "github.com/free5gc/amf/internal/ngap/message"
+	"github.com/free5gc/amf/internal/recvtime"
 	callback "github.com/free5gc/amf/internal/sbi/processor/notifier"
 	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/ngap/ngapType"
 	"github.com/free5gc/openapi/models"
 	nasMetrics "github.com/free5gc/util/metrics/nas"
 )
+
+// dlUeID returns the best available UE identifier for AMF_log downlink records:
+// the SUPI once known, otherwise the SUCI (e.g. Authentication Request may be
+// sent before the SUPI is resolved).
+func dlUeID(amfUe *context.AmfUe) string {
+	if amfUe == nil {
+		return ""
+	}
+	if amfUe.Supi != "" {
+		return amfUe.Supi
+	}
+	return amfUe.Suci
+}
 
 // backOffTimerUint = 7 means backoffTimer is null
 func SendDLNASTransport(ue *context.RanUe, payloadContainerType uint8, nasPdu []byte,
@@ -171,7 +185,11 @@ func SendAuthenticationRequest(ue *context.RanUe) {
 	}
 
 	isNasMsgSent = true
+	// AMF_log: mark the downlink NAS type so the SCTP write time is recorded in
+	// ngap message SendToRan (asynchronous; never blocks the send path).
+	recvtime.SetDLNas("AuthenticationRequest", dlUeID(amfUe))
 	ngap_message.SendDownlinkNasTransport(ue, nasMsg, nil)
+	recvtime.ClearDLNas()
 
 	if context.GetSelf().T3560Cfg.Enable {
 		cfg := context.GetSelf().T3560Cfg
@@ -180,7 +198,9 @@ func SendAuthenticationRequest(ue *context.RanUe) {
 			amfUe.GmmLog.Warnf("T3560 expires, retransmit Authentication Request (retry: %d)", expireTimes)
 			timerAdditionalCause := "Timer expired, retry authentication request"
 			defer nasMetrics.IncrMetricsSentNasMsgs(nasMetrics.AUTHENTICATION_REQUEST, &isNasMsgSent, 0, &timerAdditionalCause)
+			recvtime.SetDLNas("AuthenticationRequest", dlUeID(amfUe))
 			ngap_message.SendDownlinkNasTransport(ue, nasMsg, nil)
+			recvtime.ClearDLNas()
 		}, func() {
 			amfUe.Lock.Lock()
 			defer amfUe.Lock.Unlock()
@@ -457,7 +477,11 @@ func SendSecurityModeCommand(ue *context.RanUe, accessType models.AccessType, ea
 	}
 
 	isNasMsgSent = true
+	// AMF_log: mark the downlink NAS type so the SCTP write time is recorded in
+	// ngap message SendToRan (asynchronous; never blocks the send path).
+	recvtime.SetDLNas("SecurityModeCommand", dlUeID(amfUe))
 	ngap_message.SendDownlinkNasTransport(ue, nasMsg, nil)
+	recvtime.ClearDLNas()
 
 	if context.GetSelf().T3560Cfg.Enable {
 		cfg := context.GetSelf().T3560Cfg
@@ -466,7 +490,9 @@ func SendSecurityModeCommand(ue *context.RanUe, accessType models.AccessType, ea
 			amfUe.GmmLog.Warnf("T3560 expires, retransmit Security Mode Command (retry: %d)", expireTimes)
 			timerAdditionalCause := "Retry Security Mode Command"
 			defer nasMetrics.IncrMetricsSentNasMsgs(nasMetrics.SECURITY_MODE_COMMAND, &isNasMsgSent, 0, &timerAdditionalCause)
+			recvtime.SetDLNas("SecurityModeCommand", dlUeID(amfUe))
 			ngap_message.SendDownlinkNasTransport(ue, nasMsg, nil)
+			recvtime.ClearDLNas()
 		}, func() {
 			amfUe.Lock.Lock()
 			defer amfUe.Lock.Unlock()
@@ -597,7 +623,11 @@ func SendRegistrationAccept(
 		ngap_message.SendInitialContextSetupRequest(amfUe, anType, nil, cxtList, nil, nil, nil)
 	} else {
 		// anType is 3GPP_ACCESS
+		// AMF_log: mark the downlink NAS type so the SCTP write time is recorded
+		// in ngap message SendToRan (asynchronous; never blocks the send path).
+		recvtime.SetDLNas("RegistrationAccept", dlUeID(amfUe))
 		ngap_message.SendN2Message(amfUe, anType, nasMsg, cxtList, nil, nil, nil, nil)
+		recvtime.ClearDLNas()
 	}
 
 	if context.GetSelf().T3550Cfg.Enable {
@@ -612,7 +642,9 @@ func SendRegistrationAccept(
 				timerAdditionalCause := "Retry Registration Accept"
 				defer nasMetrics.IncrMetricsSentNasMsgs(
 					nasMetrics.REGISTRATION_ACCEPT_TIMER, &isNasMsgSent, 0, &timerAdditionalCause)
+				recvtime.SetDLNas("RegistrationAccept", dlUeID(amfUe))
 				ngap_message.SendN2Message(amfUe, anType, nasMsg, cxtList, nil, nil, nil, nil)
+				recvtime.ClearDLNas()
 			}
 		}, func() {
 			amfUe.GmmLog.Warnf("T3550 Expires %d times, abort retransmission of Registration Accept", cfg.MaxRetryTimes)

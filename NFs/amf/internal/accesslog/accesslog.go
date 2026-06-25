@@ -13,6 +13,7 @@
 // Files (override with env vars):
 //   - HTTP_LOG_PATH (default /tmp/HTTP_log.txt)
 //   - DB_LOG_PATH   (default /tmp/DB_log.txt)
+//   - NGAP_LOG_PATH (default /tmp/AMF_log.txt) - NAS messages at the SCTP boundary
 //
 // All timestamps are recorded from the NF's (requester's) point of view.
 package accesslog
@@ -36,6 +37,7 @@ type recKind uint8
 const (
 	kindHTTP recKind = iota
 	kindDB
+	kindNGAP
 )
 
 // record is a single log entry queued for the writer goroutine. It already
@@ -54,9 +56,11 @@ const (
 
 	envHTTPPath = "HTTP_LOG_PATH"
 	envDBPath   = "DB_LOG_PATH"
+	envNGAPPath = "NGAP_LOG_PATH"
 
 	defaultHTTPPath = "/tmp/HTTP_log.txt"
 	defaultDBPath   = "/tmp/DB_log.txt"
+	defaultNGAPPath = "/tmp/AMF_log.txt"
 )
 
 var (
@@ -106,6 +110,7 @@ func envOr(key, def string) string {
 func writerLoop() {
 	httpFile, httpW := openLog(envOr(envHTTPPath, defaultHTTPPath))
 	dbFile, dbW := openLog(envOr(envDBPath, defaultDBPath))
+	ngapFile, ngapW := openLog(envOr(envNGAPPath, defaultNGAPPath))
 	defer func() {
 		if httpW != nil {
 			_ = httpW.Flush()
@@ -113,11 +118,17 @@ func writerLoop() {
 		if dbW != nil {
 			_ = dbW.Flush()
 		}
+		if ngapW != nil {
+			_ = ngapW.Flush()
+		}
 		if httpFile != nil {
 			_ = httpFile.Close()
 		}
 		if dbFile != nil {
 			_ = dbFile.Close()
+		}
+		if ngapFile != nil {
+			_ = ngapFile.Close()
 		}
 	}()
 
@@ -130,41 +141,44 @@ func writerLoop() {
 			if !ok {
 				return
 			}
-			writeRec(httpW, dbW, rec)
+			writeRec(httpW, dbW, ngapW, rec)
 			// Drain anything already queued without blocking, to batch writes.
 			drain := len(queue)
 			for i := 0; i < drain; i++ {
-				writeRec(httpW, dbW, <-queue)
+				writeRec(httpW, dbW, ngapW, <-queue)
 			}
 		case <-flushTicker.C:
-			flush(httpW, dbW)
+			flush(httpW, dbW, ngapW)
 		case done := <-flushReq:
 			// Drain everything currently queued, then flush, then signal.
-			drainAll(httpW, dbW)
-			flush(httpW, dbW)
+			drainAll(httpW, dbW, ngapW)
+			flush(httpW, dbW, ngapW)
 			close(done)
 		}
 	}
 }
 
 // drainAll writes every record currently buffered in the queue without blocking.
-func drainAll(httpW, dbW *bufio.Writer) {
+func drainAll(httpW, dbW, ngapW *bufio.Writer) {
 	for {
 		select {
 		case rec := <-queue:
-			writeRec(httpW, dbW, rec)
+			writeRec(httpW, dbW, ngapW, rec)
 		default:
 			return
 		}
 	}
 }
 
-func flush(httpW, dbW *bufio.Writer) {
+func flush(httpW, dbW, ngapW *bufio.Writer) {
 	if httpW != nil {
 		_ = httpW.Flush()
 	}
 	if dbW != nil {
 		_ = dbW.Flush()
+	}
+	if ngapW != nil {
+		_ = ngapW.Flush()
 	}
 }
 
@@ -177,13 +191,15 @@ func openLog(path string) (*os.File, *bufio.Writer) {
 	return f, bufio.NewWriterSize(f, writerBufferSize)
 }
 
-func writeRec(httpW, dbW *bufio.Writer, rec record) {
+func writeRec(httpW, dbW, ngapW *bufio.Writer, rec record) {
 	var w *bufio.Writer
 	switch rec.kind {
 	case kindHTTP:
 		w = httpW
 	case kindDB:
 		w = dbW
+	case kindNGAP:
+		w = ngapW
 	}
 	if w == nil {
 		return
@@ -329,6 +345,25 @@ func LogDB(mongo, resource, operation, ueID string, reqTime, respTime time.Time)
 	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))
 	b = append(b, '}')
 	enqueue(kindDB, b)
+}
+
+// LogNGAP records one NAS message crossing the AMF<->gNB SCTP boundary, with the
+// timestamp taken at the SCTP layer (read for uplink, write for downlink). It is
+// written to AMF_log.txt (NGAP_LOG_PATH).
+//   - direction: "UL" (gNB->AMF) or "DL" (AMF->gNB)
+//   - nasType:   NAS message type name (e.g. "RegistrationRequest")
+//   - ueID:      UE id involved (may be "")
+//   - sctpTime:  SCTP read time (UL) or SCTP write time (DL)
+func LogNGAP(direction, nasType, ueID string, sctpTime time.Time) {
+	b := make([]byte, 0, 160)
+	b = append(b, '{')
+	b = appendKV(b, "nf", srcNF, true)
+	b = appendKV(b, "dir", direction, false)
+	b = appendKV(b, "nas_type", nasType, false)
+	b = appendKV(b, "ue_id", ueID, false)
+	b = appendKV(b, "sctp_time", formatTime(sctpTime), false)
+	b = append(b, '}')
+	enqueue(kindNGAP, b)
 }
 
 func appendDurUs(b []byte, key string, d time.Duration) []byte {

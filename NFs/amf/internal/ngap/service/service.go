@@ -8,9 +8,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/free5gc/amf/internal/logger"
 	ngap_internal "github.com/free5gc/amf/internal/ngap"
+	"github.com/free5gc/amf/internal/recvtime"
 	"github.com/free5gc/amf/pkg/factory"
 	"github.com/free5gc/ngap"
 	"github.com/free5gc/sctp"
@@ -219,6 +221,10 @@ func handleConnection(conn *sctp.SCTPConn, bufsize uint32, handler NGAPHandler) 
 		buf := make([]byte, bufsize)
 
 		n, info, notification, err := conn.SCTPRead(buf)
+		// Capture the SCTP-read time as early as possible (memory only). It is
+		// carried with the message and only written to AMF_log later, once the
+		// NAS layer has confirmed the message type. Never falls on the I/O path.
+		recvTime := time.Now()
 		if err != nil {
 			switch err {
 			case io.EOF, io.ErrUnexpectedEOF:
@@ -258,7 +264,7 @@ func handleConnection(conn *sctp.SCTPConn, bufsize uint32, handler NGAPHandler) 
 			logger.NgapLog.Tracef("Packet content:\n%+v", hex.Dump(buf[:n]))
 
 			// Dispatch message through worker pool for parallel processing
-			dispatchToWorkerPool(conn, buf[:n], handler)
+			dispatchToWorkerPool(conn, buf[:n], recvTime, handler)
 		}
 	}
 }
@@ -274,12 +280,16 @@ func handleConnection(conn *sctp.SCTPConn, bufsize uint32, handler NGAPHandler) 
 // The dGNB scenario is detected at SCTP accept time (see listenAndServe), so by
 // the time any NGAP message arrives the mode is already latched; this function
 // only reads the latched decision and never flips it mid-association.
-func dispatchToWorkerPool(conn net.Conn, msg []byte, handler NGAPHandler) {
+func dispatchToWorkerPool(conn net.Conn, msg []byte, recvTime time.Time, handler NGAPHandler) {
 	scheduler, err := ngap_internal.GetScheduler()
 	if err != nil {
 		// Fallback to direct handling if scheduler is not initialized
 		logger.NgapLog.Warnf("Scheduler not initialized, falling back to sequential processing: %v", err)
+		// Stash the read time for the (synchronous) handler on this goroutine so
+		// the NAS layer can attach it to AMF_log, matching the worker path.
+		recvtime.Set(recvTime)
 		handler.HandleMessage(conn, msg)
+		recvtime.Clear()
 		return
 	}
 
@@ -292,9 +302,10 @@ func dispatchToWorkerPool(conn net.Conn, msg []byte, handler NGAPHandler) {
 	}
 
 	task := ngap_internal.Task{
-		UEID:    ueID,
-		Conn:    conn,
-		Message: msg,
+		UEID:     ueID,
+		Conn:     conn,
+		Message:  msg,
+		RecvTime: recvTime,
 	}
 
 	// Attempt to dispatch to worker pool

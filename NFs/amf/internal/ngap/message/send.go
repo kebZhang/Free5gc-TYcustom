@@ -3,9 +3,11 @@ package message
 import (
 	"time"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	"github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
 	business_metrics "github.com/free5gc/amf/internal/metrics/business"
+	"github.com/free5gc/amf/internal/recvtime"
 	callback "github.com/free5gc/amf/internal/sbi/processor/notifier"
 	"github.com/free5gc/aper"
 	"github.com/free5gc/ngap/ngapType"
@@ -52,6 +54,13 @@ func SendToRan(ran *context.AmfRan, packet []byte) (bool, string) {
 		ran.Log.Errorf("Send error: %+v", err)
 		return false, ngap_metrics.SCTP_SOCKET_WRITE_ERR
 	} else {
+		// AMF_log: capture the SCTP write time and, if a downlink NAS type was
+		// marked by the GMM send path on this goroutine, record it. The logging
+		// is asynchronous (enqueue only) and never blocks this send path.
+		sentTime := time.Now()
+		if nasType, ueID, ok := recvtime.CurrentDLNas(); ok {
+			accesslog.LogNGAP("DL", nasType, ueID, sentTime)
+		}
 		ran.Log.Debugf("Write %d bytes", n)
 	}
 	return true, ""

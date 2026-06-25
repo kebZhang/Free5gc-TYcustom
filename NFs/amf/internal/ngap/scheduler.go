@@ -7,8 +7,10 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/free5gc/amf/internal/logger"
+	"github.com/free5gc/amf/internal/recvtime"
 )
 
 // workerNumFilePath is where the peak (maximum) number of distinct NGAP workers
@@ -26,9 +28,10 @@ const workerNumFilePath = "/tmp/worker_num.txt"
 //     stay ordered on a single worker and the RAN-UE-NGAP-ID (which is not
 //     unique across gNBs) is not used for routing.
 type Task struct {
-	UEID    uint64   // AMF-UE-NGAP-ID or RAN-UE-NGAP-ID (used only in non-dGNB mode)
-	Conn    net.Conn // The SCTP association this message arrived on
-	Message []byte   // The raw NGAP message bytes
+	UEID     uint64    // AMF-UE-NGAP-ID or RAN-UE-NGAP-ID (used only in non-dGNB mode)
+	Conn     net.Conn  // The SCTP association this message arrived on
+	Message  []byte    // The raw NGAP message bytes
+	RecvTime time.Time // Time the message was returned by SCTPRead; used only for AMF_log
 }
 
 // Worker represents a goroutine that processes tasks from its dedicated queue.
@@ -70,7 +73,9 @@ func (w *Worker) run() {
 		case task := <-w.taskChan:
 			logger.NgapLog.Debugf("Worker %d processing message from %v (per-association ordering)",
 				w.ID, task.Conn.RemoteAddr())
+			recvtime.Set(task.RecvTime)
 			w.handler(task.Conn, task.Message)
+			recvtime.Clear()
 
 		case <-w.stopChan:
 			logger.NgapLog.Infof("Worker %d: shutdown signal received, draining queue...", w.ID)
@@ -86,7 +91,9 @@ func (w *Worker) drainAndExit() {
 		select {
 		case task := <-w.taskChan:
 			logger.NgapLog.Debugf("Worker %d processing residual message from %v", w.ID, task.Conn.RemoteAddr())
+			recvtime.Set(task.RecvTime)
 			w.handler(task.Conn, task.Message)
+			recvtime.Clear()
 		default:
 			// Channel is empty, exit safely
 			logger.NgapLog.Infof("Worker %d: queue drained, stopped.", w.ID)
