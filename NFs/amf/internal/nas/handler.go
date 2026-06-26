@@ -10,6 +10,8 @@ import (
 	"github.com/free5gc/amf/internal/nas/nas_security"
 	"github.com/free5gc/amf/internal/recvtime"
 	"github.com/free5gc/nas"
+	"github.com/free5gc/nas/nasConvert"
+	"github.com/free5gc/nas/nasMessage"
 	nas_metrics "github.com/free5gc/util/metrics/nas"
 )
 
@@ -120,7 +122,54 @@ func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message) {
 		}
 	}
 
+	// For the very first uplink message (RegistrationRequest) the AmfUe has not
+	// been populated yet (Suci/Supi are still empty), so ueID would otherwise be
+	// "". The SUCI is, however, already present in the RegistrationRequest body,
+	// so derive it here purely for logging. This is read-only on the NAS message,
+	// never touches ranUe/amfUe state, and any failure is silently ignored — it
+	// cannot affect the registration business logic.
+	if ueID == "" && nasType == "RegistrationRequest" {
+		if suci, ok := suciFromRegistrationRequest(msg); ok {
+			ueID = suci
+		}
+	}
+
 	accesslog.LogNGAP("UL", nasType, ueID, t)
+}
+
+// suciFromRegistrationRequest extracts the SUCI string (e.g.
+// "suci-0-999-70-0-0-0-0000000004") from a RegistrationRequest, using the same
+// decoding as the GMM handler so the log format matches AmfUe.Suci exactly.
+//
+// It is logging-only and intentionally defensive: it reads from the decoded NAS
+// message without mutating any context, returns ("", false) on anything
+// unexpected, and recovers from any panic in the underlying decoder so it can
+// never impact the data path. Only the SUCI identity type yields a value; GUTI /
+// no-identity registrations return ("", false) and keep ue_id empty as before.
+func suciFromRegistrationRequest(msg *nas.Message) (suci string, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			suci, ok = "", false
+		}
+	}()
+
+	if msg == nil || msg.GmmMessage == nil || msg.RegistrationRequest == nil {
+		return "", false
+	}
+
+	contents := msg.RegistrationRequest.MobileIdentity5GS.GetMobileIdentity5GSContents()
+	if len(contents) < 1 {
+		return "", false
+	}
+	if nasConvert.GetTypeOfIdentity(contents[0]) != nasMessage.MobileIdentity5GSTypeSuci {
+		return "", false
+	}
+
+	s, plmnId, err := nasConvert.SuciToStringWithError(contents)
+	if err != nil || plmnId == "" || s == "" {
+		return "", false
+	}
+	return s, true
 }
 
 // Get5GSMobileIdentityFromNASPDU is used to find MobileIdentity from plain nas
