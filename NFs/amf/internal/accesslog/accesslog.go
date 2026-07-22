@@ -38,6 +38,7 @@ const (
 	kindHTTP recKind = iota
 	kindDB
 	kindNGAP
+	kindWorker
 )
 
 // record is a single log entry queued for the writer goroutine. It already
@@ -54,13 +55,15 @@ const (
 	queueCapacity = 1 << 21 // 2097152
 	writerBufferSize = 1 << 20 // 1 MiB
 
-	envHTTPPath = "HTTP_LOG_PATH"
-	envDBPath   = "DB_LOG_PATH"
-	envNGAPPath = "NGAP_LOG_PATH"
+	envHTTPPath   = "HTTP_LOG_PATH"
+	envDBPath     = "DB_LOG_PATH"
+	envNGAPPath   = "NGAP_LOG_PATH"
+	envWorkerPath = "WORKER_LOG_PATH"
 
-	defaultHTTPPath = "/tmp/HTTP_log.txt"
-	defaultDBPath   = "/tmp/DB_log.txt"
-	defaultNGAPPath = "/tmp/AMF_log.txt"
+	defaultHTTPPath   = "/tmp/HTTP_log.txt"
+	defaultDBPath     = "/tmp/DB_log.txt"
+	defaultNGAPPath   = "/tmp/AMF_log.txt"
+	defaultWorkerPath = "/tmp/AMF_worker_log.txt"
 )
 
 var (
@@ -111,6 +114,7 @@ func writerLoop() {
 	httpFile, httpW := openLog(envOr(envHTTPPath, defaultHTTPPath))
 	dbFile, dbW := openLog(envOr(envDBPath, defaultDBPath))
 	ngapFile, ngapW := openLog(envOr(envNGAPPath, defaultNGAPPath))
+	workerFile, workerW := openLog(envOr(envWorkerPath, defaultWorkerPath))
 	defer func() {
 		if httpW != nil {
 			_ = httpW.Flush()
@@ -121,6 +125,9 @@ func writerLoop() {
 		if ngapW != nil {
 			_ = ngapW.Flush()
 		}
+		if workerW != nil {
+			_ = workerW.Flush()
+		}
 		if httpFile != nil {
 			_ = httpFile.Close()
 		}
@@ -129,6 +136,9 @@ func writerLoop() {
 		}
 		if ngapFile != nil {
 			_ = ngapFile.Close()
+		}
+		if workerFile != nil {
+			_ = workerFile.Close()
 		}
 	}()
 
@@ -141,36 +151,36 @@ func writerLoop() {
 			if !ok {
 				return
 			}
-			writeRec(httpW, dbW, ngapW, rec)
+			writeRec(httpW, dbW, ngapW, workerW, rec)
 			// Drain anything already queued without blocking, to batch writes.
 			drain := len(queue)
 			for i := 0; i < drain; i++ {
-				writeRec(httpW, dbW, ngapW, <-queue)
+				writeRec(httpW, dbW, ngapW, workerW, <-queue)
 			}
 		case <-flushTicker.C:
-			flush(httpW, dbW, ngapW)
+			flush(httpW, dbW, ngapW, workerW)
 		case done := <-flushReq:
 			// Drain everything currently queued, then flush, then signal.
-			drainAll(httpW, dbW, ngapW)
-			flush(httpW, dbW, ngapW)
+			drainAll(httpW, dbW, ngapW, workerW)
+			flush(httpW, dbW, ngapW, workerW)
 			close(done)
 		}
 	}
 }
 
 // drainAll writes every record currently buffered in the queue without blocking.
-func drainAll(httpW, dbW, ngapW *bufio.Writer) {
+func drainAll(httpW, dbW, ngapW, workerW *bufio.Writer) {
 	for {
 		select {
 		case rec := <-queue:
-			writeRec(httpW, dbW, ngapW, rec)
+			writeRec(httpW, dbW, ngapW, workerW, rec)
 		default:
 			return
 		}
 	}
 }
 
-func flush(httpW, dbW, ngapW *bufio.Writer) {
+func flush(httpW, dbW, ngapW, workerW *bufio.Writer) {
 	if httpW != nil {
 		_ = httpW.Flush()
 	}
@@ -179,6 +189,9 @@ func flush(httpW, dbW, ngapW *bufio.Writer) {
 	}
 	if ngapW != nil {
 		_ = ngapW.Flush()
+	}
+	if workerW != nil {
+		_ = workerW.Flush()
 	}
 }
 
@@ -191,7 +204,7 @@ func openLog(path string) (*os.File, *bufio.Writer) {
 	return f, bufio.NewWriterSize(f, writerBufferSize)
 }
 
-func writeRec(httpW, dbW, ngapW *bufio.Writer, rec record) {
+func writeRec(httpW, dbW, ngapW, workerW *bufio.Writer, rec record) {
 	var w *bufio.Writer
 	switch rec.kind {
 	case kindHTTP:
@@ -200,6 +213,8 @@ func writeRec(httpW, dbW, ngapW *bufio.Writer, rec record) {
 		w = dbW
 	case kindNGAP:
 		w = ngapW
+	case kindWorker:
+		w = workerW
 	}
 	if w == nil {
 		return
@@ -364,6 +379,56 @@ func LogNGAP(direction, nasType, ueID string, sctpTime time.Time) {
 	b = appendKV(b, "sctp_time", formatTime(sctpTime), false)
 	b = append(b, '}')
 	enqueue(kindNGAP, b)
+}
+
+// SBIView is one downstream SBI call's endpoints for a worker log line: the
+// call's short name and the AMF-clock timestamps taken immediately before
+// entering the consumer Send* (T3) and immediately after it returned (T6).
+// It mirrors msgtrace.SBICall but is defined here so accesslog does not import
+// msgtrace (keeping the dependency direction one-way: callers convert).
+type SBIView struct {
+	Call   string
+	Before time.Time
+	After  time.Time
+}
+
+// LogWorker records one uplink NAS message's worker timeline to
+// AMF_worker_log.txt (WORKER_LOG_PATH). One line per handled uplink NAS message.
+//   - ueID/nasType: the message this worker pass handled
+//   - recv  (T0): SCTP read time of the message
+//   - start (T2): worker began handling it
+//   - end   (T8): the handler returned
+//   - sbi:        every downstream SBI call it triggered, each with before (T3)
+//     and after (T6). May be empty.
+//
+// The line format is JSON with an embedded "sbi" array; timestamps are the same
+// RFC3339Nano UTC as every other log, so all files can be joined by ue_id and
+// sorted by time. Enqueue only — never blocks the worker.
+func LogWorker(ueID, nasType string, recv, start, end time.Time, sbi []SBIView) {
+	b := make([]byte, 0, 256+len(sbi)*128)
+	b = append(b, '{')
+	b = appendKV(b, "nf", srcNF, true)
+	b = appendKV(b, "ue_id", ueID, false)
+	b = appendKV(b, "nas_type", nasType, false)
+	b = appendKV(b, "t_recv", formatTime(recv), false)
+	b = appendKV(b, "t_start", formatTime(start), false)
+	b = appendKV(b, "t_end", formatTime(end), false)
+	b = append(b, ',')
+	b = appendJSONString(b, "sbi")
+	b = append(b, ':', '[')
+	for i := range sbi {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, '{')
+		b = appendKV(b, "call", sbi[i].Call, true)
+		b = appendKV(b, "before", formatTime(sbi[i].Before), false)
+		b = appendKV(b, "after", formatTime(sbi[i].After), false)
+		b = append(b, '}')
+	}
+	b = append(b, ']')
+	b = append(b, '}')
+	enqueue(kindWorker, b)
 }
 
 func appendDurUs(b []byte, key string, d time.Duration) []byte {

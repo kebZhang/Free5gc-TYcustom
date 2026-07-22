@@ -9,9 +9,29 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	"github.com/free5gc/amf/internal/logger"
+	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/amf/internal/recvtime"
 )
+
+// flushWorkerTrace converts the goroutine-local msgtrace collected during one
+// handler pass into a worker log line and enqueues it (async). Called right
+// after the handler returns; a nil trace (unexpected path) is silently skipped.
+func flushWorkerTrace(end time.Time) {
+	tr := msgtrace.End(end)
+	if tr == nil {
+		return
+	}
+	var views []accesslog.SBIView
+	if len(tr.SBI) > 0 {
+		views = make([]accesslog.SBIView, len(tr.SBI))
+		for i, c := range tr.SBI {
+			views[i] = accesslog.SBIView{Call: c.Call, Before: c.Before, After: c.After}
+		}
+	}
+	accesslog.LogWorker(tr.UeID, tr.NasType, tr.Recv, tr.Start, tr.End, views)
+}
 
 // workerNumFilePath is where the peak (maximum) number of distinct NGAP workers
 // exercised during a run is written. Pinned to an absolute path so it lands in
@@ -74,7 +94,9 @@ func (w *Worker) run() {
 			logger.NgapLog.Debugf("Worker %d processing message from %v (per-association ordering)",
 				w.ID, task.Conn.RemoteAddr())
 			recvtime.Set(task.RecvTime)
+			msgtrace.Begin(task.RecvTime, time.Now()) // T0 (recv) + T2 (start)
 			w.handler(task.Conn, task.Message)
+			flushWorkerTrace(time.Now()) // T8; emits AMF_worker_log line
 			recvtime.Clear()
 
 		case <-w.stopChan:
@@ -92,7 +114,9 @@ func (w *Worker) drainAndExit() {
 		case task := <-w.taskChan:
 			logger.NgapLog.Debugf("Worker %d processing residual message from %v", w.ID, task.Conn.RemoteAddr())
 			recvtime.Set(task.RecvTime)
+			msgtrace.Begin(task.RecvTime, time.Now())
 			w.handler(task.Conn, task.Message)
+			flushWorkerTrace(time.Now())
 			recvtime.Clear()
 		default:
 			// Channel is empty, exit safely

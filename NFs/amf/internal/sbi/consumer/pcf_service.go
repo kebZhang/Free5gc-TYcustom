@@ -7,6 +7,7 @@ import (
 	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
+	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/amf/pkg/factory"
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
@@ -49,6 +50,7 @@ func (s *npcfService) getAMPolicyClient(uri string) *Npcf_AMPolicy.APIClient {
 func (s *npcfService) AMPolicyControlCreate(
 	ue *amf_context.AmfUe, anType models.AccessType,
 ) (*models.ProblemDetails, error) {
+	defer msgtrace.Track("PCF_am-policy-create")() // T3 entry / T6 return
 	client := s.getAMPolicyClient(ue.PcfUri)
 	if client == nil {
 		return nil, openapi.ReportError("pcf not found")

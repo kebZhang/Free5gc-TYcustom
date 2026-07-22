@@ -7,6 +7,7 @@ import (
 	amf_context "github.com/free5gc/amf/internal/context"
 	gmm_common "github.com/free5gc/amf/internal/gmm/common"
 	"github.com/free5gc/amf/internal/logger"
+	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/amf/internal/nas/nas_security"
 	"github.com/free5gc/amf/internal/recvtime"
 	"github.com/free5gc/nas"
@@ -135,6 +136,11 @@ func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message) {
 	}
 
 	accesslog.LogNGAP("UL", nasType, ueID, t)
+
+	// AMF_worker_log: fill in the ue_id / nas_type of the worker trace started
+	// for this message (they are only known now, after NAS decode). The SBI
+	// calls this message triggers are appended later on the same goroutine.
+	msgtrace.SetID(ueID, nasType)
 }
 
 // suciFromRegistrationRequest extracts the SUCI string (e.g.
