@@ -6,7 +6,6 @@ import (
 
 	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
-	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/amf/pkg/factory"
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
@@ -97,7 +96,7 @@ func (s *nudmService) PutUpuAck(ue *amf_context.AmfUe, upuMacIue string) error {
 }
 
 func (s *nudmService) SDMGetAmData(ue *amf_context.AmfUe) (problemDetails *models.ProblemDetails, err error) {
-	defer msgtrace.Track("UDM_sdm-am-data")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("UDM_sdm-am-data")() // T3 entry / T6 return
 	client := s.getSubscriberDMngmntClients(ue.NudmSDMUri)
 	if client == nil {
 		return nil, openapi.ReportError("udm not found")
@@ -146,7 +145,7 @@ func (s *nudmService) SDMGetAmData(ue *amf_context.AmfUe) (problemDetails *model
 }
 
 func (s *nudmService) SDMGetSmfSelectData(ue *amf_context.AmfUe) (problemDetails *models.ProblemDetails, err error) {
-	defer msgtrace.Track("UDM_sdm-smf-select")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("UDM_sdm-smf-select")() // T3 entry / T6 return
 	client := s.getSubscriberDMngmntClients(ue.NudmSDMUri)
 	if client == nil {
 		return nil, openapi.ReportError("udm not found")
@@ -193,7 +192,7 @@ func (s *nudmService) SDMGetSmfSelectData(ue *amf_context.AmfUe) (problemDetails
 func (s *nudmService) SDMGetUeContextInSmfData(
 	ue *amf_context.AmfUe,
 ) (problemDetails *models.ProblemDetails, err error) {
-	defer msgtrace.Track("UDM_sdm-ue-context-in-smf")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("UDM_sdm-ue-context-in-smf")() // T3 entry / T6 return
 	client := s.getSubscriberDMngmntClients(ue.NudmSDMUri)
 	if client == nil {
 		return nil, openapi.ReportError("udm not found")
@@ -235,7 +234,7 @@ func (s *nudmService) SDMGetUeContextInSmfData(
 }
 
 func (s *nudmService) SDMSubscribe(ue *amf_context.AmfUe) (problemDetails *models.ProblemDetails, err error) {
-	defer msgtrace.Track("UDM_sdm-subscribe")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("UDM_sdm-subscribe")() // T3 entry / T6 return
 	client := s.getSubscriberDMngmntClients(ue.NudmSDMUri)
 	if client == nil {
 		return nil, openapi.ReportError("udm not found")
@@ -286,7 +285,7 @@ func (s *nudmService) SDMSubscribe(ue *amf_context.AmfUe) (problemDetails *model
 func (s *nudmService) SDMGetSliceSelectionSubscriptionData(
 	ue *amf_context.AmfUe,
 ) (problemDetails *models.ProblemDetails, err error) {
-	defer msgtrace.Track("UDM_sdm-nssai")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("UDM_sdm-nssai")() // T3 entry / T6 return
 	client := s.getSubscriberDMngmntClients(ue.NudmSDMUri)
 	if client == nil {
 		return nil, openapi.ReportError("udm not found")
@@ -391,7 +390,7 @@ func (s *nudmService) SDMUnsubscribe(ue *amf_context.AmfUe) (problemDetails *mod
 func (s *nudmService) UeCmRegistration(
 	ue *amf_context.AmfUe, accessType models.AccessType, initialRegistrationInd bool,
 ) (*models.ProblemDetails, error) {
-	defer msgtrace.Track("UDM_uecm-registration")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("UDM_uecm-registration")() // T3 entry / T6 return
 	client := s.getUEContextMngmntClient(ue.NudmUECMUri)
 	if client == nil {
 		return nil, openapi.ReportError("udm not found")

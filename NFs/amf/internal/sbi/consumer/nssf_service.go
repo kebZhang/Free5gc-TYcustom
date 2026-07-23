@@ -5,7 +5,6 @@ import (
 
 	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
-	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
 	Nnssf_NSSelection "github.com/free5gc/openapi/nssf/NSSelection"
@@ -47,7 +46,7 @@ func (s *nssfService) getNSSelectionClient(uri string) *Nnssf_NSSelection.APICli
 func (s *nssfService) NSSelectionGetForRegistration(ue *amf_context.AmfUe, requestedNssai []models.MappingOfSnssai) (
 	*models.ProblemDetails, error,
 ) {
-	defer msgtrace.Track("NSSF_ns-selection-registration")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("NSSF_ns-selection-registration")() // T3 entry / T6 return
 	client := s.getNSSelectionClient(ue.NssfUri)
 	if client == nil {
 		return nil, openapi.ReportError("nssf not found")

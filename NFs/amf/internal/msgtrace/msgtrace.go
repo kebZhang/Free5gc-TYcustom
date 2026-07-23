@@ -1,32 +1,48 @@
 // Package msgtrace carries a per-message processing trace for the NGAP worker,
-// keyed by goroutine, so the AMF can record — asynchronously and off the data
-// path — how long each uplink NAS message spent inside the worker and around
-// each downstream SBI call it triggered.
+// so the AMF can record — asynchronously and off the data path — how long each
+// uplink NAS message spent inside the worker and around each downstream SBI call
+// it triggered.
 //
-// Why goroutine-local (same reasoning as the sibling recvtime package): a single
-// uplink NAS message is decoded and handled entirely synchronously inside ONE
-// worker goroutine (ngap worker -> Dispatch -> dispatchMain -> nas.HandleNAS ->
-// gmm FSM -> consumer.Send*). The GMM package spawns no goroutines and the FSM
-// dispatches events synchronously, so every downstream SBI call triggered by one
-// NAS message runs on that same goroutine with no channel hop in between. That
-// makes a goroutine-keyed accumulator unambiguous for the whole duration and
-// lets us avoid threading an extra parameter through the generated dispatcher
-// code (dispatcher_generated.go, DO NOT EDIT).
+// The Trace is passed EXPLICITLY (as a *Trace), never looked up by goroutine id.
+// An earlier implementation kept it goroutine-local (a global sync.Map keyed by a
+// goroutine id parsed out of runtime.Stack). Measurement showed that this became
+// a load-dependent latency source of its own: ~21 runtime.Stack calls per NAS
+// message, plus a single global map contended by hundreds of worker goroutines,
+// landing exactly on the AMF's hottest path. At RQ800 it inflated AMF-local
+// median latency ~7x. Both costs are gone here: creating and threading a plain
+// struct pointer is a few pointer dereferences with no shared container at all.
+//
+// How the pointer reaches the SBI consumers without threading a parameter
+// through the generated dispatcher (dispatcher_generated.go, DO NOT EDIT):
+// nas.HandleNAS creates the Trace and binds it to the AmfUe (AmfUe.WorkerTrace)
+// right after NAS decode; the consumers already hold that *AmfUe and read it back
+// from there. HandleNAS unbinds on return.
+//
+// Concurrency: one uplink NAS message is decoded and handled entirely
+// synchronously inside ONE worker goroutine (ngap worker -> Dispatch ->
+// dispatchMain -> nas.HandleNAS -> gmm FSM -> consumer.Send*). The GMM package
+// spawns no goroutines and the FSM dispatches events synchronously, so every SBI
+// call triggered by one NAS message runs on that same goroutine. The scheduler
+// additionally serialises messages per UE (hash-by-UEID, or per-association in
+// dGNB mode), so a given AmfUe's WorkerTrace is only ever touched by one
+// goroutine at a time. No lock is needed.
 //
 // The recorded points (see AMF_WORKER_LOG_PLAN.md):
-//   - Recv  (T0): SCTP read time of the message (carried in from the scheduler).
-//   - Start (T2): worker picked the message off its channel and began handling.
+//   - Start (T2): nas.HandleNAS entry, i.e. the worker began handling it.
 //   - each SBI call: Before (T3) entering consumer.Send*, After (T6) it returned.
 //   - End   (T8): the handler returned; the trace is flushed to AMF_worker_log.
 //
+// T0/T1 (the SCTP read time) is deliberately NOT carried here: it is already
+// recorded as the UL sctp_time in AMF_log, and the two were byte-for-byte
+// identical in the previous implementation. Dropping it is what removes the need
+// to pass anything across the generated dispatcher.
+//
 // This never affects data-plane correctness: it only feeds an asynchronous log.
-// A missed lookup (e.g. an unexpected call path) simply yields no worker record.
+// Every method is nil-safe, so a call path with no trace bound (e.g. NF
+// registration at startup, or NRF discovery) simply records nothing.
 package msgtrace
 
-import (
-	"sync"
-	"time"
-)
+import "time"
 
 // SBICall is one downstream SBI interaction the worker made while handling the
 // current NAS message. Before/After are AMF-clock timestamps taken immediately
@@ -40,66 +56,60 @@ type SBICall struct {
 	After  time.Time
 }
 
-// Trace accumulates one uplink NAS message's worker timeline.
+// Trace accumulates one uplink NAS message's worker timeline. T8 is not stored:
+// it is taken with time.Now() at flush time, in the HandleNAS defer that already
+// holds this pointer.
 type Trace struct {
 	UeID    string
 	NasType string
-	Recv    time.Time // T0
 	Start   time.Time // T2
-	End     time.Time // T8
 	SBI     []SBICall
 }
 
-var byG sync.Map // goroutine id (uint64) -> *Trace
-
-// Begin starts a trace for the current goroutine, recording T0 (recv) and T2
-// (start). Pair with End (which removes it) so a reused worker goroutine never
-// leaks or bleeds one message's SBI list into the next.
-func Begin(recv, start time.Time) {
-	byG.Store(goroutineID(), &Trace{Recv: recv, Start: start})
+// New starts a trace, recording T2 (start). It is a plain allocation: no table
+// lookup, no stack walk.
+func New(start time.Time) *Trace {
+	return &Trace{Start: start}
 }
 
 // SetID fills in the UE id and NAS type once the NAS layer has decoded them
-// (they are not known yet at Begin time). No-op if no trace is active.
-func SetID(ueID, nasType string) {
-	if v, ok := byG.Load(goroutineID()); ok {
-		t := v.(*Trace)
-		t.UeID = ueID
-		t.NasType = nasType
+// (they are not known yet at New time). nil-safe.
+func (t *Trace) SetID(ueID, nasType string) {
+	if t == nil {
+		return
 	}
+	t.UeID = ueID
+	t.NasType = nasType
 }
 
-// AddSBI appends one downstream SBI call (T3/T6) to the current trace. No-op if
-// no trace is active (e.g. an SBI call made outside NAS handling, such as NF
-// registration at startup).
-func AddSBI(call string, before, after time.Time) {
-	if v, ok := byG.Load(goroutineID()); ok {
-		t := v.(*Trace)
-		t.SBI = append(t.SBI, SBICall{Call: call, Before: before, After: after})
+// AddSBI appends one downstream SBI call (T3/T6) to the trace. nil-safe.
+func (t *Trace) AddSBI(call string, before, after time.Time) {
+	if t == nil {
+		return
 	}
+	t.SBI = append(t.SBI, SBICall{Call: call, Before: before, After: after})
 }
 
 // Track is a convenience wrapper for consumer Send* functions: it captures T3
 // now and returns a closure that captures T6 and appends the call. Intended use:
 //
-//	defer msgtrace.Track("AUSF_ue-authentications")()
+//	defer ue.WorkerTrace.Track("AUSF_ue-authentications")()
 //
 // The outer call runs at defer-registration time (function entry, = T3); the
-// returned func runs when the function returns (= T6). No-op if no trace active.
-func Track(call string) func() {
+// returned func runs when the function returns (= T6).
+//
+// nil-safe, and on the nil path it does no work at all — not even time.Now() —
+// so SBI calls made outside NAS handling cost nothing.
+func (t *Trace) Track(call string) func() {
+	if t == nil {
+		return noop
+	}
 	before := time.Now()
 	return func() {
-		AddSBI(call, before, time.Now())
+		t.AddSBI(call, before, time.Now())
 	}
 }
 
-// End records T8, removes the trace for the current goroutine, and returns it
-// (or nil if none was active) so the caller can flush it to the log.
-func End(end time.Time) *Trace {
-	if v, ok := byG.LoadAndDelete(goroutineID()); ok {
-		t := v.(*Trace)
-		t.End = end
-		return t
-	}
-	return nil
-}
+// noop is a shared do-nothing closure returned by Track on the nil path, so that
+// path allocates nothing.
+func noop() {}

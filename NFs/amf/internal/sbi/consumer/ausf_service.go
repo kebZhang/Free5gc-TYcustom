@@ -11,7 +11,6 @@ import (
 	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
-	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/nas/nasType"
 	"github.com/free5gc/openapi"
 	Nausf_UEAuthentication "github.com/free5gc/openapi/ausf/UEAuthentication"
@@ -54,7 +53,7 @@ func (s *nausfService) getUEAuthenticationClient(uri string) *Nausf_UEAuthentica
 func (s *nausfService) SendUEAuthenticationAuthenticateRequest(ue *amf_context.AmfUe,
 	resynchronizationInfo *models.ResynchronizationInfo,
 ) (*models.UeAuthenticationCtx, *models.ProblemDetails, error) {
-	defer msgtrace.Track("AUSF_ue-authentications")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("AUSF_ue-authentications")() // T3 entry / T6 return
 	client := s.getUEAuthenticationClient(ue.AusfUri)
 	if client == nil {
 		return nil, nil, openapi.ReportError("ausf not found")
@@ -108,7 +107,7 @@ func (s *nausfService) SendUEAuthenticationAuthenticateRequest(ue *amf_context.A
 func (s *nausfService) SendAuth5gAkaConfirmRequest(ue *amf_context.AmfUe, resStar string) (
 	*models.ConfirmationDataResponse, *models.ProblemDetails, error,
 ) {
-	defer msgtrace.Track("AUSF_5g-aka-confirmation")() // T3 entry / T6 return
+	defer ue.WorkerTrace.Track("AUSF_5g-aka-confirmation")() // T3 entry / T6 return
 	var ausfUri string
 	var confirmUri *url.URL
 	var err error

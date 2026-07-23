@@ -14,6 +14,7 @@ import (
 
 	"github.com/free5gc/amf/internal/logger"
 	business_metrics "github.com/free5gc/amf/internal/metrics/business"
+	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/amf/pkg/factory"
 	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/nas/nasType"
@@ -203,6 +204,17 @@ type AmfUe struct {
 	GmmStateEnterTime time.Time
 	UeConnected       bool
 	AnTypeFlags       map[models.AccessType]bool
+
+	// WorkerTrace is the msgtrace.Trace of the uplink NAS message currently being
+	// handled for this UE. nas.HandleNAS binds it right after NAS decode and
+	// unbinds it (nil) when the handler returns, so the SBI consumers can append
+	// their (T3,T6) via ue.WorkerTrace.Track(...) without any goroutine-id lookup.
+	//
+	// It is only ever touched on the single worker goroutine that owns this UE's
+	// messages (the NGAP scheduler serialises per UE: hash-by-UEID, or
+	// per-association in dGNB mode), so no lock is needed. May be nil, and every
+	// msgtrace method is nil-safe.
+	WorkerTrace *msgtrace.Trace
 }
 
 type AmfUeEventSubscription struct {

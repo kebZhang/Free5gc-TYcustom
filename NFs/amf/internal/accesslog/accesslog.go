@@ -395,22 +395,26 @@ type SBIView struct {
 // LogWorker records one uplink NAS message's worker timeline to
 // AMF_worker_log.txt (WORKER_LOG_PATH). One line per handled uplink NAS message.
 //   - ueID/nasType: the message this worker pass handled
-//   - recv  (T0): SCTP read time of the message
-//   - start (T2): worker began handling it
+//   - start (T2): worker began handling it (nas.HandleNAS entry)
 //   - end   (T8): the handler returned
 //   - sbi:        every downstream SBI call it triggered, each with before (T3)
 //     and after (T6). May be empty.
 //
+// There is deliberately no t_recv (T0/T1) field: the SCTP read time is already
+// recorded as the UL sctp_time in AMF_log, and the two were byte-for-byte
+// identical when this log also carried it. Analysis joins the two files on
+// (ue_id, nas_type), taking the most recent AMF_log UL record with
+// sctp_time <= t_start.
+//
 // The line format is JSON with an embedded "sbi" array; timestamps are the same
 // RFC3339Nano UTC as every other log, so all files can be joined by ue_id and
 // sorted by time. Enqueue only — never blocks the worker.
-func LogWorker(ueID, nasType string, recv, start, end time.Time, sbi []SBIView) {
+func LogWorker(ueID, nasType string, start, end time.Time, sbi []SBIView) {
 	b := make([]byte, 0, 256+len(sbi)*128)
 	b = append(b, '{')
 	b = appendKV(b, "nf", srcNF, true)
 	b = appendKV(b, "ue_id", ueID, false)
 	b = appendKV(b, "nas_type", nasType, false)
-	b = appendKV(b, "t_recv", formatTime(recv), false)
 	b = appendKV(b, "t_start", formatTime(start), false)
 	b = appendKV(b, "t_end", formatTime(end), false)
 	b = append(b, ',')

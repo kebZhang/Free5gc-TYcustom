@@ -11,7 +11,6 @@ import (
 	amf_context "github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/disccache"
 	"github.com/free5gc/amf/internal/logger"
-	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/amf/internal/util"
 	"github.com/free5gc/amf/pkg/factory"
 	"github.com/free5gc/openapi"
@@ -82,9 +81,10 @@ func (s *nnrfService) getNFDiscClient(uri string) *Nnrf_NFDiscovery.APIClient {
 func (s *nnrfService) SendSearchNFInstances(nrfUri string, targetNfType, requestNfType models.NrfNfManagementNfType,
 	param *Nnrf_NFDiscovery.SearchNFInstancesRequest,
 ) (*models.SearchResult, error) {
-	// T3 entry / T6 return. On a discovery-cache hit this returns almost
-	// immediately (before~=after), which is itself informative in analysis.
-	defer msgtrace.Track("NRF_disc")()
+	// Not traced into AMF_worker_log: this function has no *AmfUe to reach the
+	// current message's trace through, and NRF discovery is excluded from the
+	// analysis anyway (it hits the discovery cache ~99.9% of the time, so
+	// before~=after and the records are pure noise).
 	// Set client and set url
 	param.TargetNfType = &targetNfType
 	param.RequesterNfType = &requestNfType

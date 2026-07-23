@@ -2,6 +2,7 @@ package nas
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/free5gc/amf/internal/accesslog"
 	amf_context "github.com/free5gc/amf/internal/context"
@@ -17,6 +18,24 @@ import (
 )
 
 func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, initialMessage bool) {
+	// AMF_worker_log: T2 (this message's handling starts here) and T8 (it ends
+	// when this function returns). HandleNAS is the outermost synchronous frame
+	// for one uplink NAS message on the AMF side, so the pair brackets exactly
+	// the work attributable to it. Creating the trace is a plain allocation.
+	tr := msgtrace.New(time.Now()) // T2
+	defer func() {
+		// Only messages we care about get a line: logUplinkNAS sets NasType for
+		// the three uplink types of interest, so an early return (or any other
+		// NAS type) leaves it empty and writes nothing — matching AMF_log.
+		if tr.NasType != "" {
+			accesslog.LogWorker(tr.UeID, tr.NasType, tr.Start, time.Now(), toSBIViews(tr.SBI)) // T8
+		}
+		// Unbind so a later message on this UE can never append to this trace.
+		if ranUe != nil && ranUe.AmfUe != nil {
+			ranUe.AmfUe.WorkerTrace = nil
+		}
+	}()
+
 	isNasMsgRcv := false
 	metricCause := ""
 	nasMsg := nas.NewMessage()
@@ -66,7 +85,11 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 	// AMF_log: record the SCTP-read time for the uplink NAS messages of interest.
 	// The read time was captured at SCTPRead and carried (goroutine-local) to here;
 	// logging is asynchronous and never blocks this path.
-	logUplinkNAS(ranUe, msg)
+	//
+	// This also fills in tr's ue_id/nas_type (only known after decode) and binds
+	// tr to the AmfUe. The binding happens here, before Dispatch below drives the
+	// FSM and triggers the SBI calls, so every one of them sees the trace.
+	logUplinkNAS(ranUe, msg, tr)
 
 	ranUe.AmfUe.NasPduValue = nasPdu
 	ranUe.AmfUe.MacFailed = !integrityProtected
@@ -92,7 +115,13 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 // The read time was captured at SCTPRead and carried goroutine-locally to here.
 // All work is cheap (a type switch + an async enqueue); if no read time is
 // present (e.g. unexpected call path) the message is simply skipped.
-func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message) {
+//
+// It doubles as the place where the AMF_worker_log trace learns its identity:
+// tr is filled in with (ue_id, nas_type) and bound to the AmfUe so the SBI
+// consumers can reach it. Setting tr.NasType is also what arms the worker-log
+// line in HandleNAS's defer, so worker_log and AMF_log cover exactly the same
+// set of messages.
+func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message, tr *msgtrace.Trace) {
 	if msg == nil || msg.GmmMessage == nil {
 		return
 	}
@@ -138,9 +167,28 @@ func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message) {
 	accesslog.LogNGAP("UL", nasType, ueID, t)
 
 	// AMF_worker_log: fill in the ue_id / nas_type of the worker trace started
-	// for this message (they are only known now, after NAS decode). The SBI
-	// calls this message triggers are appended later on the same goroutine.
-	msgtrace.SetID(ueID, nasType)
+	// for this message (they are only known now, after NAS decode), then bind the
+	// trace to the AmfUe so the SBI consumers this message triggers can append
+	// their (T3,T6) to it. HandleNAS's defer unbinds it again.
+	tr.SetID(ueID, nasType)
+	if ranUe.AmfUe != nil {
+		ranUe.AmfUe.WorkerTrace = tr
+	}
+}
+
+// toSBIViews converts the trace's SBI calls into the accesslog view type. The
+// conversion exists so accesslog does not import msgtrace, keeping the
+// dependency direction one-way. Returns nil for an empty list so a NAS message
+// that triggered no downstream call still logs a valid empty "sbi":[] array.
+func toSBIViews(calls []msgtrace.SBICall) []accesslog.SBIView {
+	if len(calls) == 0 {
+		return nil
+	}
+	views := make([]accesslog.SBIView, len(calls))
+	for i, c := range calls {
+		views[i] = accesslog.SBIView{Call: c.Call, Before: c.Before, After: c.After}
+	}
+	return views
 }
 
 // suciFromRegistrationRequest extracts the SUCI string (e.g.
