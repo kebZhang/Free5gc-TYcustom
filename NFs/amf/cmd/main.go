@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof handlers on the default mux
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"syscall"
 
@@ -24,6 +27,20 @@ func main() {
 		if p := recover(); p != nil {
 			// Print stack for panic to log. Fatalf() will let program exit.
 			logger.MainLog.Fatalf("panic: %v\n%s", p, string(debug.Stack()))
+		}
+	}()
+
+	// --- Lock-contention profiling (TYcustom, for AMF-local latency debug) ---
+	// Turn on mutex + block profiling and expose pprof on :6060. This lets us
+	// snapshot /debug/pprof/mutex before/after each RQ run and diff them, to see
+	// which lock (e.g. UePool sync.Map) accumulates the most wait time as the
+	// request rate rises. Safe to leave on: sampling is cheap and the endpoint is
+	// pull-only. Remove/guard for production if the extra port is unwanted.
+	runtime.SetMutexProfileFraction(5) // sample ~1/5 of mutex contention events
+	runtime.SetBlockProfileRate(10000) // sample a blocking event ~every 10us blocked
+	go func() {
+		if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
+			logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
 		}
 	}()
 
