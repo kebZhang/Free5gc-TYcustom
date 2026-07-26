@@ -253,11 +253,27 @@ func fixIEs() {
 	MsgTable["UplinkUEAssociatedNRPPaTransport"].IEs["id-NRPPa-PDU"].Unimplemented = true
 }
 
+// needsRecvTime reports whether a message handler must receive the SCTP read
+// time (recvTime) as an explicit parameter. Only the three uplink NAS-carrying
+// procedures feed AMF_log's UL sctp_time, so only they need it threaded through;
+// every other handler keeps its original signature. This replaces the old
+// goroutine-local recvtime map that was the AMF's dominant lock-contention point.
+func needsRecvTime(msgName string) bool {
+	switch msgName {
+	case "UplinkNASTransport", "InitialUEMessage", "NASNonDeliveryIndication":
+		return true
+	default:
+		return false
+	}
+}
+
 // generate NGAP handler file
 func generateHandler() {
 	fOut := newOutputFile("handler_generated.go",
 		"ngap",
 		[]string{
+			"\"time\"",
+			"",
 			"\"github.com/free5gc/amf/internal/context\"",
 			"\"github.com/free5gc/amf/internal/logger\"",
 			"ngap_message \"github.com/free5gc/amf/internal/ngap/message\"",
@@ -275,7 +291,14 @@ func generateHandler() {
 		if msgName == "InitialUEMessage" {
 			messageAppend = ", message *ngapType.NGAPPDU"
 		}
-		fmt.Fprintf(fOut, "func handler%s(ran *context.AmfRan%s, %s *ngapType.%s) {\n", msgName, messageAppend, mInfo.GoTypeVar, mInfo.GoField)
+		// AMF_log UL recv time: the three uplink NAS-carrying handlers receive the
+		// SCTP read time as an explicit parameter (threaded from the worker), so the
+		// NAS layer can record it in AMF_log without any goroutine-local map.
+		recvTimeAppend := ""
+		if needsRecvTime(msgName) {
+			recvTimeAppend = ", recvTime time.Time"
+		}
+		fmt.Fprintf(fOut, "func handler%s(ran *context.AmfRan%s, %s *ngapType.%s%s) {\n", msgName, messageAppend, mInfo.GoTypeVar, mInfo.GoField, recvTimeAppend)
 
 		// setup variables
 		isRequest := false
@@ -547,6 +570,13 @@ syntaxCause = &ngapType.Cause{
 			mainFuncArgs = append(mainFuncArgs, ieVar+mayNil)
 		}
 
+		// AMF_log UL recv time is the last parameter of the three uplink NAS
+		// handlers' Main functions (threaded from the worker; no goroutine-local map).
+		if needsRecvTime(msgName) {
+			mainFuncArgDefs = append(mainFuncArgDefs, "recvTime time.Time")
+			mainFuncArgs = append(mainFuncArgs, "recvTime")
+		}
+
 		fmt.Fprintln(fOut, "")
 		fmt.Fprintln(fOut, "metricStatusOk = true")
 		fmt.Fprintln(fOut, "")
@@ -610,14 +640,17 @@ func generateDispatcher() {
 	fOut := newOutputFile("dispatcher_generated.go",
 		"ngap",
 		[]string{
+			"\"time\"",
+			"",
 			"\"github.com/free5gc/amf/internal/context\"",
 			"ngap_message \"github.com/free5gc/amf/internal/ngap/message\"",
 			"\"github.com/free5gc/ngap/ngapType\"",
 		})
 
-	// Generate message dispatcher codes
+	// Generate message dispatcher codes. recvTime is the SCTP read time, threaded
+	// down to the three uplink NAS handlers for AMF_log (no goroutine-local map).
 	fmt.Fprintln(fOut, "")
-	fmt.Fprintln(fOut, "func dispatchMain(ran *context.AmfRan, message *ngapType.NGAPPDU) {")
+	fmt.Fprintln(fOut, "func dispatchMain(ran *context.AmfRan, message *ngapType.NGAPPDU, recvTime time.Time) {")
 	fmt.Fprintln(fOut, "switch message.Present {")
 	for _, present := range []string{
 		"InitiatingMessage",
@@ -640,7 +673,11 @@ func generateDispatcher() {
 				if msgName == "InitialUEMessage" {
 					messageAppend = ", message"
 				}
-				fmt.Fprintf(fOut, "handler%s(ran%s, %s)\n", msgName, messageAppend, presentVar)
+				recvTimeAppend := ""
+				if needsRecvTime(msgName) {
+					recvTimeAppend = ", recvTime"
+				}
+				fmt.Fprintf(fOut, "handler%s(ran%s, %s%s)\n", msgName, messageAppend, presentVar, recvTimeAppend)
 			}
 		}
 		fmt.Fprintln(fOut, "default:")

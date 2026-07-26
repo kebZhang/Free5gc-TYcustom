@@ -2,6 +2,8 @@
 package ngap
 
 import (
+	"time"
+
 	"github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
 	ngap_message "github.com/free5gc/amf/internal/ngap/message"
@@ -4290,7 +4292,7 @@ func handlerInitialContextSetupResponse(ran *context.AmfRan, successfulOutcome *
 	handleInitialContextSetupResponseMain(ran, ranUe /* may be nil */, pDUSessionResourceSetupListCxtRes /* may be nil */, pDUSessionResourceFailedToSetupListCxtRes /* may be nil */, criticalityDiagnostics /* may be nil */)
 }
 
-func handlerInitialUEMessage(ran *context.AmfRan, message *ngapType.NGAPPDU, initiatingMessage *ngapType.InitiatingMessage) {
+func handlerInitialUEMessage(ran *context.AmfRan, message *ngapType.NGAPPDU, initiatingMessage *ngapType.InitiatingMessage, recvTime time.Time) {
 	var rANUENGAPID *ngapType.RANUENGAPID
 	var nASPDU *ngapType.NASPDU
 	var userLocationInformation *ngapType.UserLocationInformation
@@ -4517,7 +4519,7 @@ func handlerInitialUEMessage(ran *context.AmfRan, message *ngapType.NGAPPDU, ini
 	//	rRCEstablishmentCause *ngapType.RRCEstablishmentCause,
 	//	fiveGSTMSI *ngapType.FiveGSTMSI,
 	//	uEContextRequest *ngapType.UEContextRequest) {
-	handleInitialUEMessageMain(ran, message, rANUENGAPID, nASPDU, userLocationInformation, rRCEstablishmentCause /* may be nil */, fiveGSTMSI /* may be nil */, uEContextRequest /* may be nil */)
+	handleInitialUEMessageMain(ran, message, rANUENGAPID, nASPDU, userLocationInformation, rRCEstablishmentCause /* may be nil */, fiveGSTMSI /* may be nil */, uEContextRequest /* may be nil */, recvTime)
 }
 
 func handlerLocationReport(ran *context.AmfRan, initiatingMessage *ngapType.InitiatingMessage) {
@@ -5017,7 +5019,7 @@ func handlerLocationReportingFailureIndication(ran *context.AmfRan, initiatingMe
 	handleLocationReportingFailureIndicationMain(ran, ranUe, cause /* may be nil */)
 }
 
-func handlerNASNonDeliveryIndication(ran *context.AmfRan, initiatingMessage *ngapType.InitiatingMessage) {
+func handlerNASNonDeliveryIndication(ran *context.AmfRan, initiatingMessage *ngapType.InitiatingMessage, recvTime time.Time) {
 	var aMFUENGAPID *ngapType.AMFUENGAPID
 	var rANUENGAPID *ngapType.RANUENGAPID
 	var nASPDU *ngapType.NASPDU
@@ -5182,7 +5184,7 @@ func handlerNASNonDeliveryIndication(ran *context.AmfRan, initiatingMessage *nga
 	//	ranUe *context.RanUe,
 	//	nASPDU *ngapType.NASPDU,
 	//	cause *ngapType.Cause) {
-	handleNASNonDeliveryIndicationMain(ran, ranUe, nASPDU /* may be nil */, cause /* may be nil */)
+	handleNASNonDeliveryIndicationMain(ran, ranUe, nASPDU /* may be nil */, cause /* may be nil */, recvTime)
 }
 
 func handlerNGReset(ran *context.AmfRan, initiatingMessage *ngapType.InitiatingMessage) {
@@ -11505,7 +11507,7 @@ func handleUETNLABindingReleaseRequestMain(ran *context.AmfRan, ranUe *context.R
 	ngap_message.SendErrorIndication(ran, nil, nil, notImplementedCause, &notImplementedCriticalityDiagnostics)
 }
 
-func handlerUplinkNASTransport(ran *context.AmfRan, initiatingMessage *ngapType.InitiatingMessage) {
+func handlerUplinkNASTransport(ran *context.AmfRan, initiatingMessage *ngapType.InitiatingMessage, recvTime time.Time) {
 	var aMFUENGAPID *ngapType.AMFUENGAPID
 	var rANUENGAPID *ngapType.RANUENGAPID
 	var nASPDU *ngapType.NASPDU
@@ -11677,7 +11679,7 @@ func handlerUplinkNASTransport(ran *context.AmfRan, initiatingMessage *ngapType.
 	//	ranUe *context.RanUe,
 	//	nASPDU *ngapType.NASPDU,
 	//	userLocationInformation *ngapType.UserLocationInformation) {
-	handleUplinkNASTransportMain(ran, ranUe, nASPDU, userLocationInformation /* may be nil */)
+	handleUplinkNASTransportMain(ran, ranUe, nASPDU, userLocationInformation /* may be nil */, recvTime)
 }
 
 func handlerUplinkNonUEAssociatedNRPPaTransport(ran *context.AmfRan, initiatingMessage *ngapType.InitiatingMessage) {

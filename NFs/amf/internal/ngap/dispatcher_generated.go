@@ -2,12 +2,14 @@
 package ngap
 
 import (
+	"time"
+
 	"github.com/free5gc/amf/internal/context"
 	ngap_message "github.com/free5gc/amf/internal/ngap/message"
 	"github.com/free5gc/ngap/ngapType"
 )
 
-func dispatchMain(ran *context.AmfRan, message *ngapType.NGAPPDU) {
+func dispatchMain(ran *context.AmfRan, message *ngapType.NGAPPDU, recvTime time.Time) {
 	switch message.Present {
 	case ngapType.NGAPPDUPresentInitiatingMessage:
 		initiatingMessage := message.InitiatingMessage
@@ -47,7 +49,7 @@ func dispatchMain(ran *context.AmfRan, message *ngapType.NGAPPDU) {
 		case ngapType.ProcedureCodeInitialContextSetup:
 			handlerInitialContextSetupRequest(ran, initiatingMessage)
 		case ngapType.ProcedureCodeInitialUEMessage:
-			handlerInitialUEMessage(ran, message, initiatingMessage)
+			handlerInitialUEMessage(ran, message, initiatingMessage, recvTime)
 		case ngapType.ProcedureCodeLocationReport:
 			handlerLocationReport(ran, initiatingMessage)
 		case ngapType.ProcedureCodeLocationReportingControl:
@@ -55,7 +57,7 @@ func dispatchMain(ran *context.AmfRan, message *ngapType.NGAPPDU) {
 		case ngapType.ProcedureCodeLocationReportingFailureIndication:
 			handlerLocationReportingFailureIndication(ran, initiatingMessage)
 		case ngapType.ProcedureCodeNASNonDeliveryIndication:
-			handlerNASNonDeliveryIndication(ran, initiatingMessage)
+			handlerNASNonDeliveryIndication(ran, initiatingMessage, recvTime)
 		case ngapType.ProcedureCodeNGReset:
 			handlerNGReset(ran, initiatingMessage)
 		case ngapType.ProcedureCodeNGSetup:
@@ -109,7 +111,7 @@ func dispatchMain(ran *context.AmfRan, message *ngapType.NGAPPDU) {
 		case ngapType.ProcedureCodeUETNLABindingRelease:
 			handlerUETNLABindingReleaseRequest(ran, initiatingMessage)
 		case ngapType.ProcedureCodeUplinkNASTransport:
-			handlerUplinkNASTransport(ran, initiatingMessage)
+			handlerUplinkNASTransport(ran, initiatingMessage, recvTime)
 		case ngapType.ProcedureCodeUplinkNonUEAssociatedNRPPaTransport:
 			handlerUplinkNonUEAssociatedNRPPaTransport(ran, initiatingMessage)
 		case ngapType.ProcedureCodeUplinkRANConfigurationTransfer:

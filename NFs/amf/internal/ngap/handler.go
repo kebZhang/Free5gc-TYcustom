@@ -117,6 +117,7 @@ func handleUplinkNASTransportMain(ran *context.AmfRan,
 	ranUe *context.RanUe,
 	nASPDU *ngapType.NASPDU,
 	userLocationInformation *ngapType.UserLocationInformation,
+	recvTime time.Time,
 ) {
 	amfUe := ranUe.AmfUe
 	if amfUe == nil {
@@ -133,7 +134,7 @@ func handleUplinkNASTransportMain(ran *context.AmfRan,
 		ranUe.UpdateLocation(userLocationInformation)
 	}
 
-	amf_nas.HandleNAS(ranUe, ngapType.ProcedureCodeUplinkNASTransport, nASPDU.Value, false)
+	amf_nas.HandleNAS(ranUe, ngapType.ProcedureCodeUplinkNASTransport, nASPDU.Value, false, recvTime)
 }
 
 func handleNGResetMain(ran *context.AmfRan,
@@ -435,6 +436,7 @@ func handleInitialUEMessageMain(ran *context.AmfRan,
 	rRCEstablishmentCause *ngapType.RRCEstablishmentCause,
 	fiveGSTMSI *ngapType.FiveGSTMSI,
 	uEContextRequest *ngapType.UEContextRequest,
+	recvTime time.Time,
 ) {
 	ranUe := ran.RanUeFindByRanUeNgapID(rANUENGAPID.Value)
 	if ranUe != nil {
@@ -569,7 +571,7 @@ func handleInitialUEMessageMain(ran *context.AmfRan,
 		ran.Log.Errorf("libngap Encoder Error: %+v", err)
 	}
 	ranUe.InitialUEMessage = pdu
-	amf_nas.HandleNAS(ranUe, ngapType.ProcedureCodeInitialUEMessage, nASPDU.Value, true)
+	amf_nas.HandleNAS(ranUe, ngapType.ProcedureCodeInitialUEMessage, nASPDU.Value, true, recvTime)
 }
 
 func findAmfUe(ran *context.AmfRan, id, idType string) (*context.AmfUe, bool) {
@@ -1782,13 +1784,14 @@ func handleNASNonDeliveryIndicationMain(ran *context.AmfRan,
 	ranUe *context.RanUe,
 	nASPDU *ngapType.NASPDU,
 	cause *ngapType.Cause,
+	recvTime time.Time,
 ) {
 	if cause != nil {
 		printAndGetCause(ran, cause)
 	}
 
 	if nASPDU != nil {
-		amf_nas.HandleNAS(ranUe, ngapType.ProcedureCodeNASNonDeliveryIndication, nASPDU.Value, false)
+		amf_nas.HandleNAS(ranUe, ngapType.ProcedureCodeNASNonDeliveryIndication, nASPDU.Value, false, recvTime)
 	}
 }
 

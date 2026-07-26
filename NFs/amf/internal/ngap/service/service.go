@@ -12,14 +12,13 @@ import (
 
 	"github.com/free5gc/amf/internal/logger"
 	ngap_internal "github.com/free5gc/amf/internal/ngap"
-	"github.com/free5gc/amf/internal/recvtime"
 	"github.com/free5gc/amf/pkg/factory"
 	"github.com/free5gc/ngap"
 	"github.com/free5gc/sctp"
 )
 
 type NGAPHandler struct {
-	HandleMessage         func(conn net.Conn, msg []byte)
+	HandleMessage         func(conn net.Conn, msg []byte, recvTime time.Time)
 	HandleNotification    func(conn net.Conn, notification sctp.Notification)
 	HandleConnectionError func(conn net.Conn)
 }
@@ -283,13 +282,11 @@ func handleConnection(conn *sctp.SCTPConn, bufsize uint32, handler NGAPHandler) 
 func dispatchToWorkerPool(conn net.Conn, msg []byte, recvTime time.Time, handler NGAPHandler) {
 	scheduler, err := ngap_internal.GetScheduler()
 	if err != nil {
-		// Fallback to direct handling if scheduler is not initialized
+		// Fallback to direct handling if scheduler is not initialized. The UL recv
+		// time is passed explicitly to the handler (no goroutine-local map), so the
+		// NAS layer can attach it to AMF_log, matching the worker path.
 		logger.NgapLog.Warnf("Scheduler not initialized, falling back to sequential processing: %v", err)
-		// Stash the read time for the (synchronous) handler on this goroutine so
-		// the NAS layer can attach it to AMF_log, matching the worker path.
-		recvtime.Set(recvTime)
-		handler.HandleMessage(conn, msg)
-		recvtime.Clear()
+		handler.HandleMessage(conn, msg, recvTime)
 		return
 	}
 

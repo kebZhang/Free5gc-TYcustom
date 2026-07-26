@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/free5gc/amf/internal/logger"
-	"github.com/free5gc/amf/internal/recvtime"
 )
 
 // workerNumFilePath is where the peak (maximum) number of distinct NGAP workers
@@ -40,12 +39,12 @@ type Worker struct {
 	taskChan chan Task
 	stopChan chan struct{} // Signal channel for shutdown
 	stopOnce sync.Once     // Ensures stopChan is closed only once
-	handler  func(conn net.Conn, msg []byte)
+	handler  func(conn net.Conn, msg []byte, recvTime time.Time)
 	wg       *sync.WaitGroup
 }
 
 // NewWorker creates and starts a new worker goroutine.
-func NewWorker(id int, bufferSize int, handler func(conn net.Conn, msg []byte), wg *sync.WaitGroup) *Worker {
+func NewWorker(id int, bufferSize int, handler func(conn net.Conn, msg []byte, recvTime time.Time), wg *sync.WaitGroup) *Worker {
 	w := &Worker{
 		ID:       id,
 		taskChan: make(chan Task, bufferSize),
@@ -73,9 +72,11 @@ func (w *Worker) run() {
 		case task := <-w.taskChan:
 			logger.NgapLog.Debugf("Worker %d processing message from %v (per-association ordering)",
 				w.ID, task.Conn.RemoteAddr())
-			recvtime.Set(task.RecvTime)
-			w.handler(task.Conn, task.Message)
-			recvtime.Clear()
+			// AMF_log UL recv time is now passed explicitly as a parameter (no
+			// goroutine-local map / runtime.Stack): the handler carries it down to
+			// the NAS layer. This removes the global-lock contention that recvtime
+			// used to cause on the AMF hot path.
+			w.handler(task.Conn, task.Message, task.RecvTime)
 
 		case <-w.stopChan:
 			logger.NgapLog.Infof("Worker %d: shutdown signal received, draining queue...", w.ID)
@@ -91,9 +92,7 @@ func (w *Worker) drainAndExit() {
 		select {
 		case task := <-w.taskChan:
 			logger.NgapLog.Debugf("Worker %d processing residual message from %v", w.ID, task.Conn.RemoteAddr())
-			recvtime.Set(task.RecvTime)
-			w.handler(task.Conn, task.Message)
-			recvtime.Clear()
+			w.handler(task.Conn, task.Message, task.RecvTime)
 		default:
 			// Channel is empty, exit safely
 			logger.NgapLog.Infof("Worker %d: queue drained, stopped.", w.ID)
@@ -185,7 +184,7 @@ func ResolveWorkerPoolSize(configured int) int {
 }
 
 // NewUEScheduler creates a new scheduler with the specified number of workers.
-func NewUEScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Conn, msg []byte)) *UEScheduler {
+func NewUEScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Conn, msg []byte, recvTime time.Time)) *UEScheduler {
 	numWorkers = ResolveWorkerPoolSize(numWorkers)
 
 	logger.NgapLog.Infof("Initializing NGAP Scheduler with %d workers "+
@@ -339,7 +338,7 @@ var (
 
 // InitScheduler initializes the global NGAP scheduler.
 // Should be called once during AMF startup.
-func InitScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Conn, msg []byte)) {
+func InitScheduler(numWorkers int, taskBufferSize int, handler func(conn net.Conn, msg []byte, recvTime time.Time)) {
 	globalSchedulerOnce.Do(func() {
 		// Apply sensible defaults if invalid values provided
 		numWorkers = ResolveWorkerPoolSize(numWorkers)

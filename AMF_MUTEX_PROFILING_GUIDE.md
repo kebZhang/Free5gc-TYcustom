@@ -44,13 +44,20 @@ dereg 本身也是信令、也碰 `UePool`、也产生锁等待。所以 **dereg
 
 pod 起来后先做这个，不通则后面全部白跑。
 
+> 本环境实际值：namespace = `free5gc`，AMF deployment = `free5gc-amf`。
+> AMF pod 名（如 `free5gc-amf-778ccbb47d-h6264`）带随机后缀，**每次重启都会变**，
+> 所以下面用 deployment 名动态取 pod 名，重启后无需改命令。
+
 ```bash
-# ① 找到 AMF pod
-kubectl get pods -n <namespace> | grep amf
+# ① 找到 AMF pod（deployment 名固定为 free5gc-amf）
+kubectl get pods -n free5gc | grep amf
 
 # ② 端口转发（开一个终端，全程不要关）
-kubectl port-forward -n <namespace> <amf-pod-name> 6060:6060
+#    直接用 deployment，k8s 会自动选中它当前的 pod，重启换 pod 也不用改：
+kubectl port-forward -n free5gc deployment/free5gc-amf 6060:6060
 #    显示 "Forwarding from 127.0.0.1:6060 -> 6060" 即成功
+#
+#    （如需指定具体 pod，也可： kubectl port-forward -n free5gc <amf-pod-name> 6060:6060）
 
 # ③ 另开一个终端，验证 pprof 通不通
 curl -s http://localhost:6060/debug/pprof/ | head -20
@@ -66,22 +73,28 @@ curl -s http://localhost:6060/debug/pprof/ | head -20
 
 ## 2. 准备抓取脚本（在执行 curl 的机器上）
 
-```bash
-mkdir -p ~/amf_mutex && cd ~/amf_mutex
+脚本可放在 `~`（home 目录）。快照文件用**固定的输出目录** `~/amf_mutex/`，
+这样无论从哪个目录运行脚本，所有 `.pb.gz` 都集中存到同一处、方便分析。
 
-cat > snap.sh <<'EOF'
+```bash
+# 把脚本写到 home 目录
+cat > ~/snap.sh <<'EOF'
 #!/usr/bin/env bash
-# 用法: ./snap.sh <标签>    例: ./snap.sh S0_baseline
+# 用法: ~/snap.sh <标签>    例: ~/snap.sh S0_baseline
 LABEL="$1"
-if [ -z "$LABEL" ]; then echo "需要一个标签,如 ./snap.sh S0_baseline"; exit 1; fi
+if [ -z "$LABEL" ]; then echo "需要一个标签,如 ~/snap.sh S0_baseline"; exit 1; fi
+OUTDIR="$HOME/amf_mutex"          # 快照固定存这里，不受当前目录影响
+mkdir -p "$OUTDIR"
 TS=$(date +%H%M%S)
-curl -s http://localhost:6060/debug/pprof/mutex > "mutex_${LABEL}.pb.gz"
-curl -s http://localhost:6060/debug/pprof/block > "block_${LABEL}.pb.gz"
-echo "[$TS] 已抓取: mutex_${LABEL}.pb.gz  block_${LABEL}.pb.gz"
-ls -l "mutex_${LABEL}.pb.gz"
+curl -s http://localhost:6060/debug/pprof/mutex > "$OUTDIR/mutex_${LABEL}.pb.gz"
+curl -s http://localhost:6060/debug/pprof/block > "$OUTDIR/block_${LABEL}.pb.gz"
+echo "[$TS] 已抓取到 $OUTDIR : mutex_${LABEL}.pb.gz  block_${LABEL}.pb.gz"
+ls -l "$OUTDIR/mutex_${LABEL}.pb.gz"
 EOF
-chmod +x snap.sh
+chmod +x ~/snap.sh
 ```
+
+之后每次抓快照用 `~/snap.sh <标签>`（在任意目录都行），文件都会落在 `~/amf_mutex/`。
 
 ---
 
@@ -91,27 +104,27 @@ chmod +x snap.sh
 
 ```bash
 # ===== S0：pod 已起来，还没跑任何 UE reg 时 =====
-./snap.sh S0_baseline
+~/snap.sh S0_baseline
 
 # ===== 跑 RQ200 的 1000 UE reg（你平时的 PacketRusher 命令）=====
 # ...启动 RQ200 UE1000 reg...
 # 等所有 UE 注册完成、进入注册态停留后：
-./snap.sh S1_afterRQ200reg
+~/snap.sh S1_afterRQ200reg
 
 # ===== 对 RQ200 这组做 dereg =====
 # ...执行 RQ200 dereg...  等 dereg 全部完成后：
-./snap.sh S2_afterRQ200dereg
+~/snap.sh S2_afterRQ200dereg
 
 # ===== 等一会，跑 RQ1000 的 1000 UE reg =====
 # ...启动 RQ1000 UE1000 reg...  等注册完成后：
-./snap.sh S3_afterRQ1000reg
+~/snap.sh S3_afterRQ1000reg
 
 # ===== （可选）RQ1000 dereg，如果也想分析 dereg =====
 # ...执行 RQ1000 dereg...
-./snap.sh S4_afterRQ1000dereg
+~/snap.sh S4_afterRQ1000dereg
 ```
 
-产物：`mutex_S0_baseline.pb.gz` … `mutex_S3_afterRQ1000reg.pb.gz`（及对应 `block_`）。
+产物都在 `~/amf_mutex/`：`mutex_S0_baseline.pb.gz` … `mutex_S3_afterRQ1000reg.pb.gz`（及对应 `block_`）。
 
 **提醒：S2（dereg 后）必须打**，它是 RQ1000 的干净基线。
 
@@ -194,8 +207,14 @@ env:
   - name: GODEBUG
     value: "schedtrace=1000"
 ```
-看 AMF 日志里每秒一行 `SCHED ...ms: ... runqueue=N [n1 n2 ...]`。
+加完环境变量后 AMF pod 会重启，用下面命令看每秒一行的调度器状态：
+```bash
+kubectl logs -n free5gc deployment/free5gc-amf -f | grep SCHED
+#   输出形如: SCHED 1000ms: gomaxprocs=48 ... runqueue=N [p0 p1 ...]
+```
 **高 RQ 时 `runqueue` 与各 P 本地队列变大 → 证实调度排队（goroutine 等着被恢复执行）。**
+> 注意：`GODEBUG=schedtrace` 打到 **stderr**，若 AMF 用文件日志而 `kubectl logs` 看不到，
+> 就查容器 stderr 或 pod 日志文件。
 
 ---
 

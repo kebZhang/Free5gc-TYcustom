@@ -10,14 +10,13 @@ import (
 	"github.com/free5gc/amf/internal/logger"
 	"github.com/free5gc/amf/internal/msgtrace"
 	"github.com/free5gc/amf/internal/nas/nas_security"
-	"github.com/free5gc/amf/internal/recvtime"
 	"github.com/free5gc/nas"
 	"github.com/free5gc/nas/nasConvert"
 	"github.com/free5gc/nas/nasMessage"
 	nas_metrics "github.com/free5gc/util/metrics/nas"
 )
 
-func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, initialMessage bool) {
+func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, initialMessage bool, recvTime time.Time) {
 	// AMF_worker_log: T2 (this message's handling starts here) and T8 (it ends
 	// when this function returns). HandleNAS is the outermost synchronous frame
 	// for one uplink NAS message on the AMF side, so the pair brackets exactly
@@ -89,7 +88,7 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 	// This also fills in tr's ue_id/nas_type (only known after decode) and binds
 	// tr to the AmfUe. The binding happens here, before Dispatch below drives the
 	// FSM and triggers the SBI calls, so every one of them sees the trace.
-	logUplinkNAS(ranUe, msg, tr)
+	logUplinkNAS(ranUe, msg, tr, recvTime)
 
 	ranUe.AmfUe.NasPduValue = nasPdu
 	ranUe.AmfUe.MacFailed = !integrityProtected
@@ -121,7 +120,7 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 // consumers can reach it. Setting tr.NasType is also what arms the worker-log
 // line in HandleNAS's defer, so worker_log and AMF_log cover exactly the same
 // set of messages.
-func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message, tr *msgtrace.Trace) {
+func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message, tr *msgtrace.Trace, recvTime time.Time) {
 	if msg == nil || msg.GmmMessage == nil {
 		return
 	}
@@ -138,8 +137,12 @@ func logUplinkNAS(ranUe *amf_context.RanUe, msg *nas.Message, tr *msgtrace.Trace
 		return // not a message of interest
 	}
 
-	t, ok := recvtime.Current()
-	if !ok {
+	// recvTime is the SCTP read time, threaded here explicitly from the NGAP worker
+	// (previously carried via a goroutine-local map that caused the AMF's dominant
+	// lock contention). A zero time means the call path had no SCTP read time
+	// (e.g. an SBI-notified N1 message), so skip the UL sctp_time line.
+	t := recvTime
+	if t.IsZero() {
 		return
 	}
 

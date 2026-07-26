@@ -7,7 +7,6 @@ import (
 	"github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
 	business_metrics "github.com/free5gc/amf/internal/metrics/business"
-	"github.com/free5gc/amf/internal/recvtime"
 	callback "github.com/free5gc/amf/internal/sbi/processor/notifier"
 	"github.com/free5gc/aper"
 	"github.com/free5gc/ngap/ngapType"
@@ -54,13 +53,6 @@ func SendToRan(ran *context.AmfRan, packet []byte) (bool, string) {
 		ran.Log.Errorf("Send error: %+v", err)
 		return false, ngap_metrics.SCTP_SOCKET_WRITE_ERR
 	} else {
-		// AMF_log: capture the SCTP write time and, if a downlink NAS type was
-		// marked by the GMM send path on this goroutine, record it. The logging
-		// is asynchronous (enqueue only) and never blocks this send path.
-		sentTime := time.Now()
-		if nasType, ueID, ok := recvtime.CurrentDLNas(); ok {
-			accesslog.LogNGAP("DL", nasType, ueID, sentTime)
-		}
 		ran.Log.Debugf("Write %d bytes", n)
 	}
 	return true, ""
@@ -83,7 +75,17 @@ func SendToRanUe(ue *context.RanUe, packet []byte) (bool, string) {
 		ue.Log.Warn("AmfUe is nil")
 	}
 
-	return SendToRan(ran, packet)
+	ok, cause := SendToRan(ran, packet)
+
+	// AMF_log: record the DL SCTP write time here (SendToRanUe has the UE context).
+	// The GMM send path marked the pending downlink NAS type on this UE's worker
+	// trace; read it back and log asynchronously. No goroutine-local map / lock.
+	if ok && ue.AmfUe != nil {
+		if nasType, ueID, has := ue.AmfUe.WorkerTrace.DLNas(); has {
+			accesslog.LogNGAP("DL", nasType, ueID, time.Now())
+		}
+	}
+	return ok, cause
 }
 
 func NasSendToRan(ue *context.AmfUe, accessType models.AccessType, packet []byte) (bool, string) {

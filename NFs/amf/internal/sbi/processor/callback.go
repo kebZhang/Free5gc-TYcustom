@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -328,7 +329,10 @@ func (p *Processor) N1MessageNotifyProcedure(n1MessageNotify models.N1MessageNot
 
 		gmm_common.AttachRanUeToAmfUeAndReleaseOldIfAny(amfUe, ranUe)
 
-		amf_nas.HandleNAS(ranUe, ngapType.ProcedureCodeInitialUEMessage, n1MessageNotify.BinaryDataN1Message, true)
+		// This N1 message comes from an SBI notification, not from an SCTP read, so
+		// there is no UL recv time to attach to AMF_log; pass the zero time (which
+		// logUplinkNAS treats as "no recv time" and skips the UL sctp_time line).
+		amf_nas.HandleNAS(ranUe, ngapType.ProcedureCodeInitialUEMessage, n1MessageNotify.BinaryDataN1Message, true, time.Time{})
 	}()
 	return nil
 }

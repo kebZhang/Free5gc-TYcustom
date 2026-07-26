@@ -2,6 +2,7 @@ package ngap
 
 import (
 	"net"
+	"time"
 
 	"github.com/free5gc/amf/internal/context"
 	"github.com/free5gc/amf/internal/logger"
@@ -10,7 +11,10 @@ import (
 	"github.com/free5gc/sctp"
 )
 
-func Dispatch(conn net.Conn, msg []byte) {
+// Dispatch handles one NGAP message. recvTime is the SCTP read time of this
+// message, threaded explicitly (not via a goroutine-local map) so the NAS layer
+// can record it in AMF_log without any global-lock contention.
+func Dispatch(conn net.Conn, msg []byte, recvTime time.Time) {
 	amfSelf := context.GetSelf()
 
 	if len(msg) == 0 {
@@ -52,7 +56,7 @@ func Dispatch(conn net.Conn, msg []byte) {
 		}
 	}
 
-	dispatchMain(ran, pdu)
+	dispatchMain(ran, pdu, recvTime)
 }
 
 func HandleSCTPNotification(conn net.Conn, notification sctp.Notification) {

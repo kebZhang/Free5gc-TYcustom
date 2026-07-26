@@ -64,6 +64,14 @@ type Trace struct {
 	NasType string
 	Start   time.Time // T2
 	SBI     []SBICall
+
+	// dlNasType/dlUeID carry the downlink NAS type and ue id that a GMM Send*
+	// function is about to emit, so the shared ngap SendToRanUe path can record the
+	// DL sctp_time in AMF_log without a goroutine-local map. Set by the GMM layer
+	// (which knows the NAS type) right before the send; read back at write time.
+	// Only ever touched on the single worker goroutine owning this UE, so no lock.
+	dlNasType string
+	dlUeID    string
 }
 
 // New starts a trace, recording T2 (start). It is a plain allocation: no table
@@ -113,3 +121,22 @@ func (t *Trace) Track(call string) func() {
 // noop is a shared do-nothing closure returned by Track on the nil path, so that
 // path allocates nothing.
 func noop() {}
+
+// SetDLNas records the downlink NAS type and ue id that the GMM layer is about to
+// send, so the ngap send path can attach the DL sctp_time to AMF_log. nil-safe.
+func (t *Trace) SetDLNas(nasType, ueID string) {
+	if t == nil {
+		return
+	}
+	t.dlNasType = nasType
+	t.dlUeID = ueID
+}
+
+// DLNas returns the pending downlink NAS type and ue id, and whether one was set.
+// nil-safe; returns ok=false when no trace is bound or none was set.
+func (t *Trace) DLNas() (nasType, ueID string, ok bool) {
+	if t == nil || t.dlNasType == "" {
+		return "", "", false
+	}
+	return t.dlNasType, t.dlUeID, true
+}
