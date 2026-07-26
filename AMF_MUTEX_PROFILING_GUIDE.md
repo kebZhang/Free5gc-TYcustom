@@ -98,39 +98,50 @@ chmod +x ~/snap.sh
 
 ---
 
-## 3. 跑实验 + 打 5 个快照（严格按顺序）
+## 3. 跑实验 + 打 7 个快照（严格按顺序）
 
-每一步括号说明「在什么时刻执行」。
+三组数据：**RQ600 / RQ800 / RQ1000**，每组 1000 UE reg。
+每组 reg 后打一个快照，dereg 后再打一个快照（后者即下一组的干净基线）。
 
 ```bash
-# ===== S0：pod 已起来，还没跑任何 UE reg 时 =====
-~/snap.sh S0_baseline
+# ===== baseline：pod 已起来，还没跑任何 UE reg 时 =====
+~/snap.sh baseline
 
-# ===== 跑 RQ200 的 1000 UE reg（你平时的 PacketRusher 命令）=====
-# ...启动 RQ200 UE1000 reg...
+# ===== 跑 RQ600 的 1000 UE reg（你平时的 PacketRusher 命令）=====
+# ...启动 RQ600 UE1000 reg...
 # 等所有 UE 注册完成、进入注册态停留后：
-~/snap.sh S1_afterRQ200reg
+~/snap.sh RQ600_UE1000
 
-# ===== 对 RQ200 这组做 dereg =====
-# ...执行 RQ200 dereg...  等 dereg 全部完成后：
-~/snap.sh S2_afterRQ200dereg
+# ===== 对 RQ600 这组做 dereg =====
+# ...执行 RQ600 dereg...  等 dereg 全部完成后：
+~/snap.sh After_RQ600_UE1000
 
-# ===== 等一会，跑 RQ1000 的 1000 UE reg =====
+# ===== 跑 RQ800 的 1000 UE reg =====
+# ...启动 RQ800 UE1000 reg...  等注册完成后：
+~/snap.sh RQ800_UE1000
+
+# ===== 对 RQ800 这组做 dereg =====
+# ...执行 RQ800 dereg...  等 dereg 全部完成后：
+~/snap.sh After_RQ800_UE1000
+
+# ===== 跑 RQ1000 的 1000 UE reg =====
 # ...启动 RQ1000 UE1000 reg...  等注册完成后：
-~/snap.sh S3_afterRQ1000reg
+~/snap.sh RQ1000_UE1000
 
 # ===== （可选）RQ1000 dereg，如果也想分析 dereg =====
 # ...执行 RQ1000 dereg...
-~/snap.sh S4_afterRQ1000dereg
+~/snap.sh After_RQ1000_UE1000
 ```
 
-产物都在 `~/amf_mutex/`：`mutex_S0_baseline.pb.gz` … `mutex_S3_afterRQ1000reg.pb.gz`（及对应 `block_`）。
+产物都在 `~/amf_mutex/`：`mutex_baseline.pb.gz`、`mutex_RQ600_UE1000.pb.gz`、
+`mutex_After_RQ600_UE1000.pb.gz` … `mutex_RQ1000_UE1000.pb.gz`（及对应 `block_`）。
 
-**提醒：S2（dereg 后）必须打**，它是 RQ1000 的干净基线。
+**提醒：每组的 `After_*`（dereg 后）快照必须打**，它是下一组 RQ 的干净基线；
+漏打的话，下一组 reg 的差值里会混入上一组的 dereg。
 
 > 更省心的替代方案：**每组 RQ 单独重启一次 AMF pod**，则每组从零累计，
-> 连 dereg 快照都不用管：`重启 → S0基线 → RQ200 reg → S1 → 对比 S1-S0`，
-> 再 `重启 → S0'基线 → RQ1000 reg → S1' → 对比 S1'-S0'`。代价是多重启一次。
+> 连 dereg 快照都不用管：`重启 → baseline → RQ600 reg → RQ600_UE1000 → 相减`，
+> RQ800 / RQ1000 同理各重启一次。代价是多重启两次。
 
 ---
 
@@ -138,53 +149,43 @@ chmod +x ~/snap.sh
 
 需要一台装了 Go 的机器（`go tool pprof` 随 Go 自带）。本机没 Go 就把 `.pb.gz` 拷到有 Go 的机器。
 
-### 4.1 交互方式（SSH 终端即可）
+### 4.1 一条命令直接出文本（可存文件、可贴给他人判读）
+
+每组 reg 的净贡献 = 该组 reg 后的快照 − 上一组 dereg 后的快照：
 
 ```bash
 cd ~/amf_mutex
 
-# RQ200 reg 净贡献 = S1 - S0
-go tool pprof -base mutex_S0_baseline.pb.gz mutex_S1_afterRQ200reg.pb.gz
-```
-进入后依次输入：
-```
-top20          # 等待时间最长的前 20 个锁点
-list AmfUe     # (可选) 看 UePool/AmfUe 相关的具体代码行
-quit
-```
-
-```bash
-# RQ1000 reg 净贡献 = S3 - S2
-go tool pprof -base mutex_S2_afterRQ200dereg.pb.gz mutex_S3_afterRQ1000reg.pb.gz
-# 同样输入 top20
-```
-
-### 4.2 一条命令直接出文本（不进交互，可存文件、可贴给他人判读）
-
-```bash
-# 直接打印 top40 并退出，重定向到文本文件
 go tool pprof -top -nodecount=40 \
-  -base mutex_S2_afterRQ200dereg.pb.gz mutex_S3_afterRQ1000reg.pb.gz \
-  > rq1000_mutex_top.txt
+  -base mutex_baseline.pb.gz mutex_RQ600_UE1000.pb.gz \
+  > top_mutex_RQ600.txt
 
-cat rq1000_mutex_top.txt
+go tool pprof -top -nodecount=40 \
+  -base mutex_After_RQ600_UE1000.pb.gz mutex_RQ800_UE1000.pb.gz \
+  > top_mutex_RQ800.txt
+
+go tool pprof -top -nodecount=40 \
+  -base mutex_After_RQ800_UE1000.pb.gz mutex_RQ1000_UE1000.pb.gz \
+  > top_mutex_RQ1000.txt
+
+cat top_mutex_RQ1000.txt
 ```
-`rq1000_mutex_top.txt` 是**纯文本**，可直接阅读，也可贴给他人/AI 判读（无需传二进制）。
+`top_mutex_RQ*.txt` 是**纯文本**，可直接阅读，也可贴给他人/AI 判读（无需传二进制）。
 
 > `.pb.gz` 是 gzip 压缩的 protobuf 二进制，肉眼读不了；
 > 但 `go tool pprof -top ... > x.txt` 会把它转成纯文本。
-> **图形界面（`web`/`svg`）只是可选的调用图，`top`/`list` 已给出全部结论，服务器环境完全够用。**
+> **图形界面（`web`/`svg`）只是可选的调用图，`-top` 已给出全部结论，服务器环境完全够用。**
 
-### 4.3 判读表
+### 4.2 判读表
 
-对比两组 `top20`：**同一把锁在 RQ1000 里的累计等待，是否远大于 RQ200（几倍～十几倍）。**
+对比三份 `top_mutex_RQ*.txt`：**同一把锁的累计等待是否随 RQ600 → RQ800 → RQ1000 单调放大（几倍～十几倍）。**
 
 | top 第一名指向 | 结论 | 下一步 |
 |---|---|---|
-| `sync.Map` / `UePool` / `RanUePool` / `AmfRanPool`，且 RQ1000 >> RQ200 | ✅ **头号嫌疑证实：全 UE 共享表在排队** | 对 UePool 做分片(sharded map) |
+| `sync.Map` / `UePool` / `RanUePool` / `AmfRanPool`，且随 RQ 单调放大（RQ1000 >> RQ600） | ✅ **头号嫌疑证实：全 UE 共享表在排队** | 对 UePool 做分片(sharded map) |
 | `accesslog` / channel 相关 | 是自加日志系统在污染测量 | 优化日志(分片/异步/采样) |
 | `scheduler` 的 `s.mu` | dispatch 全局锁 | connToWorker 改 sync.Map |
-| **所有锁等待都很小、RQ1000≈RQ200** | ❌ **不是锁的问题** | → 见第 5 节（调度排队） |
+| **所有锁等待都很小、RQ1000≈RQ800≈RQ600** | ❌ **不是锁的问题** | → 见第 5 节（调度排队） |
 
 ---
 
@@ -194,10 +195,21 @@ mutex profile 只记锁。没有热锁，说明真凶是「goroutine 集中唤�
 
 ### 5.1 block profile（已抓）——看 goroutine 卡在哪（含 channel/网络等待）
 ```bash
+cd ~/amf_mutex
+
 go tool pprof -top -nodecount=30 \
-  -base block_S2_afterRQ200dereg.pb.gz block_S3_afterRQ1000reg.pb.gz \
-  > rq1000_block_top.txt
-cat rq1000_block_top.txt
+  -base block_baseline.pb.gz block_RQ600_UE1000.pb.gz \
+  > top_block_RQ600.txt
+
+go tool pprof -top -nodecount=30 \
+  -base block_After_RQ600_UE1000.pb.gz block_RQ800_UE1000.pb.gz \
+  > top_block_RQ800.txt
+
+go tool pprof -top -nodecount=30 \
+  -base block_After_RQ800_UE1000.pb.gz block_RQ1000_UE1000.pb.gz \
+  > top_block_RQ1000.txt
+
+cat top_block_RQ1000.txt
 ```
 
 ### 5.2 schedtrace（不改代码，重启 AMF 时加环境变量）
