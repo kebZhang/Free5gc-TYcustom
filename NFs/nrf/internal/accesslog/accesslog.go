@@ -256,15 +256,35 @@ func formatTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
+// formatTimeOrEmpty renders a timestamp like formatTime but yields "" for the
+// zero time, which is how a request that failed before being written (or one
+// whose response never arrived) is recorded. Emitting the key with an empty
+// value keeps every line's field set identical, so the reader never has to
+// special-case a missing key.
+func formatTimeOrEmpty(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return formatTime(t)
+}
+
 // LogHTTP records one outgoing HTTP request/response from this NF's view.
-//   - dstNF:    destination NF name (best-effort, derived from URL host)
-//   - method:   HTTP method
-//   - uri:      full request URI
-//   - ueID:     UE id this request is for (may be ""); used for requests whose
-//     URI does not carry the UE id but whose body does
-//   - reqTime:  when the request was sent
-//   - respTime: when the response (or error) was received
-func LogHTTP(dstNF, method, uri, ueID string, reqTime, respTime time.Time) {
+//   - dstNF:        destination NF name (best-effort, derived from URL host)
+//   - method:       HTTP method
+//   - uri:          full request URI
+//   - ueID:         UE id this request is for (may be ""); used for requests
+//     whose URI does not carry the UE id but whose body does
+//   - reqTime:      when the request was handed to the transport
+//   - wroteTime:    when every frame of the request had reached the kernel
+//     socket buffer. Zero if the request failed before it was written.
+//   - gotFirstByte: when the first byte of the response reached this process's
+//     read loop. Zero if no response ever arrived.
+//   - respTime:     when the response (or error) was received
+//
+// A zero wroteTime/gotFirstByte is emitted as "" so the reader can skip it.
+// latency_us keeps its original meaning, respTime - reqTime, so existing
+// analysis scripts are unaffected.
+func LogHTTP(dstNF, method, uri, ueID string, reqTime, wroteTime, gotFirstByte, respTime time.Time) {
 	b := make([]byte, 0, 256)
 	b = append(b, '{')
 	b = appendKV(b, "src", srcNF, true)
@@ -273,6 +293,8 @@ func LogHTTP(dstNF, method, uri, ueID string, reqTime, respTime time.Time) {
 	b = appendKV(b, "uri", uri, false)
 	b = appendKV(b, "ue_id", ueID, false)
 	b = appendKV(b, "req_time", formatTime(reqTime), false)
+	b = appendKV(b, "wrote_time", formatTimeOrEmpty(wroteTime), false)
+	b = appendKV(b, "got_first_byte", formatTimeOrEmpty(gotFirstByte), false)
 	b = appendKV(b, "resp_time", formatTime(respTime), false)
 	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))
 	b = append(b, '}')

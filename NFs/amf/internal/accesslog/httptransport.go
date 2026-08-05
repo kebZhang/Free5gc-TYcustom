@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"time"
 
@@ -74,12 +75,50 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	// body is fully buffered and restored so the outgoing request is unchanged.
 	ueID := sniffUEID(req)
 
+	// wroteTime records the instant every frame of this request (HEADERS plus
+	// all DATA) has been handed to the kernel socket buffer. Splitting the
+	// request leg at this point separates sender-side queueing (waiting for the
+	// shared clientConn write lock) from everything that happens afterwards in
+	// the kernel and on the receiving NF.
+	//
+	// gotFirstByte records when the response HEADERS reached this process's
+	// HTTP/2 read loop. It splits the response leg the same way: what precedes
+	// it is the peer's write path plus the wire, what follows it is this process
+	// receiving the body and waking the goroutine blocked below in RoundTrip.
+	//
+	// Both callbacks are request-scoped, not frame-scoped: WroteRequest fires
+	// once after the last frame is written, GotFirstResponseByte once on the
+	// first response byte. Each closure captures this call's own local variable,
+	// so concurrent RoundTrips never interfere and no correlation id is needed.
+	//
+	// Neither callback may log or block: WroteRequest runs on the stream's write
+	// goroutine and GotFirstResponseByte on the connection's single read loop,
+	// which serves every stream on that connection. Any I/O there would stall
+	// all of them. They only stamp a local variable; the record is enqueued
+	// after RoundTrip returns, on the normal asynchronous path.
+	//
+	// The transport may write the request more than once (an idempotent request
+	// retried after a connection error); keep the first write so the recorded
+	// value always pairs with reqTime below.
+	var wroteTime, gotFirstByte time.Time
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			if wroteTime.IsZero() {
+				wroteTime = time.Now()
+			}
+		},
+		GotFirstResponseByte: func() {
+			gotFirstByte = time.Now()
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
 	reqTime := time.Now()
 	resp, err := base.RoundTrip(req)
 	respTime := time.Now()
 
 	// Always log, even on transport error, so failed attempts are visible.
-	LogHTTP(dst, method, uri, ueID, reqTime, respTime)
+	LogHTTP(dst, method, uri, ueID, reqTime, wroteTime, gotFirstByte, respTime)
 	return resp, err
 }
 
@@ -171,12 +210,17 @@ func InboundLogger() gin.HandlerFunc {
 		method := c.Request.Method
 		uri := inboundURI(c.Request)
 
+		// Timestamp first: sniffing reads and unmarshals the whole body, and that
+		// cost belongs to this NF's own processing, not to the request's journey
+		// from the caller. Taking reqTime beforehand keeps the request leg free
+		// of it.
+		reqTime := time.Now()
+
 		// For the few request types whose UE id lives only in the body, sniff it
 		// before the handler runs and restore the body so the handler is
 		// unaffected. Every other request is untouched and pays no cost.
 		ueID := sniffInboundUEID(c.Request)
 
-		reqTime := time.Now()
 		c.Next()
 		respTime := time.Now()
 
