@@ -21,8 +21,12 @@ import (
 // well under 1 KiB; this guards against ever buffering a large/unexpected body.
 const maxSniffBody = 8 << 10 // 8 KiB
 
-// These mirror the timeouts used by free5gc/openapi's internal HTTP/2 clients
-// so behaviour is unchanged apart from the added logging.
+// These mirror the timeouts used by free5gc/openapi's internal HTTP/2 clients.
+// The 1s ping timeout is aggressive (Go's default is 15s): under load a peer
+// that is slow to answer a PING gets its connection torn down and replaced.
+// That replacement is deliberately left in place -- see the
+// StrictMaxConcurrentStreams comment below for which kind of extra connection
+// is suppressed and which is not.
 const (
 	readIdleTimeoutPeriod = 1 * time.Second
 	pingTimeoutPeriod     = 1 * time.Second
@@ -42,8 +46,22 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 	return &loggingRoundTripper{
 		tls: &http2.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // matches openapi default
-			ReadIdleTimeout: readIdleTimeoutPeriod,
-			PingTimeout:     pingTimeoutPeriod,
+			// Treat the peer's SETTINGS_MAX_CONCURRENT_STREAMS as a limit on
+			// this NF as a whole rather than per connection. With the default
+			// (false) the transport silently dials extra connections whenever
+			// the in-flight stream count reaches the peer's limit, which is how
+			// a single NF pair was observed holding up to 10 sockets at 1500
+			// req/s. With true, requests past the limit block in RoundTrip and
+			// wait their turn, so the pair keeps exactly one connection.
+			//
+			// This does NOT pin the connection's identity: if the connection
+			// dies (GOAWAY, or the ping health check above failing) the
+			// transport still dials a replacement. That is intended -- what is
+			// being suppressed is "open another because we are busy", not
+			// "open another because the old one is gone".
+			StrictMaxConcurrentStreams: true,
+			ReadIdleTimeout:            readIdleTimeoutPeriod,
+			PingTimeout:                pingTimeoutPeriod,
 		},
 		clear: &http2.Transport{
 			AllowHTTP: true,
@@ -51,8 +69,12 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 				d := &net.Dialer{}
 				return d.DialContext(ctx, network, addr)
 			},
-			ReadIdleTimeout: readIdleTimeoutPeriod,
-			PingTimeout:     pingTimeoutPeriod,
+			// Same rationale as the tls transport above. This is the one that
+			// actually carries traffic in this deployment: every config/*.yaml
+			// sets `scheme: http`, so all SBI calls take the h2c path.
+			StrictMaxConcurrentStreams: true,
+			ReadIdleTimeout:            readIdleTimeoutPeriod,
+			PingTimeout:                pingTimeoutPeriod,
 		},
 	}
 }
