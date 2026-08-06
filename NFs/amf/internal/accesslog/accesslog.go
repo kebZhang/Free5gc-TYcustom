@@ -282,6 +282,20 @@ func appendKV(b []byte, key, val string, first bool) []byte {
 	return b
 }
 
+// appendKVBool appends a boolean-valued JSON field. The value is emitted
+// unquoted so downstream analysis reads it as a real boolean, not a string.
+func appendKVBool(b []byte, key string, val bool, first bool) []byte {
+	if !first {
+		b = append(b, ',')
+	}
+	b = appendJSONString(b, key)
+	b = append(b, ':')
+	if val {
+		return append(b, "true"...)
+	}
+	return append(b, "false"...)
+}
+
 // formatTime renders a timestamp as RFC3339Nano (UTC) for stable sorting.
 func formatTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
@@ -305,6 +319,13 @@ func formatTimeOrEmpty(t time.Time) string {
 //   - uri:          full request URI
 //   - ueID:         UE id this request is for (may be ""); used for requests
 //     whose URI does not carry the UE id but whose body does
+//   - connID:       the TCP connection this request went out on, as
+//     "localIP:localPort". Empty when the transport never obtained a connection
+//     (e.g. the dial itself failed), which is how a connection-level failure is
+//     distinguished from a request that was actually sent.
+//   - connReused:   true if an existing connection was reused, false if this
+//     request is what caused a new connection to be established. Grouping the
+//     false records by time shows when (and whether) the connection pool grew.
 //   - reqTime:      when the request was handed to the transport
 //   - wroteTime:    when every frame of the request had reached the kernel
 //     socket buffer. Zero if the request failed before it was written.
@@ -315,14 +336,18 @@ func formatTimeOrEmpty(t time.Time) string {
 // A zero wroteTime/gotFirstByte is emitted as "" so the reader can skip it.
 // latency_us keeps its original meaning, respTime - reqTime, so existing
 // analysis scripts are unaffected.
-func LogHTTP(dstNF, method, uri, ueID string, reqTime, wroteTime, gotFirstByte, respTime time.Time) {
-	b := make([]byte, 0, 256)
+func LogHTTP(dstNF, method, uri, ueID, connID string, connReused bool,
+	reqTime, wroteTime, gotFirstByte, respTime time.Time,
+) {
+	b := make([]byte, 0, 288)
 	b = append(b, '{')
 	b = appendKV(b, "src", srcNF, true)
 	b = appendKV(b, "dst", dstNF, false)
 	b = appendKV(b, "method", method, false)
 	b = appendKV(b, "uri", uri, false)
 	b = appendKV(b, "ue_id", ueID, false)
+	b = appendKV(b, "conn", connID, false)
+	b = appendKVBool(b, "conn_reused", connReused, false)
 	b = appendKV(b, "req_time", formatTime(reqTime), false)
 	b = appendKV(b, "wrote_time", formatTimeOrEmpty(wroteTime), false)
 	b = appendKV(b, "got_first_byte", formatTimeOrEmpty(gotFirstByte), false)

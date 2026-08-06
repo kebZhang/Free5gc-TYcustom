@@ -101,7 +101,38 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	// retried after a connection error); keep the first write so the recorded
 	// value always pairs with reqTime below.
 	var wroteTime, gotFirstByte time.Time
+
+	// connID identifies the TCP connection this request went out on, as
+	// "localIP:localPort". A socket's local port is unique within this process
+	// for the socket's whole lifetime, so grouping log lines by connID recovers
+	// exactly which requests shared a connection.
+	//
+	// connReused reports whether the transport handed back an existing
+	// connection (true) or had to establish a new one (false). Every false is
+	// the birth of a new connection, so the timestamps of the false records show
+	// WHEN the pool grew — which is what distinguishes load-driven expansion
+	// from a burst of dials at start-up.
+	var connID string
+	var connReused bool
+
 	trace := &httptrace.ClientTrace{
+		// GotConn fires once, after the transport has picked (or dialled) the
+		// connection for this request and before the request is written. Unlike
+		// the two callbacks below it runs on this calling goroutine, not on a
+		// shared loop, but it follows the same rule anyway: stamp locals only,
+		// never log or block.
+		//
+		// Deliberately no IsZero()-style guard here. wroteTime keeps its first
+		// value because a retry must still pair with reqTime; for the
+		// connection the opposite is wanted — a retry means a different
+		// connection, and the last one is the one that actually carried the
+		// request, so overwriting is correct.
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil {
+				connID = info.Conn.LocalAddr().String()
+			}
+			connReused = info.Reused
+		},
 		WroteRequest: func(httptrace.WroteRequestInfo) {
 			if wroteTime.IsZero() {
 				wroteTime = time.Now()
@@ -118,7 +149,7 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	respTime := time.Now()
 
 	// Always log, even on transport error, so failed attempts are visible.
-	LogHTTP(dst, method, uri, ueID, reqTime, wroteTime, gotFirstByte, respTime)
+	LogHTTP(dst, method, uri, ueID, connID, connReused, reqTime, wroteTime, gotFirstByte, respTime)
 	return resp, err
 }
 
