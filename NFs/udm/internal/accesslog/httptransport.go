@@ -47,21 +47,26 @@ const (
 	timeoutPeriod         = 10 * time.Second
 )
 
-// connsPerPeer is how many HTTP/2 connections this NF keeps to each peer NF.
+// connsPerPeer is how many HTTP/2 connections this NF opens to each peer NF up
+// front. It is 1: the transport starts with a single connection per peer and is
+// left free to add more on its own.
 //
-// Each connection is backed by its own http2.Transport. A transport's
-// connection pool is private to that instance, so N instances hold N separate
-// TCP connections to the same host:port -- there is no transport option that
-// asks for "N connections", and this is the only way to get more than one.
-// Requests are spread over them round-robin (see RoundTrip).
+// Each slot is a separate http2.Transport with its own private pool, so N slots
+// mean N connections held from the start. This was 2 for the round-robin
+// experiment (HTTP_MULTI_CONN_ROUNDROBIN_PLAN_0806.md). That comparison never
+// actually ran as designed: the server's 1ms IdleTimeout tore every connection
+// down between requests, so each slot handed out a freshly dialled socket every
+// time rather than holding one. With the server-side IdleTimeout now raised to
+// 500ms, two slots would for the first time mean two genuinely long-lived
+// sockets -- a second variable on top of the connection-lifetime change this
+// experiment exists to measure. Hence back to 1.
 //
-// Measurements that motivated this: with a single connection, one NF pair put
-// 86-100% of its requests on one socket at every load point tested, and the
-// in-flight stream count peaked at 371 (UDM->UDR, 1500 req/s) against the
-// peer's 250-stream limit. Splitting across two connections halves both the
-// per-connection stream pressure and the contention for a connection's write
-// lock, which is what this experiment is measuring.
-const connsPerPeer = 2
+// Growth is still permitted and expected: StrictMaxConcurrentStreams is
+// deliberately left unset (see below), so when in-flight streams reach the
+// peer's 250-stream limit the transport dials an additional connection by
+// itself. The intent is "start at one, grow only under real pressure", not a
+// hard cap of one.
+const connsPerPeer = 1
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
