@@ -48,25 +48,29 @@ const (
 )
 
 // connsPerPeer is how many HTTP/2 connections this NF opens to each peer NF up
-// front. It is 1: the transport starts with a single connection per peer and is
-// left free to add more on its own.
+// front, and how many round-robin slots requests are dealt across. It is 4.
 //
 // Each slot is a separate http2.Transport with its own private pool, so N slots
-// mean N connections held from the start. This was 2 for the round-robin
-// experiment (HTTP_MULTI_CONN_ROUNDROBIN_PLAN_0806.md). That comparison never
-// actually ran as designed: the server's 1ms IdleTimeout tore every connection
-// down between requests, so each slot handed out a freshly dialled socket every
-// time rather than holding one. With the server-side IdleTimeout now raised to
-// 500ms, two slots would for the first time mean two genuinely long-lived
-// sockets -- a second variable on top of the connection-lifetime change this
-// experiment exists to measure. Hence back to 1.
+// mean N connections held from the start, with requests handed to them one after
+// another in turn.
 //
-// Growth is still permitted and expected: StrictMaxConcurrentStreams is
-// deliberately left unset (see below), so when in-flight streams reach the
-// peer's 250-stream limit the transport dials an additional connection by
-// itself. The intent is "start at one, grow only under real pressure", not a
-// hard cap of one.
-const connsPerPeer = 1
+// The history matters for reading this number. It was 2 for the original
+// round-robin experiment (HTTP_MULTI_CONN_ROUNDROBIN_PLAN_0806.md), then went
+// back to 1 (HTTP2_IDLETIMEOUT_FIX_PLAN_0807.md) once that comparison turned out
+// never to have run as designed: the server's 1ms IdleTimeout tore every
+// connection down between requests, so each slot handed out a freshly dialled
+// socket every time instead of holding one -- measured at RQ5/UE10 as exactly
+// 1.0 requests per socket, 84 requests over UDM->UDR opening 84 connections.
+// With the server-side IdleTimeout now at 500ms, connections survive the gaps
+// between requests, so N slots finally mean N concurrent long-lived sockets.
+// 4 is what this experiment measures against that fixed baseline of 1.
+//
+// Growth beyond these 4 is still permitted and expected:
+// StrictMaxConcurrentStreams is deliberately left unset (see below), so when a
+// slot's in-flight streams reach the peer's 250-stream limit the transport dials
+// an additional connection by itself. 4 is a floor, not a cap -- which is why
+// conn_slot rather than conn is the field that shows whether the split is even.
+const connsPerPeer = 4
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
@@ -106,8 +110,9 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 		//
 		// With the default, a transport may dial an extra connection when its
 		// in-flight stream count reaches the peer's limit. That is accepted:
-		// the point of connsPerPeer is to compare one connection against two,
-		// not to cap the total.
+		// connsPerPeer sets how many connections are held from the start, so
+		// that the number in use can be compared against the single-connection
+		// baseline; it is not meant to cap the total.
 		l.tls[i] = &http2.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // matches openapi default
 			ReadIdleTimeout: readIdleTimeoutPeriod,
