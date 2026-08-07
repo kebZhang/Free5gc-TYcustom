@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,69 +22,121 @@ import (
 // well under 1 KiB; this guards against ever buffering a large/unexpected body.
 const maxSniffBody = 8 << 10 // 8 KiB
 
-// These mirror the timeouts used by free5gc/openapi's internal HTTP/2 clients.
-// The 1s ping timeout is aggressive (Go's default is 15s): under load a peer
-// that is slow to answer a PING gets its connection torn down and replaced.
-// That replacement is deliberately left in place -- see the
-// StrictMaxConcurrentStreams comment below for which kind of extra connection
-// is suppressed and which is not.
+// readIdleTimeoutPeriod / timeoutPeriod mirror the values used by
+// free5gc/openapi's internal HTTP/2 clients. pingTimeoutPeriod deliberately
+// does NOT: openapi uses 1s, and this is raised to 3s.
+//
+// After ReadIdleTimeout of no frames arriving, the transport sends a PING and
+// tears the connection down if no PONG comes back within PingTimeout. At 1s
+// that check was firing on connections that were merely busy rather than dead:
+// a peer under load could not turn a PING around inside a second, so healthy
+// connections were killed and redialled mid-run (observed in
+// Ty_log/Free5gc/C6525100g_HTTPconnum_0806, where the main UDM->UDR connection
+// died at +813.6ms and a replacement took over 2.8ms later). Every such kill
+// re-splits traffic onto a fresh socket and muddies the per-connection
+// measurements this experiment exists to take.
+//
+// 3s is a compromise: still well below Go's 15s default, so a genuinely dead
+// peer is detected promptly, but wide enough that ordinary head-of-line delay
+// on a loaded connection no longer reads as failure. This does not eliminate
+// reconnects -- it only removes the ones caused by the health check being
+// impatient.
 const (
 	readIdleTimeoutPeriod = 1 * time.Second
-	pingTimeoutPeriod     = 1 * time.Second
+	pingTimeoutPeriod     = 3 * time.Second
 	timeoutPeriod         = 10 * time.Second
 )
+
+// connsPerPeer is how many HTTP/2 connections this NF keeps to each peer NF.
+//
+// Each connection is backed by its own http2.Transport. A transport's
+// connection pool is private to that instance, so N instances hold N separate
+// TCP connections to the same host:port -- there is no transport option that
+// asks for "N connections", and this is the only way to get more than one.
+// Requests are spread over them round-robin (see RoundTrip).
+//
+// Measurements that motivated this: with a single connection, one NF pair put
+// 86-100% of its requests on one socket at every load point tested, and the
+// in-flight stream count peaked at 371 (UDM->UDR, 1500 req/s) against the
+// peer's 250-stream limit. Splitting across two connections halves both the
+// per-connection stream pressure and the contention for a connection's write
+// lock, which is what this experiment is measuring.
+const connsPerPeer = 2
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
 // openapi.CallAPI's inner clients do, and records one HTTP access-log entry per
 // request from the requester's (this NF's) point of view.
 type loggingRoundTripper struct {
-	tls   http.RoundTripper // h2 over TLS  (https)
-	clear http.RoundTripper // h2c cleartext (http)
+	// One slot per connection to each peer. Every element is a SEPARATE
+	// http2.Transport with its own pool, which is what makes them distinct TCP
+	// connections rather than one shared one.
+	tls   [connsPerPeer]http.RoundTripper // h2 over TLS  (https)
+	clear [connsPerPeer]http.RoundTripper // h2c cleartext (http)
+
+	// next is the round-robin cursor, shared by both schemes. Atomic rather
+	// than mutex-guarded: this is on every request's path, and an atomic add is
+	// a single instruction with no contention point, so the cost does not grow
+	// with concurrency the way lock acquisition would.
+	next atomic.Uint64
 }
 
 func newLoggingRoundTripper() *loggingRoundTripper {
-	return &loggingRoundTripper{
-		tls: &http2.Transport{
+	l := &loggingRoundTripper{}
+	for i := 0; i < connsPerPeer; i++ {
+		// Each iteration builds a SEPARATE http2.Transport. Field values are
+		// identical across slots; only the instance identity differs, and that
+		// is precisely what yields one connection per slot.
+		// StrictMaxConcurrentStreams is deliberately NOT set here, i.e. it keeps
+		// its default of false. Setting it true was tried (see
+		// Ty_log/Free5gc/C6525100g_NFHTTPonly1conn_0806v1) and made things
+		// worse for measurement: instead of holding one steady connection the
+		// pair churned through 2-7 of them, each living only 25-120ms before
+		// being torn down and replaced. Blocked-in-RoundTrip requests keep a
+		// connection idle enough for the ping health check to time out and kill
+		// it, so the "limit" produced a stream of short-lived sockets and made
+		// the logs harder to read rather than easier. (That run predates the
+		// PingTimeout increase above and used the old 1s value, which is part of
+		// why it churned so hard; Strict is still not re-enabled here.)
+		//
+		// With the default, a transport may dial an extra connection when its
+		// in-flight stream count reaches the peer's limit. That is accepted:
+		// the point of connsPerPeer is to compare one connection against two,
+		// not to cap the total.
+		l.tls[i] = &http2.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // matches openapi default
-			// Treat the peer's SETTINGS_MAX_CONCURRENT_STREAMS as a limit on
-			// this NF as a whole rather than per connection. With the default
-			// (false) the transport silently dials extra connections whenever
-			// the in-flight stream count reaches the peer's limit, which is how
-			// a single NF pair was observed holding up to 10 sockets at 1500
-			// req/s. With true, requests past the limit block in RoundTrip and
-			// wait their turn, so the pair keeps exactly one connection.
-			//
-			// This does NOT pin the connection's identity: if the connection
-			// dies (GOAWAY, or the ping health check above failing) the
-			// transport still dials a replacement. That is intended -- what is
-			// being suppressed is "open another because we are busy", not
-			// "open another because the old one is gone".
-			StrictMaxConcurrentStreams: true,
-			ReadIdleTimeout:            readIdleTimeoutPeriod,
-			PingTimeout:                pingTimeoutPeriod,
-		},
-		clear: &http2.Transport{
+			ReadIdleTimeout: readIdleTimeoutPeriod,
+			PingTimeout:     pingTimeoutPeriod,
+		}
+		l.clear[i] = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 				d := &net.Dialer{}
 				return d.DialContext(ctx, network, addr)
 			},
-			// Same rationale as the tls transport above. This is the one that
-			// actually carries traffic in this deployment: every config/*.yaml
-			// sets `scheme: http`, so all SBI calls take the h2c path.
-			StrictMaxConcurrentStreams: true,
-			ReadIdleTimeout:            readIdleTimeoutPeriod,
-			PingTimeout:                pingTimeoutPeriod,
-		},
+			ReadIdleTimeout: readIdleTimeoutPeriod,
+			PingTimeout:     pingTimeoutPeriod,
+		}
 	}
+	return l
 }
 
 func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	base := l.clear
+	// Take the address rather than the array: a Go array is a value, so
+	// assigning it would copy every element on each request.
+	pool := &l.clear
 	if req.URL != nil && req.URL.Scheme == "https" {
-		base = l.tls
+		pool = &l.tls
 	}
+
+	// Round-robin over the connsPerPeer transports. The cursor is shared
+	// between the tls and clear pools; this deployment is http-only, so only
+	// the clear pool is ever indexed in practice and sharing costs nothing.
+	//
+	// Add returns the value AFTER incrementing, so subtracting 1 makes the
+	// first request land on slot 0 and keeps connSlot 0-based in the log.
+	connSlot := int((l.next.Add(1) - 1) % connsPerPeer)
+	base := pool[connSlot]
 
 	dst := dstNFFromURL(req)
 	method := req.Method
@@ -171,7 +224,7 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	respTime := time.Now()
 
 	// Always log, even on transport error, so failed attempts are visible.
-	LogHTTP(dst, method, uri, ueID, connID, connReused, reqTime, wroteTime, gotFirstByte, respTime)
+	LogHTTP(dst, method, uri, ueID, connID, connSlot, connReused, reqTime, wroteTime, gotFirstByte, respTime)
 	return resp, err
 }
 

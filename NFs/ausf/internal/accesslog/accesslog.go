@@ -265,6 +265,17 @@ func appendKVBool(b []byte, key string, val bool, first bool) []byte {
 	return append(b, "false"...)
 }
 
+// appendKVInt appends an integer-valued JSON field. The value is emitted
+// unquoted so downstream analysis reads it as a number, not a string.
+func appendKVInt(b []byte, key string, val int, first bool) []byte {
+	if !first {
+		b = append(b, ',')
+	}
+	b = appendJSONString(b, key)
+	b = append(b, ':')
+	return strconv.AppendInt(b, int64(val), 10)
+}
+
 // formatTime renders a timestamp as RFC3339Nano (UTC) for stable sorting.
 func formatTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
@@ -292,6 +303,12 @@ func formatTimeOrEmpty(t time.Time) string {
 //     "localIP:localPort". Empty when the transport never obtained a connection
 //     (e.g. the dial itself failed), which is how a connection-level failure is
 //     distinguished from a request that was actually sent.
+//   - connSlot:     which round-robin transport slot carried this request
+//     (0..connsPerPeer-1). This is the slot the request was ASSIGNED to, which
+//     is what shows whether the round-robin split is even; connID says which
+//     socket that slot happened to be holding at the time. The two differ when
+//     a slot's connection dies and is replaced, so a slot can span several
+//     connID values over a run.
 //   - connReused:   true if an existing connection was reused, false if this
 //     request is what caused a new connection to be established. Grouping the
 //     false records by time shows when (and whether) the connection pool grew.
@@ -305,10 +322,10 @@ func formatTimeOrEmpty(t time.Time) string {
 // A zero wroteTime/gotFirstByte is emitted as "" so the reader can skip it.
 // latency_us keeps its original meaning, respTime - reqTime, so existing
 // analysis scripts are unaffected.
-func LogHTTP(dstNF, method, uri, ueID, connID string, connReused bool,
+func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused bool,
 	reqTime, wroteTime, gotFirstByte, respTime time.Time,
 ) {
-	b := make([]byte, 0, 288)
+	b := make([]byte, 0, 304)
 	b = append(b, '{')
 	b = appendKV(b, "src", srcNF, true)
 	b = appendKV(b, "dst", dstNF, false)
@@ -316,6 +333,7 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connReused bool,
 	b = appendKV(b, "uri", uri, false)
 	b = appendKV(b, "ue_id", ueID, false)
 	b = appendKV(b, "conn", connID, false)
+	b = appendKVInt(b, "conn_slot", connSlot, false)
 	b = appendKVBool(b, "conn_reused", connReused, false)
 	b = appendKV(b, "req_time", formatTime(reqTime), false)
 	b = appendKV(b, "wrote_time", formatTimeOrEmpty(wroteTime), false)

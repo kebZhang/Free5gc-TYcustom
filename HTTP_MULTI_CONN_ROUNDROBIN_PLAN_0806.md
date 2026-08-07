@@ -1,572 +1,419 @@
-# NF↔NF 多 HTTP/2 连接 + Round-Robin 改造计划 (0806)
+# NF↔NF 双 HTTP/2 连接 + Round-Robin 改造计划 (0806)
 
-> 基于 commit `98903eb`（`add NF-NF http transmission latency debug log in HTTP_log -- 0804`）实际代码阅读得出，
-> 非记忆推断。所有引用的行号对应该 commit。
+> **状态：已实施**（在 commit `0848dba` 之上）。
+> 本文件已根据 `C6525100g_HTTPconnum_0806` 的实测数据重写；
+> 初版中「每个 NF 对恰好 1 条 TCP」的假设**已被实测推翻**，见第 1 节。
+>
+> **修订（本次）**：`PingTimeout` 1s → 3s，缓解高负载下健康检查误杀连接
+> 导致的重建。这是相对 `2fa0755` 的**唯一行为差异**，见第 2.3 节。
 
 ---
 
-## 0. TL;DR（先回答四个问题）
+## 0. TL;DR
 
 | # | 问题 | 结论 |
 |---|---|---|
-| 1 | 目前两个 NF 通信是否只开一条 HTTP 连接（一条 TCP）？ | **是**。每个 NF 进程对每个对端 `host:port` 只有 **1 条 TCP**，所有 UE 的请求作为 HTTP/2 stream 复用其上。 |
-| 2 | 改成一次性开 2 条连接 + Round-Robin 选连接，是否可行？ | **可行**，且改动面很小（每个 NF 只需改 `internal/accesslog/httptransport.go` 一个文件）。 |
-| 3 | 请求走连接 1，响应是否一定从连接 1 回来？ | **是，100% 保证**。这是 HTTP/2 协议 + Go transport 的结构性保证，不存在跨连接错配。 |
-| 4 | 改造计划 | 见第 4 节。核心：把 `loggingRoundTripper` 里的单个 `http2.Transport` **对象**换成 2 个独立对象 + 原子计数器轮询。 |
+| 1 | 改造前两个 NF 之间只有一条 TCP 吗？ | **不是**。低负载下是 1 条，但高负载下实测多达 **10 条**（UDM→UDR @1500 req/s）。初版计划的核心假设是错的。 |
+| 2 | 强制开 2 条 + round-robin 可行吗？ | **可行，已实施**。每个 NF 只改 `internal/accesslog/` 下两个文件。 |
+| 3 | 请求走连接 1，响应会从连接 2 回来吗？ | **不会，100% 保证**。HTTP/2 协议 + Go transport 的结构性保证。 |
+| 4 | 日志能验证 round-robin 效果吗？ | **能**。新增 `conn_slot` 字段（本次），配合已有的 `conn` / `conn_reused`。见第 5 节。 |
+| 5 | 连接断了会自动重建吗？ | **会**。每个槽独立重建，互不影响，轮询逻辑不受干扰。见第 6 节。 |
+| 6 | 健康检查误杀连接怎么办？ | **`PingTimeout` 1s → 3s**（本次）。1s 会把「忙」误判成「死」，见第 2.3 节。 |
 
-> **术语提醒**：下文所有"实例 / instance"一律指**进程内的 `http2.Transport` 对象**，
-> **不是** NF 的 pod / 副本。NF 部署拓扑一个都不变。详见 2.2 节。
-
-> **连接数固定为 2**：不引入环境变量，`connsPerPeer = 2` 是编译期常量。
-
----
-
-## 1. 现状：为什么现在只有一条 TCP
-
-### 1.1 调用链（实际代码，逐层验证）
-
-以 AMF→UDM 的 SDM 查询为例：
-
-```
-consumer 层                     NFs/amf/internal/sbi/consumer/udm_service.go:27-49
-  getSubscriberDMngmntClients(uri)
-    ├─ 以 uri 为 key 缓存 APIClient（map + RWMutex），同一 uri 只建一次
-    ├─ configuration.SetBasePath(uri)
-    └─ configuration.SetHTTPClient(accesslog.Client())      ← :41
-                                        │
-openapi 层（外部模块 github.com/free5gc/openapi v1.2.3）
-  openapi.CallAPI(cfg, request)
-    └─ if cfg.HTTPClient() != nil { return cfg.HTTPClient().Do(request) }
-                                        │
-accesslog 层                    NFs/amf/internal/accesslog/httptransport.go
-  sharedClient (:286-289)  ← 包级单例 var，整个 NF 进程唯一
-    └─ Transport: newLoggingRoundTripper()  (:41-58)
-         ├─ tls   : &http2.Transport{...}   (:43-47)   ← https 用
-         └─ clear : &http2.Transport{...}   (:48-56)   ← http (h2c) 用
-                                        │
-golang.org/x/net v0.47.0 http2.Transport
-  连接池 key = (scheme, host:port)  →  每个对端只保留一个 *ClientConn
-```
-
-### 1.2 三个"收敛点"叠加，最终收敛成 1 条 TCP
-
-| 层级 | 收敛行为 | 代码位置 |
-|---|---|---|
-| **A. Client 单例** | `Client()` 返回包级 `sharedClient`，**所有** service（SDM/UECM/NRF/AUSF/PCF…）共用同一个 `*http.Client`，因此共用同一个 `loggingRoundTripper` | `httptransport.go:282-289` |
-| **B. Transport 单例** | `newLoggingRoundTripper()` 只在 `sharedClient` 初始化时调用一次，里面的 `tls` / `clear` 两个 `http2.Transport` 是**固定的两个实例** | `httptransport.go:41-58, 286-289` |
-| **C. http2 连接池** | `http2.Transport` 内部 `connPool` 以 `(scheme, authority)` 为 key。同一 key 命中已有 `ClientConn` 就直接复用，**不会**因为并发高就再开一条 | `golang.org/x/net/http2`（外部模块） |
-
-> **注意 B 的一个细节**：`tls` 和 `clear` 是两个独立的 `http2.Transport`，
-> 但它们按 **URL scheme** 二选一（`RoundTrip` :61-64）。
-> 本项目 `config/*.yaml` 里 **全部是 `scheme: http`**
-> （已核对 amfcfg/ausfcfg/udmcfg/udrcfg/pcfcfg/nrfcfg/nssfcfg 共 7 个文件），
-> 所以实际运行时 **只有 `clear` 这一个 transport 在工作**，`tls` 恒为空闲。
-> 这意味着当前有效连接数 = 1，而不是 2。
-
-### 1.3 为什么"多个 APIClient"不会带来多条 TCP
-
-这是最容易误判的一点。AMF 里确实有很多个 `APIClient`（NRF-Mngmt、NRF-Disc、UDM-SDM、UDM-UECM、AUSF、PCF、NSSF、SMF……），
-`SetHTTPClient(accesslog.Client())` 在 **8 个文件**里被调用（`amf` 下 grep 结果）。
-
-但它们传进去的是**同一个** `sharedClient` 指针。
-`APIClient` 多 ≠ 连接多 —— 连接由最底层的 `http2.Transport` 连接池决定，与上层建了几个 APIClient 无关。
-
-### 1.4 为什么"每个 UE 各自查 NRF"也不会带来多条 TCP
-
-`NFs/amf/internal/disccache/disccache.go` 的缓存 key 是
-`targetNfType | requesterNfType | serviceNames`（:59-68），**刻意排除了 supi**（见包注释 :20-27）。
-
-因此**所有 UE 拿到的是同一个 SearchResult → 同一个 URI → 同一个 host:port**。
-即便不看 disccache，本 deployment 每种 NF 只有一个实例，NRF 也只会返回同一个地址。
-
-**结论**：不存在"不同 UE 落到不同 host:port 从而自然分裂出多条 TCP"的可能。
-
-### 1.5 现状小结
-
-```
-AMF 进程
-  └── sharedClient (唯一)
-        └── clear *http2.Transport (唯一，scheme=http 时唯一在用)
-              ├── ClientConn → UDM:8000    ← 1 条 TCP，承载所有 UE 的 SDM+UECM
-              ├── ClientConn → AUSF:8000   ← 1 条 TCP
-              ├── ClientConn → PCF:8000    ← 1 条 TCP
-              └── ClientConn → NRF:8000    ← 1 条 TCP
-```
-
-**每个 NF-pair 恰好 1 条 TCP。** 这与 `HTTP_WROTE_TIME_PLAN_0804.md` 第 1.1 节
-描述的"抢 `clientConn` 写锁排队"是同一个瓶颈的两种表述 —— 单条连接上的
-写锁与 HPACK 编码是全连接串行的。
+> **术语**：下文的「实例 / instance」一律指**进程内的 `http2.Transport` 对象**，
+> 不是 NF 的 pod / 副本。**NF 部署拓扑一个都不变。**
 
 ---
 
-## 2. 问题 2：改成 2 条连接 + Round-Robin，可行性分析
+## 1. 前提修正：改造前并非「只有一条连接」
 
-### 2.1 结论：可行
+### 1.1 初版假设与实测的冲突
 
-关键在于**如何让 Go 的 http2 连接池认为这是"两个不同的目标"**。有三条路，推荐第一条。
+初版计划断言「每个 NF 对恰好 1 条 TCP」，理由是 `http2.Transport` 的连接池按
+`(scheme, host:port)` 复用。**这个推理在低负载下成立，在高负载下不成立。**
 
-| 方案 | 做法 | 评价 |
-|---|---|---|
-| **A. 多 Transport 实例（推荐）** | 建 N 个独立的 `http2.Transport`，每个有自己的连接池，因此每个对同一 host 各开 1 条 TCP。RoundTrip 时用原子计数器轮询选一个 | ✅ 改动最小（1 个文件）<br>✅ 不碰 URL、不碰 openapi 模块<br>✅ 语义干净，N 可配置 |
-| B. `MaxConcurrentStreams` 限流触发扩容 | 依赖 h2 在 stream 用满时新开连接 | ❌ 行为不可控，取决于 server 的 SETTINGS，不是"固定 2 条" |
-| C. 改 URL 使 authority 不同 | 给同一 IP 造两个 host 别名 | ❌ 侵入 URI，污染 HTTP_log 的 uri 字段与现有分析脚本 |
+用 `conn` 字段（commit `2fa0755` 引入）实测 UDM→UDR：
 
-### 2.2 术语澄清：「实例」指的是什么
+| RQ | 连接数 | 峰值并发 stream | 主连接占比 |
+|---|---|---|---|
+| 1000 | 1 | 48 | 100% |
+| 1500 | **10** | **371** | 86.4% |
+| 2000 | 5 | 297 | 91.4% |
 
-⚠️ **这里说的"建 N 个实例"，指的是 Go 进程内部的 `http2.Transport` 对象个数，
-与 NF 的部署数量（pod 数、副本数）毫无关系。**
+### 1.2 连接增长的两种机制（实测确认）
 
-NF 拓扑**完全不变**：还是 1 个 AMF、1 个 UDM、1 个 UDR，各自 1 个 pod。
-改的只是**每个 NF 进程内部对同一个对端维持几条 TCP**。
-两条 TCP 打到的是**同一个 UDM 的同一个 `host:port`**，
-UDM 侧只是看到"有个客户端开了两条连接过来"。
+RQ1500 各连接诞生瞬间的并发 stream 数：
 
 ```
-【现在】1 个 AMF 进程                【改后】还是同一个 AMF 进程
-  sharedClient                         sharedClient
-    └── clear: 1 个 http2.Transport      └── clear: [2]http2.Transport
-          └── 1 条 TCP ──> UDM pod             ├── transport[0] → TCP ──┐
-                                                └── transport[1] → TCP ──┴─> 同一个 UDM pod
+#1  @   4.5ms  streams_at_birth=  1   reqs=6986   ← 起始连接
+#2  @ 434.7ms  streams_at_birth=250   reqs=4      ┐
+#3  @ 449.9ms  streams_at_birth=250   reqs=28     │
+#4  @ 527.0ms  streams_at_birth=251   reqs=33     │
+#5  @ 550.4ms  streams_at_birth=251   reqs=55     ├ 机制①：撞 250 上限
+#6  @ 603.9ms  streams_at_birth=251   reqs=215    │
+#7  @ 673.4ms  streams_at_birth=249   reqs=188    │
+#8  @ 753.2ms  streams_at_birth=249   reqs=10     │
+#9  @ 763.3ms  streams_at_birth=247   reqs=6      ┘
+#10 @ 820.9ms  streams_at_birth=  1   reqs=563    ← 机制②：主连接刚死
 ```
 
-### 2.3 方案 A 为什么必然产生 2 条 TCP
+**机制① — `MaxConcurrentStreams` 溢出**。Go 文档（`StrictMaxConcurrentStreams`）：
 
-`http2.Transport` 的连接池是**每个 Transport 对象私有的**（`t.connPoolOrDef()` → 该对象自己的 `clientConnPool`）。
-两个不同的 `*http2.Transport` 对象之间**不共享任何 ClientConn**。
+> If false, **new TCP connections are created to the server as needed** to keep
+> each under the per-connection SETTINGS_MAX_CONCURRENT_STREAMS limit.
 
-所以：
+**机制② — 健康检查误杀后重建**。`PingTimeout = 1s`（Go 默认 15s）在高负载下
+误判连接失效。实测主连接 @813.6ms 死亡，#10 @816.4ms 接管后续 563 个请求。
 
-```
-2 个 http2.Transport 对象  →  对同一个 UDM:8000  →  2 条独立 TCP
-```
+> 机制②已由本次的 `PingTimeout` 1s → 3s **针对性缓解**（2.3 节）。
+> 机制①（撞 250 上限溢出）**未处理也不打算处理**——那是真实的并发压力信号。
 
-这是结构性的，不依赖任何 tuning 参数或 server 行为。
+### 1.3 对改造的影响
 
-### 2.4 "一次性开启"的语义澄清
+初版计划的价值主张是「1 条 → 2 条」。实测表明改造前就是「**浮动的 1~10 条**」，
+且**没有**可靠手段把它锁成固定值（Strict 的尝试见 2.1，失败）。
 
-Go 的 `http2.Transport` 是**懒建连**的：只有第一个请求到达时才拨号。
-所以严格意义上的"一次性同时开 2 条"需要区分两种理解：
+因此本次的对照设计改为：
 
-- **理解一（推荐，默认）**：2 条连接**槽位**在启动时就确定，各自在自己的首个请求到来时建立。
-  轮询从第 1 个请求就开始，因此前 2 个请求会分别触发 2 次拨号，之后稳定为 2 条长连接。
-  → **无需额外代码**，方案 A 天然满足。
+| 组 | 配置 | 连接数 | 关键指标 |
+|---|---|---|---|
+| 对照（`2fa0755`） | 默认 | 1 条起步，高负载溢出 | 主连接占 86~100% |
+| 实验（**本次**） | 2 个 transport 轮询 | 2 条起步，高负载溢出 | `conn_slot` 应接近 50:50 |
 
-- **理解二**：进程启动时立刻主动拨号 2 条，不等业务请求。
-  → 需要额外的预热（warm-up）逻辑，见 4.4 节「可选增强」。
-  实验场景下通常**不必要**，因为注册洪水的头两个请求瞬间就会把连接建起来。
-
-### 2.5 与现有日志的兼容性
-
-改造**不影响** `HTTP_log.txt` 的任何字段：
-
-- `req_time` / `resp_time`：仍在 `RoundTrip` 内的同一位置取（:116, :118）
-- `wrote_time` / `got_first_byte`：由 `httptrace` 回调产生（:104-113），
-  回调闭包捕获的是**本次调用的局部变量**，与走哪条连接无关
-- `sniffUEID` / `dstNFFromURL`：纯粹基于 `req`，与连接无关
-
-**唯一建议的新增**：给日志加一个 `conn_idx` 字段，用于事后验证轮询确实生效、
-以及分连接对比延迟。见 4.3 节。
-
-### 2.6 风险清单
-
-| 风险 | 评估 | 处理 |
-|---|---|---|
-| 对端 server 连接数上限 | h2c server（gin + h2c）默认不限制连接数，2 条无压力 | 无需处理 |
-| 打乱现有 latency 基线 | 会。这正是实验目的 | 基线组直接用**改造前的镜像**（或把 `connsPerPeer` 改回 1 重新构建），两者行为逐字一致 |
-| 响应乱序 / 错配 | **不存在**，见第 3 节 | — |
-| 连接不均衡 | 轮询是按**请求数**均衡，不是按**字节数**或**耗时**均衡。若某类请求特别慢，两条连接负载可能不均 | 可接受；`conn_idx` 日志可事后验证 |
-| `ReadIdleTimeout` 健康检查开销翻倍 | 每条连接各自 1s ping，N=2 时 ping 翻倍。开销可忽略 | 无需处理 |
+对照的重点**不是连接总数相等**，而是**负载分布**：改造前无论有几条连接，
+主连接始终扛 86~100%；改造后轮询强制按请求数均分。
 
 ---
 
-## 3. 问题 3：请求走连接 1，响应会不会从连接 2 回来？
+## 2. 需求
 
-### 3.1 结论：不会，有三重结构性保证
+| # | 要求 | 实现方式 |
+|---|---|---|
+| **R1** | 解除「只能 1 条连接」的限制，回到 `0848dba` 之前的状态 | **移除** `StrictMaxConcurrentStreams: true`；transport 字段与 `2fa0755` 一致，**唯一例外是 R5** |
+| **R2** | 强制每对 NF 开 **2** 条连接 | 2 个独立 `http2.Transport` 实例 |
+| **R3** | round-robin 分流 | 原子计数器 `next.Add(1) % 2` |
+| **R4** | 连接断了允许重建 | Go 默认行为，本就如此（第 6 节） |
+| **R5** | 减少健康检查误杀导致的连接重建 | `pingTimeoutPeriod` **1s → 3s**（见 2.3） |
 
-**绝对不会出现"req 发给连接 1，resp 从连接 2 回来"的情况。** 理由：
+### 2.1 为什么移除 `StrictMaxConcurrentStreams: true`（实测依据）
 
-**① HTTP/2 协议层**
-stream ID 的作用域是**单条连接内部**。连接 1 上的 stream 5 与连接 2 上的 stream 5
-是两个毫无关系的东西。server 只能在**收到请求的那条连接**上回复该 stream，
-协议本身没有"跨连接回复"的表达能力。
+初稿曾建议保留 Strict 以锁死连接数。**实测数据否定了这个建议。**
 
-**② Go transport 实现层**
-`http2.Transport.RoundTrip` 的实际流程是：
+`C6525100g_NFHTTPonly1conn_0806v1`（Strict=true 的那次实验）UDM→UDR 结果：
+
+| RQ | 800 | 1000 | 1200 | 1400 | 1600 | 1800 | 2000 |
+|---|---|---|---|---|---|---|---|
+| 连接数 | 2 | 4 | 2 | 3 | **7** | 4 | 3 |
+
+**Strict 并没有把连接数降到 1**，反而制造了大量短命连接。RQ1600 的连接生命周期：
 
 ```
-RoundTrip(req)
-  → 从连接池取得一个具体的 *ClientConn  cc
-  → cc.RoundTrip(req)
-      → cc.newStream()  在 cc 上分配 stream，登记进 cc.streams[id]
-      → 写 HEADERS/DATA 到 cc 的 socket
-      → 阻塞等待 cs.resc（这个 stream 私有的 channel）
-  ← cc 的读循环 readLoop 收到该 stream 的响应帧后，
-    查 cc.streams[id] 找到 cs，写入 cs.resc
+192.168.88.209:38012  born=+  0.0ms  died=+ 25.8ms  reqs=161
+192.168.88.209:38026  born=+ 24.5ms  died=+122.6ms  reqs=915
+192.168.88.209:38042  born=+120.1ms  died=+241.8ms  reqs=1001
+192.168.88.209:38046  born=+229.6ms  died=+546.3ms  reqs=2474
+192.168.88.209:38054  born=+549.7ms  died=+753.6ms  reqs=1554
+192.168.88.209:38068  born=+756.0ms  died=+758.0ms  reqs=2
+192.168.88.209:38084  born=+763.6ms  died=+765.4ms  reqs=1
 ```
 
-响应的投递路径是 `cc.readLoop → cc.streams[id] → cs.resc`，
-**全程被 `cc` 这一个连接对象闭包住**。连接 2 的 readLoop 根本访问不到连接 1 的 `streams` map。
+连接每 25~120ms 就被销毁重建一次，**几乎是纯粹的先死后生**（重叠仅 3 对）。
 
-**③ 本方案的隔离层**
-方案 A 里，第 i 个请求交给第 `i % 2` 个 `http2.Transport` 对象，
-该对象的 `RoundTrip` 是一个**同步阻塞调用**，返回值就是该次请求的响应。
-我们的 `loggingRoundTripper.RoundTrip` 里：
+**推测原因**：Strict 让超限请求阻塞在 `RoundTrip`，连接上没有新帧流动；
+`ReadIdleTimeout=1s` 触发 PING 健康检查，而对端在高负载下 1 秒内回不上，
+`PingTimeout=1s` 随即判定连接失效并销毁。**Strict 与激进的健康检查超时互相踩踏。**
+
+结论：Strict 不但没达到锁死连接的目的，还严重干扰日志分析。**本次移除。**
+
+### 2.2 移除 Strict 的代价：连接总数不再受控
+
+必须明说：去掉 Strict 后，两个 transport 各自仍可能在撞 250 时溢出建连，
+所以实际连接数是「**2 条起步，可能更多**」，不是严格的 2 条。
+
+这是**有意接受的取舍**：
+
+- 保留 Strict → 连接数名义受控，但实测反而churn 出更多短命连接，日志不可读
+- 移除 Strict → 连接数可能 >2，但每条连接生命周期长、日志干净可分析
+
+判读时用 `conn_slot`（本次新增）区分：**轮询是否均衡看 `conn_slot`，
+实际 socket 数看 `conn`**。两者分开记录正是为了应对这种情况。
+
+### 2.3 `PingTimeout` 1s → 3s（本次新增）
+
+**改动**：`NFs/<nf>/internal/accesslog/httptransport.go`
 
 ```go
-base := pick()               // 选定一个 transport
-resp, err := base.RoundTrip(req)   // 同步，resp 必然来自 base
+readIdleTimeoutPeriod = 1 * time.Second   // 不变
+pingTimeoutPeriod     = 3 * time.Second   // 原 1s
+timeoutPeriod         = 10 * time.Second  // 不变
 ```
 
-`resp` 由被选中的那个 transport 直接返回。**不存在任何跨实例的路由或汇聚**。
+**机制**：连接上 `ReadIdleTimeout`（1s）内没有任何帧到达 → transport 主动发 PING
+→ `PingTimeout` 内收不到 PONG → **判定连接失效并销毁**。
 
-### 3.2 一个需要留意的边界情况（不是错配，但值得知道）
+**为什么 1s 太短**：这个检查区分不了「对端死了」和「对端很忙」。高负载下 UDR
+的 event loop 被塞满，1 秒内回不上一个 PING 是**正常现象**，不是故障。结果是
+健康的连接被反复误杀：
 
-`http2.Transport` 在**连接层错误**（如 `GOAWAY`、连接被对端关掉）时，
-会对**幂等请求**自动重试 —— 重试可能落到该 transport **新建的另一条连接**上。
+- `C6525100g_HTTPconnum_0806`：主连接 @813.6ms 被杀，@816.4ms 新连接接管
+  （6.3 节原本把这段当作「重建无缝」的正面佐证，**实际它是误杀的证据**）
+- `C6525100g_NFHTTPonly1conn_0806v1`：Strict 让请求阻塞在 `RoundTrip`，
+  连接上更没有帧流动，误杀被进一步放大 → 每 25~120ms 重建一次（2.1 节）
 
-这仍然不是"响应跨连接错配"：重试是一次全新的请求-响应对，请求和响应依然在同一条新连接上配对。
+**为什么改 3s 而不是 15s**：
 
-但它对日志有一个已知影响，**现有代码已经处理了**：
+| 值 | 影响 |
+|---|---|
+| 1s（原） | 忙 = 死，误杀频繁，`conn` 生命周期被切碎，per-connection 指标不可读 |
+| **3s（本次）** | 留出足够余量吸收负载抖动，仍远低于 Go 默认，真死也能及时发现 |
+| 15s（Go 默认） | 误杀基本消除，但真正的连接故障要 15s 才被发现，实验中途出问题难以察觉 |
 
-```go
-// httptransport.go:104-109
-WroteRequest: func(httptrace.WroteRequestInfo) {
-    if wroteTime.IsZero() {      // ← 只保留第一次写出的时间
-        wroteTime = time.Now()
-    }
-},
-```
+**这是本次相对 `2fa0755` 的唯一行为差异**，必须在对比时明说。第 6.4 节
+原本写「若后续发现误杀频繁干扰实验，可放宽到 15s，**本次不改**」——
+现在改了，理由是误杀已经被实测确认（而非「若发现」），且它直接污染
+本次要测的 per-slot 连接寿命。取 3s 而非 15s 是为了把行为改动压到最小。
 
-注释 :100-102 明确说明了这一点。改造后若加 `conn_idx`，
-需注意重试场景下记录的是**最初选中**的那个 transport 索引（见 4.3 的说明）。
+> **对实验解读的影响**：对照组（`0848dba` / `2fa0755`）跑的是 1s。
+> 若要严格归因「双连接」的效果，理想做法是**对照组也用 3s 重跑一次**；
+> 否则两组之间存在「连接数」和「ping 超时」两个变量。
+> 若时间不允许，至少在结论中注明这一点——见第 8 节验证清单。
 
----
-
-## 4. 修改计划
-
-### 4.0 改动范围总览
+### 3.1 改动范围
 
 | 项 | 内容 |
 |---|---|
-| **需要改的文件** | `NFs/<nf>/internal/accesslog/httptransport.go`，共 **7 个 NF**：`amf` `ausf` `udm` `udr` `pcf` `nrf` `nssf` |
-| **可选改的文件** | `NFs/<nf>/internal/accesslog/accesslog.go`（加 `conn_idx` 字段），同样 7 份 |
-| **不需要改** | ✅ 任何 consumer/service 代码（`SetHTTPClient(accesslog.Client())` 调用点全部保持原样）<br>✅ openapi 外部模块（**无需 fork、无需 replace**）<br>✅ 任何 `config/*.yaml`<br>✅ 任何现有分析脚本（字段只增不改） |
+| **已改文件** | 7 个 NF × 2 个文件 = **14 个** |
+| | `NFs/<nf>/internal/accesslog/httptransport.go`（连接策略 + `PingTimeout` 3s） |
+| | `NFs/<nf>/internal/accesslog/accesslog.go`（`conn_slot` 日志字段） |
+| **NF 列表** | `amf` `ausf` `udm` `udr` `pcf` `nrf` `nssf` |
+| **未改动** | ✅ consumer/service 代码 ✅ openapi 外部模块 ✅ `config/*.yaml` |
 
-> **重要前提（已验证）**：7 个 NF 的 `accesslog/httptransport.go` 内容**完全一致**，
-> 只有 `accesslog.go:32` 的 `const srcNF` 不同。
-> 因此可以在 `amf` 上改好后，把 `httptransport.go` 原样复制到其余 6 个 NF（该文件不含 NF 名）。
-> **不要**连 `accesslog.go` 一起复制，会覆盖 `srcNF`。
+### 3.2 `httptransport.go`
 
-> **`smf` 说明**：`grep -rl "accesslog.Client()" NFs/smf` 结果为 0，
-> SMF 没有接入 accesslog 客户端，因此本次不涉及。若后续要覆盖 SMF，需先给它接入 accesslog。
-
----
-
-### 4.1 Step 1：改造 `loggingRoundTripper`（核心，唯一必须的改动）
-
-文件：`NFs/amf/internal/accesslog/httptransport.go`
-
-#### 1a. 新增连接数常量（在 :26-30 的 const 块附近）
+**a. 新增常量**
 
 ```go
-// connsPerPeer is how many independent HTTP/2 connections this NF keeps to each
-// peer NF. Each connection is backed by its own http2.Transport instance, and
-// http2.Transport connection pools are per-instance, so connsPerPeer instances
-// yield that many separate TCP connections to the same host:port. Requests are
-// spread across them round-robin.
-//
-// This is a compile-time constant on purpose: the deployment always wants two
-// connections. Setting it back to 1 reproduces the previous single-connection
-// behaviour byte-for-byte, which is the only other value worth building.
 const connsPerPeer = 2
 ```
 
-> 不需要新增 `"os"` / `"strconv"` import —— 常量写死，无需读环境变量。
-
-#### 1b. 把 `loggingRoundTripper` 的两个字段从单实例改为定长数组（:36-39）
+**b. struct 改为定长数组 + 原子游标**
 
 ```go
-// 改造前
 type loggingRoundTripper struct {
-    tls   http.RoundTripper
-    clear http.RoundTripper
-}
-
-// 改造后
-type loggingRoundTripper struct {
-    // One slot per connection to each peer. Each element is a SEPARATE
-    // http2.Transport instance with its own connection pool — that is what makes
-    // them distinct TCP connections instead of one shared one.
-    tls   [connsPerPeer]http.RoundTripper // h2-over-TLS transports (https)
-    clear [connsPerPeer]http.RoundTripper // h2c transports (http)
-    next  atomic.Uint64                   // round-robin cursor, shared by both schemes
+	tls   [connsPerPeer]http.RoundTripper // h2 over TLS  (https)
+	clear [connsPerPeer]http.RoundTripper // h2c cleartext (http)
+	next  atomic.Uint64                   // round-robin cursor
 }
 ```
 
-> 用定长数组而非 slice：`connsPerPeer` 是编译期常量，数组能省掉构造函数里的 `make`，
-> 长度也不可能在运行时被改错。
-> `atomic.Uint64` 需要 import `"sync/atomic"`。
-> 用 `atomic` 而非 mutex：这是每请求都要走的热路径，
-> `Add` 是单条 LOCK XADD 指令，比抢锁便宜得多，且与 `accesslog.go` 里
-> `dropped atomic.Uint64` 的既有风格一致。
+**c. 构造函数改为循环**，每轮建立**独立**的 `http2.Transport`。
+字段**集合**与 `2fa0755`（Strict 引入前）一致——只有
+`AllowHTTP` / `DialTLSContext` / `ReadIdleTimeout` / `PingTimeout`，
+**不设** `StrictMaxConcurrentStreams`；
+其中 `PingTimeout` 的**取值**由 1s 改为 3s（2.3 节）。
+连接池是每实例私有的，所以 2 个实例 = 2 条 TCP。
 
-#### 1c. 改造构造函数（:41-58）
-
-把现在**一次性构造一组 transport**（tls + clear 各一个）的写法，
-改为 **循环构造 `connsPerPeer` 组**。
-每次循环内 `&http2.Transport{...}` 的字段配置**逐字保持不变**
-（`TLSClientConfig` / `AllowHTTP` / `DialTLSContext` / `ReadIdleTimeout` / `PingTimeout`），
-这样把 `connsPerPeer` 改回 1 时与改造前完全等价。
+**d. `RoundTrip` 选路**
 
 ```go
-func newLoggingRoundTripper() *loggingRoundTripper {
-    l := &loggingRoundTripper{}
-    for i := 0; i < connsPerPeer; i++ {
-        // Each iteration builds a SEPARATE http2.Transport. Separate instances
-        // mean separate connection pools, which is what produces connsPerPeer
-        // distinct TCP connections to the same peer. Field values are identical
-        // to the pre-change single-transport config, so setting connsPerPeer
-        // back to 1 is behaviourally identical to the old code.
-        l.tls[i] = &http2.Transport{
-            TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // matches openapi default
-            ReadIdleTimeout: readIdleTimeoutPeriod,
-            PingTimeout:     pingTimeoutPeriod,
-        }
-        l.clear[i] = &http2.Transport{
-            AllowHTTP: true,
-            DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-                d := &net.Dialer{}
-                return d.DialContext(ctx, network, addr)
-            },
-            ReadIdleTimeout: readIdleTimeoutPeriod,
-            PingTimeout:     pingTimeoutPeriod,
-        }
-    }
-    return l
-}
-```
-
-> ⚠️ **Go 版本注意**：`NFs/*/go.mod` 声明 `go 1.25.5`，循环变量按 Go 1.22+ 语义
-> 每轮迭代独立，闭包捕获 `i` 无经典陷阱。且此处 `DialTLSContext` 闭包本身
-> 并未捕获 `i`，无论如何都是安全的。
-
-#### 1d. 改造 `RoundTrip` 的选路逻辑（:60-64）
-
-```go
-// 改造前
-base := l.clear
+pool := &l.clear                 // 取地址：数组是值类型，直接赋值会整份拷贝
 if req.URL != nil && req.URL.Scheme == "https" {
-    base = l.tls
+	pool = &l.tls
 }
-
-// 改造后
-pool := &l.clear
-if req.URL != nil && req.URL.Scheme == "https" {
-    pool = &l.tls
-}
-// Round-robin across the connsPerPeer transports. The cursor is shared between
-// the tls and clear pools; since this deployment is http-only (every
-// config/*.yaml sets scheme: http) only the clear pool is ever indexed in
-// practice, so sharing the cursor costs nothing and keeps the hot path to a
-// single atomic op.
-idx := int((l.next.Add(1) - 1) % connsPerPeer)
-base := pool[idx]
+connSlot := int((l.next.Add(1) - 1) % connsPerPeer)
+base := pool[connSlot]
 ```
 
-> ⚠️ **必须取地址 `&l.clear`,不能写 `pool := l.clear`**。
-> 数组在 Go 里是值类型,直接赋值会**整个复制一份**;虽然复制的是接口指针、
-> 功能上仍能工作,但每个请求都白白拷贝一次数组。用 `*[connsPerPeer]http.RoundTripper`
-> 指针可以避免,且索引语法 `pool[idx]` 不变（Go 会自动解引用）。
-> 若嫌指针别扭,也可以把字段改回 slice —— slice 赋值本来就是引用语义。
+> `Add` 返回自增**后**的值，减 1 使首个请求落在 slot 0，日志索引 0-based。
 
-> `Add(1) - 1` 而不是 `Add(1)`：让第一个请求拿到 idx=0，
-> 使 `connsPerPeer=1` 时的行为、以及日志里的索引都从 0 开始，更直观。
+**e. import** 新增 `sync/atomic`。
 
-> `% connsPerPeer` 直接用常量取模：编译器能把 `% 2` 优化成位运算，
-> 比 `% uint64(len(pool))` 更省。
+### 3.3 `accesslog.go`
 
-`RoundTrip` 剩余部分（`dstNFFromURL`、`sniffUEID`、`httptrace` 回调、
-`reqTime`/`respTime` 取值、`LogHTTP` 调用）**完全不动**。
+新增 `appendKVInt` helper，`LogHTTP` 签名加 `connSlot int` 参数，
+JSON 行在 `conn` 之后插入 `"conn_slot":N`（无引号整数）。
+预分配 `288 → 304`。
+
+### 3.4 建连时机：懒建连
+
+Go 的 `http2.Transport` 懒建连。两个 slot 各自在**首个请求到达时**拨号。
+轮询从第 1 个请求就开始，因此头两个请求会分别触发两次拨号，之后稳定为 2 条。
+
+**不做启动预热**：注册洪水的头几个请求毫秒内就把连接建满；
+预热需要一个无副作用的 SBI 端点，各 NF 不统一，成本高于收益。
+若要排除冷启动影响，丢弃实验前几十毫秒的数据即可。
 
 ---
 
-### 4.2 Step 2：同步到其余 6 个 NF
+## 4. 请求/响应配对保证（问题 3）
 
-```bash
-cd /path/to/Free5gc-TYcustom
-for nf in ausf udm udr pcf nrf nssf; do
-  cp NFs/amf/internal/accesslog/httptransport.go \
-     NFs/$nf/internal/accesslog/httptransport.go
-done
-```
+**绝对不会出现「req 走连接 1、resp 从连接 2 回来」。** 三重保证：
 
-改完后逐个验证编译：
+**① 协议层**：HTTP/2 的 stream ID 作用域是单条连接内部。连接 1 的 stream 5
+与连接 2 的 stream 5 毫无关系，server 只能在**收到请求的那条连接**上回复。
 
-```bash
-for nf in amf ausf udm udr pcf nrf nssf; do
-  (cd NFs/$nf && go build ./... ) || echo "BUILD FAIL: $nf"
-done
-```
+**② Go 实现层**：响应投递路径是 `cc.readLoop → cc.streams[id] → cs.resc`，
+全程被 `cc`（单个连接对象）闭包住。连接 2 的读循环访问不到连接 1 的 `streams` map。
 
-> 复制前建议先 `git diff --stat` 确认 7 份 `httptransport.go` 在改动前确实一致：
-> ```bash
-> for nf in ausf udm udr pcf nrf nssf; do
->   diff -q NFs/amf/internal/accesslog/httptransport.go \
->           NFs/$nf/internal/accesslog/httptransport.go
-> done
-> ```
-> （本计划撰写时已核对为一致；若你在此之前动过某个 NF，请重新确认。）
+**③ 本实现**：`base.RoundTrip(req)` 是同步调用，`resp` 由被选中的 transport
+直接返回，不存在跨实例的路由或汇聚。
+
+> **边界情况**（不是错配）：连接层错误时 h2 会对幂等请求自动重试，
+> 可能落到新连接上。那是一次全新的请求-响应对，仍在同一条新连接内配对。
+> 现有代码用 `if wroteTime.IsZero()` 保留首次写出时间来处理这种情况。
 
 ---
 
-### 4.3 Step 3（推荐但可选）：给 HTTP_log 加 `conn_idx`
+## 5. 如何从日志验证 round-robin 效果（问题 4）
 
-没有这个字段，你无法从日志验证轮询是否真的生效、也无法分连接对比延迟。
+日志现在有**三个**相关字段：
 
-**改 `accesslog.go` 的 `LogHTTP`**（7 份，`amf` 版在 :318-333）：
-新增一个 `connIdx int` 参数，并在 `resp_time` 之后、`latency_us` 之前插入：
-
-```go
-b = appendKVInt(b, "conn_idx", connIdx, false)
-```
-
-需要新增一个整数版的 helper（放在 `appendKV` 附近）：
-
-```go
-// appendKVInt appends an integer-valued JSON field. Unlike appendKV the value is
-// emitted unquoted so downstream analysis can read it as a number directly.
-func appendKVInt(b []byte, key string, val int, first bool) []byte {
-    if !first {
-        b = append(b, ',')
-    }
-    b = appendJSONString(b, key)
-    b = append(b, ':')
-    return strconv.AppendInt(b, int64(val), 10)
-}
-```
-
-（`strconv` 在 `accesslog.go:24` 已经 import，无需新增。）
-
-**改 `httptransport.go` 的调用点**（:121）：
-
-```go
-LogHTTP(dst, method, uri, ueID, idx, reqTime, wroteTime, gotFirstByte, respTime)
-```
-
-> **语义说明（务必写进注释）**：`conn_idx` 记录的是本次 `RoundTrip` **最初选中**的
-> transport 索引。若该 transport 内部因连接层错误重试并新建了连接，
-> 索引不变 —— 因为重试仍发生在**同一个 transport 实例**内，
-> 只是换了它自己池子里的一条新 TCP。所以 `conn_idx` 准确表达的是
-> **"走的是哪一路 transport"**，而不是"第几条 TCP 套接字"。
-> 在稳态实验中这两者一一对应。
-
-> **`LogHTTPInbound` 不加此字段**：server 端无法得知对端用了哪条连接
-> （现有代码里 `src` 已经因同样的原因记为 `"NaN"`，见 :350-352）。
-> 保持 inbound 记录不变，分析脚本按 `conn_idx` 字段是否存在即可区分两种视角。
-
----
-
-### 4.4 Step 4（可选增强）：启动时预热连接
-
-若你要的是 2.3 节的**理解二**（进程启动即刻建满 2 条），加一个预热函数：
-
-```go
-// WarmUp eagerly establishes all connsPerPeer connections to peerBaseURL so the
-// first real SBI request never pays a dial. Safe to call multiple times and safe
-// to ignore errors: a failed warm-up just means the connection is dialled lazily
-// later, exactly as it would be without this call.
-func WarmUp(peerBaseURL string) { /* 对每个 transport 各发一次轻量请求 */ }
-```
-
-**但本计划建议先不做**，理由：
-
-- 注册洪水的头几个请求会在毫秒内把连接全部建起来，稳态实验不受影响
-- 预热需要一个"无副作用的 SBI 端点"，各 NF 不统一，实现成本与出错面都不小
-- 如果只是想避开冷启动，更简单的做法是**丢弃实验前几秒的数据**
-
----
-
-### 4.5 Step 5：验证
-
-#### 5a. 连接数验证（最直接）
-
-在 NF pod 内（或宿主机 `nsenter` 进 netns）：
-
-```bash
-# 改造前：每个对端 NF 应只有 1 行
-# 改造后（connsPerPeer=2）：每个对端 NF 应有 2 行
-ss -tnp | grep ESTAB | grep <peer-ip>:8000
-```
-
-也可从对端 server 侧看，结论应一致。
-
-> 注意 NF 之间是**双向**的（例如 AMF→UDM 和 UDM→AMF 的回调）。
-> 数连接时要按"谁主动拨号"区分，用本地端口是否为临时端口来判断。
-
-#### 5b. 轮询生效验证（需 Step 3 的 `conn_idx`）
-
-```bash
-# 两个索引的计数应该接近 1:1
-grep '"src":"AMF"' /tmp/HTTP_log.txt | grep -o '"conn_idx":[0-9]*' | sort | uniq -c
-```
-
-#### 5c. 对照实验设计
-
-`connsPerPeer` 是编译期常量，所以对照组靠**镜像**区分，不靠运行时配置：
-
-| 组 | 镜像 | 说明 |
-|---|---|---|
-| 基线 | 改造前的镜像（现有的） | 直接复用现有历史数据，无需重跑 |
-| 实验 | `connsPerPeer = 2` 构建的新镜像 | 目标配置 |
-
-> 若之后想看收益是否随连接数继续增长，把常量改成 4 / 8 各构建一个镜像即可；
-> 但按你的要求，当前只做 2。
-
-#### 5d. 关键观测指标
-
-对照 `HTTP_WROTE_TIME_PLAN_0804.md` 定义的分段：
-
-| 指标 | 期望变化（若"单连接写锁串行"确为瓶颈） |
+| 字段 | 含义 |
 |---|---|
-| `wrote_time - req_time`（发送端抢写锁） | **应显著下降**（写锁竞争者减半） |
-| `got_first_byte - server.resp_time`（含服务端抢写锁） | **应下降**（服务端 serverConn 写锁同样减半） |
-| `server.req_time - wrote_time` | 变化不大（内核+对端调度，与连接数关系弱） |
-| `resp_time - got_first_byte`（客户端 goroutine 调度） | 变化不大（是 Go 调度器问题，非连接问题） |
+| `conn_slot` | **本次新增**。请求被分配到哪个轮询槽（0 或 1） |
+| `conn` | 该槽当时持有的实际 socket（`localIP:localPort`） |
+| `conn_reused` | 是复用还是新建 |
 
-> 如果 `wrote_time - req_time` **没有**明显下降，
-> 说明瓶颈不在 clientConn 写锁，而在别处（如接收端 goroutine 调度或 CPU），
-> 这本身也是一个有价值的负面结论。
+### 5.1 验证轮询是否均衡
+
+```bash
+grep '"src":"UDM"' HTTP_log.txt | grep '"dst":"UDR"' \
+  | grep -o '"conn_slot":[0-9]*' | sort | uniq -c
+```
+
+**期望：两个槽计数接近 1:1**（轮询按请求数强制均分，误差 ≤1）。
+
+对比改造前实测的 86.4% : 13.6%，这是最直接的效果证据。
+
+### 5.2 验证确实开了 2 条连接
+
+```bash
+grep '"dst":"UDR"' HTTP_log.txt | grep -o '"conn":"[^"]*"' | sort -u | wc -l
+```
+
+**期望：2**（若某槽的连接中途死亡重建，会 > 2，属正常，见第 6 节）。
+
+### 5.3 验证槽与连接的对应关系
+
+```bash
+grep '"dst":"UDR"' HTTP_log.txt \
+  | grep -o '"conn":"[^"]*","conn_slot":[0-9]*' | sort | uniq -c
+```
+
+**期望：每个 slot 对应一个 conn**。若某 slot 对应多个 conn，
+说明该槽的连接被重建过——这正是 `conn_slot` 与 `conn` 分开记录的价值：
+**`conn_slot` 反映轮询是否均衡，`conn` 反映实际 socket 生命周期。**
+
+### 5.4 验证负载是否真的并行
+
+仅看请求数均衡还不够——改造前 RQ1000 曾出现「两条连接总数接近但实际是时间上接力」
+的假象。用并发 stream 的时间序列确认两个槽**同时**在工作：
+
+`cloudlab/Ty_log/Free5gc/C6525100g_HTTPconnum_0806/analyze_http_conns.py`
+的第 6 张图（按时间分箱的占比堆叠图）可直接看出是并行还是接力。
 
 ---
 
-## 5. 附录：改动前后连接拓扑对比
+## 6. 连接断开会自动重建吗（问题 5）
 
-注意左边始终是**一个** AMF 进程，右边始终是**一个** UDM pod。
+**会。** 分两个层面：
+
+### 6.1 重建是 Go 的默认行为
+
+`http2.Transport` 在连接失效（GOAWAY、读写错误、PING 超时）后，
+下一个请求会自动拨号补上。这是默认行为，**本改造没有做任何抑制**
+（`StrictMaxConcurrentStreams` 已按 2.1 移除）。
+
+已查证 `http2.Transport` 的连接池相关字段只有
+`ConnPool` / `StrictMaxConcurrentStreams` / `IdleConnTimeout` 三个，
+**没有** `MaxConnsPerHost`（那是 `net/http.Transport` 的字段），
+所以也没有任何设置会阻止重建。
+
+### 6.2 每个槽独立重建
+
+两个 slot 是独立的 `http2.Transport`，**各自维护自己的连接池**。
+slot 0 的连接死亡不影响 slot 1，slot 0 会自己拨号补上，
+轮询逻辑完全不受影响（它只按索引取 transport，不关心底层 socket 状态）。
+
+### 6.3 实测佐证
+
+改造前 RQ1500 的数据显示重建确实会自动发生且无缝：
 
 ```
-【改造前】connsPerPeer=1
-1 个 AMF 进程 ══════════════════> 1 个 UDM pod   1 条 TCP，全部 UE 的 stream 挤在上面
-     (clear: 1 个 http2.Transport)                clientConn 写锁 = 全局串行点
-
-【改造后】connsPerPeer=2
-1 个 AMF 进程 ══════════════════> 1 个 UDM pod   transport[0] 的 1 条 TCP
-              ══════════════════>  (同一个)       transport[1] 的 1 条 TCP
-     (clear: 2 个独立 http2.Transport)            写锁竞争者各减半，两条连接完全独立
-                                                  req/resp 在各自连接内严格配对
+主连接最后一个响应 @813.6ms
+后继连接首个请求   @816.4ms   ← 间隔 2.8ms，之后 563 个请求全部由它承担
 ```
+
+> 注意：这段数据有**两层**含义。它证明了「重建是自动且无缝的」（本节主题），
+> 但那次断开本身是 `PingTimeout=1s` 的**误杀**，并非真实故障——
+> 这正是 2.3 节把 `PingTimeout` 提到 3s 的直接依据。
+
+### 6.4 因此连接总数仍可能 > 2
+
+即使 `PingTimeout` 提到 3s，连接总数**依然不是**严格的 2 条，原因有三：
+
+1. **溢出建连**：移除 Strict 后，任一 transport 的 in-flight stream 撞到对端
+   250 上限时会自行再拨号（2.2 节）。实测单 transport 峰值达 371 streams，
+   所以这条路径在高 RQ 下**必然**触发。
+2. **健康检查重建**：3s 只是把误杀**变少**，没有消除。极端拥塞下仍可能发生。
+3. **冷启动**：懒建连，头两个请求之前连接数是 0 → 1 → 2（3.4 节）。
+
+因此准确表述是：**轮询槽恒为 2 个，实际 socket 数是「2 条起步、浮动 ≥2」**。
+
+判读时用 5.3 区分：**同一 slot 出现多个 conn = 该槽重建过**，属正常。
+**轮询是否均衡看 `conn_slot`，实际 socket 数看 `conn`**——两者分开记录
+正是为了应对这种情况。
 
 ---
 
-## 6. 检查清单
+## 7. 风险
 
-- [ ] 确认 7 份 `httptransport.go` 改动前内容一致（`diff -q`）
-- [ ] `amf` 版改造：`const connsPerPeer = 2`、struct 字段改数组、构造函数改循环、`RoundTrip` 选路加轮询
-- [ ] 补 import：`sync/atomic`（**不需要** `os` / `strconv`，因为不读环境变量）
-- [ ] 确认 `RoundTrip` 里用的是 `&l.clear` / `&l.tls`（取地址，避免每请求拷贝数组）
-- [ ] 复制到 `ausf` `udm` `udr` `pcf` `nrf` `nssf`（**不要**动 `accesslog.go` 的 `srcNF`）
-- [ ] （可选）`accesslog.go` 加 `appendKVInt` + `LogHTTP` 的 `conn_idx` 参数（7 份）
-- [ ] 7 个 NF 逐个 `go build ./...` 通过
+| 风险 | 评估 | 处理 |
+|---|---|---|
+| 延迟未改善 | 有可能。若瓶颈不在连接层（而在 Go 调度、CPU、对端处理），2 条连接无收益 | 这本身是有价值的负面结论 |
+| 连接数 > 2 | **预期会发生**。移除 Strict 后仍有溢出建连 + 健康检查重建 | 用 5.3 区分；轮询均衡看 `conn_slot` 而非 `conn` |
+| 两槽的连接寿命不同 | 某槽连接死亡重建时，该槽短暂无连接 | 轮询仍按索引分派，Go 会自动补建，不影响正确性 |
+| 两槽负载不均 | 轮询按**请求数**均衡，非按**耗时**。慢请求集中在一槽时仍可能不均 | 用 5.1 + 5.4 观察 |
+| 漏改某 NF | 改了 `LogHTTP` 签名，漏改会**编译报错** | 编译器兜底 |
+| `srcNF` 被 sed 写坏 | **不报编译错**，是真实风险 | 已验证 7 个全对 |
+| **`PingTimeout` 引入第二个变量** | 对照组跑 1s、实验组跑 3s，连接数与 ping 超时同时变了 | 理想做法：对照组用 3s 重跑。否则结论中必须注明（2.3 节末） |
+| **3s 掩盖真实故障** | 真连接故障的发现从 1s 延后到 3s | 仍远快于 Go 默认 15s；实验时长为分钟级，影响可忽略 |
+
+---
+
+## 8. 验证清单
+
+- [x] 7 份 `httptransport.go` 改动后仍完全一致（`diff -q`）
+- [x] 每个 NF：`connsPerPeer=2`、轮询、`connSlot` 传参
+- [x] 每个 NF：`StrictMaxConcurrentStreams` **计数为 0**（已移除）
+- [x] 每个 NF：`pingTimeoutPeriod = 3 * time.Second`（7/7 已确认）
+- [x] 每个 NF：`appendKVInt`、`LogHTTP` 新签名
+- [x] 7 个 `srcNF` 正确（AMF/AUSF/UDM/UDR/PCF/NRF/NSSF）
+- [x] AMF 的 `LogWorker`/`SBIView` 未被覆盖，且未泄漏到其余 6 个
+- [ ] **7 个 NF `go build ./...` 通过**（本机无 Go 工具链，需在 node-0 执行）
 - [ ] 重建镜像并部署
-- [ ] `ss -tnp` 验证每个 NF-pair 连接数 = 2
-- [ ] `conn_idx` 分布验证轮询均衡（两个索引应接近 1:1）
-- [ ] 与改造前的历史数据对比 4.5d 的四个指标
+- [ ] 跑 RQ1000 / 1500 / 2000
+- [ ] 5.1：`conn_slot` 分布接近 1:1
+- [ ] 5.2：`conn` 去重计数 = 2（或 >2 但可由 5.3 解释为重建）
+- [ ] 5.3：每个 slot 对应的 conn 数量合理
+- [ ] 5.4：确认两槽**并行**工作而非时间接力
+- [ ] **连接重建次数显著下降**（3s 生效的直接证据）：
+      同一 slot 对应的 `conn` 去重数应明显少于 1s 那几次实验
+- [ ] **各 NF `dropped` 计数为 0**——否则 `conn_slot` 分布统计本身有采样偏差
+      （每行新增 ~15 字节，高 RQ 下写盘压力上升）
+- [ ] 与对照组（`0848dba`）对比 t2→t4 延迟，并在结论中注明
+      对照组是 **1 条连接 + ping 1s**、实验组是 **2 槽 + ping 3s**（两个变量）
+
+---
+
+## 9. 不在覆盖范围内的 HTTP 路径
+
+以下路径不走 `accesslog.Client()`，因此**既不受本改造影响，也不记日志**：
+
+- `NFs/pcf/internal/sbi/consumer/bsf_service.go:30` — 裸 `&http.Client{}`（PCF→BSF）
+- `NFs/smf/internal/sbi/consumer/bsf_service.go:28` — 裸 `&http.Client{}`（SMF→BSF）
+- `NFs/nef/internal/sbi/consumer/*.go` — `http.DefaultClient`（4 处）
+- SMF 出向：SMF 无 `internal/accesslog/` 目录，未接入
+
+用户关注的 **AMF / AUSF / UDM / UDR / PCF** 之间的链路**全部覆盖**。
+（AMF→SMF 方向走 accesslog，会被改造；SMF 出向不会。）
