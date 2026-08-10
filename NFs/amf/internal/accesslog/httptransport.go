@@ -48,13 +48,13 @@ const (
 )
 
 // connsPerPeer is how many HTTP/2 connections this NF opens to each peer NF up
-// front, and how many round-robin slots requests are dealt across. It is 8.
+// front, and how many round-robin slots requests are dealt across. It is 16.
 //
 // Each slot is a separate http2.Transport with its own private pool, so N slots
 // mean N connections held from the start, with requests handed to them one after
 // another in turn. The slots are per PROCESS, not per peer: these same N
 // transports serve every peer this NF talks to, and each one keeps its own pool
-// keyed by address. A NF with 6 peers therefore holds 8*6 = 48 connections.
+// keyed by address. A NF with 4 peers therefore holds 16*4 = 64 connections.
 //
 // The history matters for reading this number. It was 2 for the original
 // round-robin experiment (HTTP_MULTI_CONN_ROUNDROBIN_PLAN_0806.md), then went
@@ -65,23 +65,30 @@ const (
 // 1.0 requests per socket, 84 requests over UDM->UDR opening 84 connections.
 // With the server-side IdleTimeout now at 500ms, connections survive the gaps
 // between requests, so N slots finally mean N concurrent long-lived sockets.
-// 4 (HTTP_4CONN_ROUNDROBIN_PLAN_0807.md) was the first value measured against
-// that fixed baseline of 1; 8 is this step (HTTP_8CONN_PLAN_0809.md).
+// From that fixed baseline of 1 the measured series is 4
+// (HTTP_4CONN_ROUNDROBIN_PLAN_0807.md), 8 (HTTP_8CONN_PLAN_0809.md), and 16
+// here (HTTP_16CONN_PLAN_0809v1.md).
 //
-// The 4-slot run it doubles held exactly 4 sockets per pair at every rate from
-// RQ800 to RQ2500, with 4 dials and no redials for the whole window, so the
-// slots behaved as designed and the split was even to within 5%. Going to 8
-// halves the per-slot sample: the thinnest pair measured, AMF->PCF at 1000
-// requests, drops from ~250 to ~125 per slot. That is still enough to read a
-// distribution, but it is the pair to watch, and a materially lower request
-// rate or UE count would make the 8-slot split too sparse to interpret.
+// The returns are diminishing and that is the point of measuring 16. On median
+// end-to-end registration at RQ2500/UE1000, 1->4 saved 126ms and 4->8 saved a
+// further 41ms; each doubling has bought less than the one before it, so 16 is
+// the step that shows whether the curve has flattened or still has slope.
 //
-// Growth beyond these 8 is still permitted and expected:
-// StrictMaxConcurrentStreams is deliberately left unset (see below), so when a
-// slot's in-flight streams reach the peer's 250-stream limit the transport dials
-// an additional connection by itself. 8 is a floor, not a cap -- which is why
-// conn_slot rather than conn is the field that shows whether the split is even.
-const connsPerPeer = 8
+// 16 also halves the per-slot sample again. The thinnest pairs measured,
+// AMF->PCF and PCF->UDR at 1000 requests, fall to ~62 per slot. That is still
+// enough to see whether the round-robin split is even, but too thin to read a
+// per-slot P95/P99 from: tail statistics should come from AMF->UDM (~375) and
+// UDM->UDR (~562) instead. A materially lower request rate or UE count would
+// make even the split unreadable at 16 slots.
+//
+// Growth beyond these 16 is still permitted: StrictMaxConcurrentStreams is
+// deliberately left unset (see below), so when a slot's in-flight streams reach
+// the peer's 250-stream limit the transport dials an additional connection by
+// itself. In practice that has never triggered -- every run from 4 to 8 held
+// exactly connsPerPeer sockets per pair with zero redials -- so 16 is expected
+// to be the actual count, not merely a floor. conn_slot rather than conn is
+// still the field that shows whether the split is even.
+const connsPerPeer = 16
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
