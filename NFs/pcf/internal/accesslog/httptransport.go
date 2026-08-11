@@ -48,13 +48,13 @@ const (
 )
 
 // connsPerPeer is how many HTTP/2 connections this NF opens to each peer NF up
-// front, and how many round-robin slots requests are dealt across. It is 16.
+// front, and how many round-robin slots requests are dealt across. It is 2.
 //
 // Each slot is a separate http2.Transport with its own private pool, so N slots
 // mean N connections held from the start, with requests handed to them one after
 // another in turn. The slots are per PROCESS, not per peer: these same N
 // transports serve every peer this NF talks to, and each one keeps its own pool
-// keyed by address. A NF with 4 peers therefore holds 16*4 = 64 connections.
+// keyed by address. A NF with 4 peers therefore holds 2*4 = 8 connections.
 //
 // The history matters for reading this number. It was 2 for the original
 // round-robin experiment (HTTP_MULTI_CONN_ROUNDROBIN_PLAN_0806.md), then went
@@ -65,30 +65,32 @@ const (
 // 1.0 requests per socket, 84 requests over UDM->UDR opening 84 connections.
 // With the server-side IdleTimeout now at 500ms, connections survive the gaps
 // between requests, so N slots finally mean N concurrent long-lived sockets.
-// From that fixed baseline of 1 the measured series is 4
+// From that fixed baseline of 1 the measured series ran 4
 // (HTTP_4CONN_ROUNDROBIN_PLAN_0807.md), 8 (HTTP_8CONN_PLAN_0809.md), and 16
-// here (HTTP_16CONN_PLAN_0809v1.md).
+// (HTTP_16CONN_PLAN_0809v1.md); this is a deliberate return to 2.
 //
-// The returns are diminishing and that is the point of measuring 16. On median
-// end-to-end registration at RQ2500/UE1000, 1->4 saved 126ms and 4->8 saved a
-// further 41ms; each doubling has bought less than the one before it, so 16 is
-// the step that shows whether the curve has flattened or still has slope.
+// Note that 2 here is NOT the same measurement the original 2-slot run made.
+// That one predated the IdleTimeout fix, so its slots never held a connection
+// between requests. This is the first 2-slot configuration where two sockets
+// actually stay up, which makes it the honest low end of the 2/4/8/16 series
+// rather than a repeat of the run that had to be discarded.
 //
-// 16 also halves the per-slot sample again. The thinnest pairs measured,
-// AMF->PCF and PCF->UDR at 1000 requests, fall to ~62 per slot. That is still
-// enough to see whether the round-robin split is even, but too thin to read a
-// per-slot P95/P99 from: tail statistics should come from AMF->UDM (~375) and
-// UDM->UDR (~562) instead. A materially lower request rate or UE count would
-// make even the split unreadable at 16 slots.
+// 2 slots give the widest per-slot sample of the series: every pair splits its
+// requests two ways, so even the thinnest pairs measured (AMF->PCF and PCF->UDR
+// at 1000 requests, ~500 per slot) carry enough samples to read a per-slot
+// P95/P99 -- something 16 slots could not support at ~62 per slot. Tail
+// statistics are therefore readable on every pair at this setting.
 //
-// Growth beyond these 16 is still permitted: StrictMaxConcurrentStreams is
+// Growth beyond these 2 is still permitted: StrictMaxConcurrentStreams is
 // deliberately left unset (see below), so when a slot's in-flight streams reach
 // the peer's 250-stream limit the transport dials an additional connection by
-// itself. In practice that has never triggered -- every run from 4 to 8 held
-// exactly connsPerPeer sockets per pair with zero redials -- so 16 is expected
-// to be the actual count, not merely a floor. conn_slot rather than conn is
-// still the field that shows whether the split is even.
-const connsPerPeer = 16
+// itself. That headroom matters more at 2 than it did at 16: with only two slots
+// carrying the whole load, a busy pair is far likelier to reach the stream limit
+// and grow past connsPerPeer. Runs from 4 to 16 held exactly connsPerPeer
+// sockets per pair with zero redials, but at 2 that should be checked rather
+// than assumed -- conn_slot shows whether the split is even, and conn_reused
+// false records show whether the pool grew beyond the two held from the start.
+const connsPerPeer = 2
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
