@@ -26,6 +26,33 @@ import (
 	"time"
 )
 
+// Enabled is the compile-time kill switch for ALL TYcustom instrumentation in
+// this NF: the log files, every timestamp taken to fill them, the httptrace
+// callbacks, the request-body UE-id sniffing, and the gin inbound middleware.
+//
+// It is a const, not an env var, on purpose. With `const Enabled = false` the
+// compiler eliminates every guarded branch, so the control build pays literally
+// nothing -- no branch, no interface call, no retained closure or allocation. An
+// env var would leave a load and a branch on every SBI hop and keep all the
+// instrumentation objects alive, which is a weaker control for an experiment
+// whose whole question is "what does the instrumentation cost".
+//
+// Flip to true and rebuild to restore instrumentation; nothing else needs
+// changing. See DISABLE_ALL_LOGGING_PLAN_0811.md.
+//
+// What false guarantees:
+//   - Init() never runs, so the 2M-entry queue, the writer goroutine and the
+//     buffers are never allocated, and openLog never runs -- the log files are
+//     never even CREATED. Absence of /tmp/*_log.txt is the acceptance signal for
+//     a control build.
+//   - Every LogXxx returns on its first statement, before any allocation or JSON
+//     building, so no record is ever built or enqueued.
+//
+// What false deliberately does NOT change: connsPerPeer and the round-robin in
+// httptransport.go. Those are the experiment's independent variable, not
+// instrumentation, and both builds open the same number of connections.
+const Enabled = false
+
 // srcNF is the name of the NF this binary runs as (the requester for HTTP logs,
 // and the "NF" side for DB logs). Set once at package init.
 const srcNF = "PCF"
@@ -70,6 +97,12 @@ var (
 // first call has any effect. It is invoked automatically on first use, but NFs
 // may call it explicitly at startup.
 func Init() {
+	// Nothing to start when instrumentation is compiled out: no queue, no writer
+	// goroutine, no buffers, and crucially no openLog -- so the log files are
+	// never created.
+	if !Enabled {
+		return
+	}
 	initOne.Do(func() {
 		queue = make(chan record, queueCapacity)
 		flushReq = make(chan chan struct{})
@@ -90,7 +123,11 @@ func Flush() {
 	<-done
 }
 
-func init() { Init() }
+func init() {
+	if Enabled {
+		Init()
+	}
+}
 
 // envOr returns the value of env key or def if unset/empty.
 func envOr(key, def string) string {
@@ -325,6 +362,11 @@ func formatTimeOrEmpty(t time.Time) string {
 func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused bool,
 	reqTime, wroteTime, gotFirstByte, respTime time.Time,
 ) {
+	// Guard FIRST, before the allocation: the per-record make() and the JSON
+	// building below are the dominant cost, not the file write.
+	if !Enabled {
+		return
+	}
 	b := make([]byte, 0, 304)
 	b = append(b, '{')
 	b = appendKV(b, "src", srcNF, true)
@@ -359,6 +401,9 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused b
 //   - reqTime:  when the request arrived at this server
 //   - respTime: when the response was sent back
 func LogHTTPInbound(method, uri, ueID string, reqTime, respTime time.Time) {
+	if !Enabled {
+		return
+	}
 	b := make([]byte, 0, 256)
 	b = append(b, '{')
 	b = appendKV(b, "src", "NaN", true)
@@ -382,6 +427,9 @@ func LogHTTPInbound(method, uri, ueID string, reqTime, respTime time.Time) {
 //   - reqTime:   when the DB request was issued
 //   - respTime:  when the DB reply was received
 func LogDB(mongo, resource, operation, ueID string, reqTime, respTime time.Time) {
+	if !Enabled {
+		return
+	}
 	b := make([]byte, 0, 256)
 	b = append(b, '{')
 	b = appendKV(b, "nf", srcNF, true)

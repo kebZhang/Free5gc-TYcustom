@@ -107,7 +107,11 @@ func bindRouter(nssf app.NssfApp, router *gin.Engine, tlsKeyLogPath string) (*ht
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
-	router.Use(accesslog.InboundLogger())
+	// Instrumentation off: do not put the inbound access-log middleware in the
+	// chain at all. A pass-through would still cost one gin frame per request.
+	if accesslog.Enabled {
+		router.Use(accesslog.InboundLogger())
+	}
 
 	for _, serviceName := range s.Config().Configuration.ServiceNameList {
 		switch serviceName {

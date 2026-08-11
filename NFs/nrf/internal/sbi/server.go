@@ -48,7 +48,11 @@ func NewServer(nrf ServerNrf, tlsKeyLogPath string) (*Server, error) {
 		router:    logger_util.NewGinWithLogrus(logger.GinLog),
 	}
 	s.router.Use(metrics.InboundMetrics())
-	s.router.Use(accesslog.InboundLogger())
+	// Instrumentation off: do not put the inbound access-log middleware in the
+	// chain at all. A pass-through would still cost one gin frame per request.
+	if accesslog.Enabled {
+		s.router.Use(accesslog.InboundLogger())
+	}
 	cfg := s.Config()
 	bindAddr := cfg.GetSbiBindingAddr()
 	logger.SBILog.Infof("Binding addr: [%s]", bindAddr)

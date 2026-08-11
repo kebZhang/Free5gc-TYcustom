@@ -75,7 +75,11 @@ func NewServer(pcf pcf, tlsKeyLogPath string) (*Server, error) {
 	}
 
 	s.router.Use(metrics.InboundMetrics())
-	s.router.Use(accesslog.InboundLogger())
+	// Instrumentation off: do not put the inbound access-log middleware in the
+	// chain at all. A pass-through would still cost one gin frame per request.
+	if accesslog.Enabled {
+		s.router.Use(accesslog.InboundLogger())
+	}
 
 	smPolicyRoutes := s.getSmPolicyRoutes()
 	smPolicyGroup := s.router.Group(factory.PcfSMpolicyCtlResUriPrefix)

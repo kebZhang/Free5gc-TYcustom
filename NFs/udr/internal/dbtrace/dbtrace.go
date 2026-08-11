@@ -48,6 +48,15 @@ func ueIDFromFilter(filter bson.M) string {
 // real call; we stamp the end here. operation names the mongoapi call made so
 // each log line records its operation type (find/update/else).
 func logDB(collName, operation string, filter bson.M, start time.Time) {
+	// Instrumentation off: emit nothing. The wrapper functions above still take
+	// their `start := time.Now()`, whose result is then discarded -- guarding
+	// each of them individually would make `start` an unused variable under
+	// `const Enabled = false` and would not compile without splitting all ten
+	// into two branches. One discarded time.Now() per DB call is negligible next
+	// to the ueIDFromFilter scan, JSON building and enqueue removed here.
+	if !accesslog.Enabled {
+		return
+	}
 	accesslog.LogDB(mongoTarget, collName, operation, ueIDFromFilter(filter), start, time.Now())
 }
 
