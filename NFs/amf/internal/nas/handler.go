@@ -21,26 +21,12 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 	// when this function returns). HandleNAS is the outermost synchronous frame
 	// for one uplink NAS message on the AMF side, so the pair brackets exactly
 	// the work attributable to it. Creating the trace is a plain allocation.
-	// Instrumentation off: leave the trace nil. Every msgtrace method is
-	// nil-safe and does no work at all on the nil path -- Track() in particular
-	// returns a shared noop closure without calling time.Now() -- so this single
-	// line also removes the fourteen T3/T6/DL-NAS timestamp sites scattered
-	// across the SBI consumers, gmm/message/send.go and ngap/message/send.go.
-	// Those sites are deliberately left unguarded; see
-	// DISABLE_ALL_LOGGING_PLAN_0811.md.
-	var tr *msgtrace.Trace
-	if accesslog.Enabled {
-		tr = msgtrace.New(time.Now()) // T2
-	}
+	tr := msgtrace.New(time.Now()) // T2
 	defer func() {
 		// Only messages we care about get a line: logUplinkNAS sets NasType for
 		// the three uplink types of interest, so an early return (or any other
 		// NAS type) leaves it empty and writes nothing — matching AMF_log.
-		//
-		// The nil check is load-bearing when instrumentation is off: msgtrace's
-		// METHODS are nil-safe, but this is a direct field read, which would
-		// panic on the nil trace above.
-		if tr != nil && tr.NasType != "" {
+		if tr.NasType != "" {
 			accesslog.LogWorker(tr.UeID, tr.NasType, tr.Start, time.Now(), toSBIViews(tr.SBI)) // T8
 		}
 		// Unbind so a later message on this UE can never append to this trace.

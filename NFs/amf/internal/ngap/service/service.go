@@ -10,7 +10,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/free5gc/amf/internal/accesslog"
 	"github.com/free5gc/amf/internal/logger"
 	ngap_internal "github.com/free5gc/amf/internal/ngap"
 	"github.com/free5gc/amf/pkg/factory"
@@ -224,17 +223,7 @@ func handleConnection(conn *sctp.SCTPConn, bufsize uint32, handler NGAPHandler) 
 		// Capture the SCTP-read time as early as possible (memory only). It is
 		// carried with the message and only written to AMF_log later, once the
 		// NAS layer has confirmed the message type. Never falls on the I/O path.
-		//
-		// This timestamp exists SOLELY to feed AMF_log, so with instrumentation
-		// off it is not taken at all and recvTime keeps its zero value. That is
-		// already the downstream contract: logUplinkNAS returns early on a zero
-		// time, and nothing else reads it. The parameter still has to be threaded
-		// through Dispatch and the generated dispatcher, whose signatures must
-		// not change.
-		var recvTime time.Time
-		if accesslog.Enabled {
-			recvTime = time.Now()
-		}
+		recvTime := time.Now()
 		if err != nil {
 			switch err {
 			case io.EOF, io.ErrUnexpectedEOF:

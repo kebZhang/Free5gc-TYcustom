@@ -90,16 +90,11 @@ const (
 // still the field that shows whether the split is even.
 const connsPerPeer = 16
 
-// roundRobinTransport owns the connection pool: separate HTTP/2 transports for
-// https (h2) and cleartext (h2c), chosen per request by URL scheme exactly like
-// openapi.CallAPI's inner clients do, dealt out round-robin.
-//
-// This type is deliberately independent of logging. connsPerPeer and the
-// round-robin are the EXPERIMENT's independent variable, whereas the access log
-// is instrumentation; keeping them in separate types is what lets the
-// instrumentation be compiled out (Enabled = false) without changing how many
-// connections this NF opens. See Client().
-type roundRobinTransport struct {
+// loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
+// cleartext (h2c), choosing per request by URL scheme exactly like
+// openapi.CallAPI's inner clients do, and records one HTTP access-log entry per
+// request from the requester's (this NF's) point of view.
+type loggingRoundTripper struct {
 	// One slot per connection to each peer. Every element is a SEPARATE
 	// http2.Transport with its own pool, which is what makes them distinct TCP
 	// connections rather than one shared one.
@@ -113,15 +108,8 @@ type roundRobinTransport struct {
 	next atomic.Uint64
 }
 
-// loggingRoundTripper adds access logging on top of the pool. It holds a
-// roundRobinTransport rather than being one, so that the two concerns can be
-// enabled independently: the control build uses the pool alone.
-type loggingRoundTripper struct {
-	pool *roundRobinTransport
-}
-
-func newRoundRobinTransport() *roundRobinTransport {
-	l := &roundRobinTransport{}
+func newLoggingRoundTripper() *loggingRoundTripper {
+	l := &loggingRoundTripper{}
 	for i := 0; i < connsPerPeer; i++ {
 		// Each iteration builds a SEPARATE http2.Transport. Field values are
 		// identical across slots; only the instance identity differs, and that
@@ -161,11 +149,7 @@ func newRoundRobinTransport() *roundRobinTransport {
 	return l
 }
 
-// pick selects the next transport for this request and reports which slot it
-// came from. This is the whole of the round-robin behaviour; both the logging
-// and the non-logging round-trippers go through it, so the connection pattern is
-// identical whether or not instrumentation is compiled in.
-func (l *roundRobinTransport) pick(req *http.Request) (http.RoundTripper, int) {
+func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Take the address rather than the array: a Go array is a value, so
 	// assigning it would copy every element on each request.
 	pool := &l.clear
@@ -180,19 +164,7 @@ func (l *roundRobinTransport) pick(req *http.Request) (http.RoundTripper, int) {
 	// Add returns the value AFTER incrementing, so subtracting 1 makes the
 	// first request land on slot 0 and keeps connSlot 0-based in the log.
 	connSlot := int((l.next.Add(1) - 1) % connsPerPeer)
-	return pool[connSlot], connSlot
-}
-
-// RoundTrip on the bare pool: deal the request to the next slot and send it.
-// No timestamps, no httptrace, no body sniffing. This is the round-tripper the
-// control build (Enabled = false) uses.
-func (l *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	base, _ := l.pick(req)
-	return base.RoundTrip(req)
-}
-
-func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	base, connSlot := l.pool.pick(req)
+	base := pool[connSlot]
 
 	dst := dstNFFromURL(req)
 	method := req.Method
@@ -290,12 +262,6 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 // is untouched and pays no cost. When it does read the body, it restores it so
 // the request can still be sent normally.
 func sniffUEID(req *http.Request) string {
-	// Instrumentation disabled: never touch the body. This is what removes the
-	// io.ReadAll + json.Unmarshal + body re-wrap from every POST
-	// ue-authentications and POST policies on the client side.
-	if !Enabled {
-		return ""
-	}
 	if req.Method != http.MethodPost || req.URL == nil || req.Body == nil {
 		return ""
 	}
@@ -372,18 +338,8 @@ func extractStringField(body []byte, field string) string {
 // Register it once, right after the existing inbound middleware, e.g.:
 //
 //	router.Use(metrics.InboundMetrics())
-//	if accesslog.Enabled {
-//		router.Use(accesslog.InboundLogger())
-//	}
-//
-// Callers guard the registration with Enabled so that a disabled build does not
-// carry this middleware in the chain at all. The pass-through returned below is
-// only a safety net for a caller that forgot: it still costs one gin frame per
-// request, which is why not registering is the preferred form.
+//	router.Use(accesslog.InboundLogger())
 func InboundLogger() gin.HandlerFunc {
-	if !Enabled {
-		return func(c *gin.Context) { c.Next() }
-	}
 	return func(c *gin.Context) {
 		method := c.Request.Method
 		uri := inboundURI(c.Request)
@@ -432,11 +388,6 @@ func inboundURI(req *http.Request) string {
 // only in the body, or "" otherwise. Mirrors sniffUEID but reads the server-side
 // request body and restores it so the gin handler can still read it.
 func sniffInboundUEID(req *http.Request) string {
-	// Instrumentation disabled: never touch the body. Server-side counterpart of
-	// the guard in sniffUEID.
-	if !Enabled {
-		return ""
-	}
 	if req == nil || req.Method != http.MethodPost || req.URL == nil || req.Body == nil {
 		return ""
 	}
@@ -456,37 +407,19 @@ func sniffInboundUEID(req *http.Request) string {
 	return extractStringField(body, field)
 }
 
-// Client returns an *http.Client that behaves like free5gc/openapi's internal
-// HTTP/2 clients, holding connsPerPeer connections per peer and dealing requests
-// across them round-robin. When Enabled it additionally logs every request.
-// Inject it into a service Configuration via
-// configuration.SetHTTPClient(accesslog.Client()).
+// Client returns an *http.Client that logs every request and otherwise behaves
+// like free5gc/openapi's internal HTTP/2 clients. Inject it into a service
+// Configuration via configuration.SetHTTPClient(accesslog.Client()).
 //
 // A single shared client is returned so connection pools are reused across all
 // service configurations within the NF.
-//
-// The connection pool is the SAME in both builds — only the logging layer on top
-// of it differs. Disabling instrumentation must not change how many connections
-// this NF opens, since that is the experiment's independent variable.
 func Client() *http.Client {
 	return sharedClient
 }
 
 var sharedClient = &http.Client{
-	Transport: newTransport(),
+	Transport: newLoggingRoundTripper(),
 	Timeout:   timeoutPeriod,
-}
-
-// newTransport builds the pool, and wraps it in the logging layer only when
-// instrumentation is compiled in. With Enabled = false the returned transport is
-// the bare pool, so no httptrace callback is ever installed on the HTTP/2 write
-// path or the shared connection read loop.
-func newTransport() http.RoundTripper {
-	pool := newRoundRobinTransport()
-	if !Enabled {
-		return pool
-	}
-	return &loggingRoundTripper{pool: pool}
 }
 
 // dstNFFromURL derives the destination NF name from the request URL path. SBI
