@@ -48,13 +48,17 @@ const (
 )
 
 // connsPerPeer is how many HTTP/2 connections this NF opens to each peer NF up
-// front, and how many round-robin slots requests are dealt across. It is 2.
+// front, and how many round-robin slots requests are dealt across. It is 1: the
+// transport starts with a single connection per peer and is left free to add
+// more on its own.
 //
 // Each slot is a separate http2.Transport with its own private pool, so N slots
 // mean N connections held from the start, with requests handed to them one after
-// another in turn. The slots are per PROCESS, not per peer: these same N
-// transports serve every peer this NF talks to, and each one keeps its own pool
-// keyed by address. A NF with 4 peers therefore holds 2*4 = 8 connections.
+// another in turn. At 1 the round-robin degenerates: the array has a single
+// element, the modulo is always 0, and conn_slot is 0 on every log line. The
+// slots are per PROCESS, not per peer: this one transport serves every peer this
+// NF talks to, and keeps its own pool keyed by address. A NF with 4 peers
+// therefore holds 1*4 = 4 connections.
 //
 // The history matters for reading this number. It was 2 for the original
 // round-robin experiment (HTTP_MULTI_CONN_ROUNDROBIN_PLAN_0806.md), then went
@@ -66,31 +70,29 @@ const (
 // With the server-side IdleTimeout now at 500ms, connections survive the gaps
 // between requests, so N slots finally mean N concurrent long-lived sockets.
 // From that fixed baseline of 1 the measured series ran 4
-// (HTTP_4CONN_ROUNDROBIN_PLAN_0807.md), 8 (HTTP_8CONN_PLAN_0809.md), and 16
-// (HTTP_16CONN_PLAN_0809v1.md); this is a deliberate return to 2.
+// (HTTP_4CONN_ROUNDROBIN_PLAN_0807.md), 8 (HTTP_8CONN_PLAN_0809.md), 16
+// (HTTP_16CONN_PLAN_0809v1.md), and then 2. This is a return to 1.
 //
-// Note that 2 here is NOT the same measurement the original 2-slot run made.
-// That one predated the IdleTimeout fix, so its slots never held a connection
-// between requests. This is the first 2-slot configuration where two sockets
-// actually stay up, which makes it the honest low end of the 2/4/8/16 series
-// rather than a repeat of the run that had to be discarded.
+// 1 is the single-connection baseline the whole 1/2/4/8/16 series is measured
+// against: one socket per NF pair carrying the pair's entire load, so every
+// queueing effect that multiple connections exist to split -- the shared
+// clientConn write lock, HTTP/2 head-of-line delay on one stream multiplexer --
+// is concentrated on one connection and visible in full. It is also the closest
+// this code gets to stock free5gc behaviour, where openapi's client holds one
+// pooled connection per peer.
 //
-// 2 slots give the widest per-slot sample of the series: every pair splits its
-// requests two ways, so even the thinnest pairs measured (AMF->PCF and PCF->UDR
-// at 1000 requests, ~500 per slot) carry enough samples to read a per-slot
-// P95/P99 -- something 16 slots could not support at ~62 per slot. Tail
-// statistics are therefore readable on every pair at this setting.
-//
-// Growth beyond these 2 is still permitted: StrictMaxConcurrentStreams is
-// deliberately left unset (see below), so when a slot's in-flight streams reach
-// the peer's 250-stream limit the transport dials an additional connection by
-// itself. That headroom matters more at 2 than it did at 16: with only two slots
-// carrying the whole load, a busy pair is far likelier to reach the stream limit
-// and grow past connsPerPeer. Runs from 4 to 16 held exactly connsPerPeer
-// sockets per pair with zero redials, but at 2 that should be checked rather
-// than assumed -- conn_slot shows whether the split is even, and conn_reused
-// false records show whether the pool grew beyond the two held from the start.
-const connsPerPeer = 2
+// Growth beyond this 1 is still permitted: StrictMaxConcurrentStreams is
+// deliberately left unset (see below), so when the slot's in-flight streams
+// reach the peer's 250-stream limit the transport dials an additional
+// connection by itself. The intent is "start at one, grow only under real
+// pressure", not a hard cap of one -- so at high RQ more than one socket per
+// pair is expected rather than a failure. Runs from 4 to 16 held exactly
+// connsPerPeer sockets per pair with zero redials, and their peak in-flight
+// stream counts (37/65/156 at the 0807 measurement) never reached 250; with the
+// whole load now on a single slot that headroom is much thinner, so conn_reused
+// false records are the thing to watch -- they show whether the pool grew past
+// the one connection held from the start.
+const connsPerPeer = 1
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
@@ -130,9 +132,11 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 		//
 		// With the default, a transport may dial an extra connection when its
 		// in-flight stream count reaches the peer's limit. That is accepted:
-		// connsPerPeer sets how many connections are held from the start, so
-		// that the number in use can be compared against the single-connection
-		// baseline; it is not meant to cap the total.
+		// connsPerPeer sets how many connections are held from the start; it is
+		// not meant to cap the total. At connsPerPeer = 1 this is the only way
+		// a pair ever ends up with more than one socket, so a conn_reused false
+		// record is the signal that the single connection hit 250 in-flight
+		// streams -- not a sign the setting was ignored.
 		l.tls[i] = &http2.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // matches openapi default
 			ReadIdleTimeout: readIdleTimeoutPeriod,
@@ -165,6 +169,11 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	//
 	// Add returns the value AFTER incrementing, so subtracting 1 makes the
 	// first request land on slot 0 and keeps connSlot 0-based in the log.
+	//
+	// At connsPerPeer = 1 the modulo makes this constant 0 and every request
+	// takes the same transport. The counter is kept rather than special-cased
+	// so that changing the constant back is a one-line edit, and its cost at
+	// one slot is a single uncontended atomic add per request.
 	connSlot := int((l.next.Add(1) - 1) % connsPerPeer)
 	base := pool[connSlot]
 
