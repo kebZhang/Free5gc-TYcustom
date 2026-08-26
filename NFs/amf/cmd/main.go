@@ -13,6 +13,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	"github.com/free5gc/amf/internal/logger"
 	"github.com/free5gc/amf/pkg/factory"
 	"github.com/free5gc/amf/pkg/service"
@@ -30,14 +31,21 @@ func main() {
 		}
 	}()
 
-	// --- Lock-contention profiling (TYcustom, for AMF-local latency debug) ---
-	// Turn on mutex + block profiling and expose pprof on :6060. This lets us
-	// snapshot /debug/pprof/mutex before/after each RQ run and diff them, to see
-	// which lock (e.g. UePool sync.Map) accumulates the most wait time as the
-	// request rate rises. Safe to leave on: sampling is cheap and the endpoint is
-	// pull-only. Remove/guard for production if the extra port is unwanted.
+	// --- Lock-contention + scheduler profiling (TYcustom, 0826) ---
+	// Turn on mutex + block profiling, register /debug/schedstat, and expose
+	// pprof on :6060. Snapshot /debug/pprof/{block,mutex} and /debug/schedstat
+	// before and after each RQ run and diff them: the block profile attributes
+	// time spent waiting on the HTTP/2 client's per-connection locks
+	// (cc.reqHeaderMu, cc.wmu), and schedstat bounds the time goroutines spend
+	// runnable but not yet on a P. Both are cumulative since process start, so
+	// only the PRE/POST difference is meaningful.
+	//
+	// Safe to leave on: sampling is cheap and both endpoints are pull-only.
+	// Remove/guard for production if the extra port is unwanted.
+	// See LOCK_SCHED_PROFILING_GUIDE_0826.md for the full procedure.
 	runtime.SetMutexProfileFraction(5) // sample ~1/5 of mutex contention events
 	runtime.SetBlockProfileRate(10000) // sample a blocking event ~every 10us blocked
+	accesslog.RegisterSchedStat()      // must precede the ListenAndServe below
 	go func() {
 		if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
 			logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
