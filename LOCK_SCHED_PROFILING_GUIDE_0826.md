@@ -305,34 +305,43 @@ done
 
 ---
 
-## 3. 实验时序（两部分共用）
+## 3. 实验时序：一步一步照做
 
-**核心原则：block profile 和 sched profile 都是「进程启动以来的累计值，只增不减」，
-所以必须在实验前后各抓一次快照，用差值才是这一次实验的量。**
+### 3.0 先理解三条规矩（读一次就够）
 
+1. **两套 profile 都是「进程启动以来的累计值，只增不减」。**
+   一次快照本身没有意义，**必须 PRE / POST 各抓一次，用差值**才是这一轮实验的量。
+2. **warm-up 不能省。** 正式实验只有 0.9 秒左右（实测：RQ800 = 1286 ms，
+   RQ1500 = 900 ms，RQ2500 = 798 ms）。不预热的话，测到的一大半是 Go 进程的
+   冷启动（首次 GC、线程池扩张、建连），不是负载本身。
+   warm-up 还有第二个作用：`connsPerPeer = 1` 的那条连接必须在 PRE 之前就建好，
+   否则 TCP 握手 + SETTINGS 交换会被算进这次实验的阻塞里。
+3. **PRE 之后、POST 之前，除了 PacketRusher 不要做任何别的动作。**
+   `kubectl exec` / `kubectl logs` / 额外的 `curl` 都会在 NF 进程里制造
+   多余的 goroutine 和锁等待，直接进到差值里。
+
+### 3.1 一次性准备
+
+整个流程分两个终端：
+
+- **【终端 A】node-0** —— 起 port-forward、清日志、抓快照、收日志
+- **【终端 B】PacketRusher pod 里** —— 只负责跑 warm-up 和正式实验（按你原来的方式跑，本文档不代劳）
+
+**① 在【终端 A】设好脚本路径变量**（按实际路径改一次即可）
+
+```bash
+K8S=~/cloudlab/K8s      # collect_*.sh / rename.sh 所在目录
+COLLECT=$K8S/collect_HTTPDBAMFlog_AMFdetail0723_Free5gc.sh
+LOGDIR=/local/free5gcLog   # COLLECT 的默认输出目录
 ```
-① 跑一次 warm-up：200 UE                    <- 避开进程冷启动（首次 GC、线程池扩张、建连）
-② 等 2 秒
-③ 抓 PRE 快照
-④ 启动 PacketRusher：1000 UE @ 0.67ms       <- 正式实验，约 0.9 秒
-⑤ 等 2 秒（让在途请求收尾）
-⑥ 抓 POST 快照
-⑦ dereg
-⑧ 再抓一次快照，作为下一组的 PRE 基线        <- dereg 本身也产生锁等待，不能混进下一组
-```
 
-> 实验只有 0.9 秒（实测：RQ800 = 1286 ms，RQ1500 = 900 ms，RQ2500 = 798 ms），
-> 所以 **① 的 warm-up 不能省** —— 否则测到的一大半是 Go 进程的冷启动，不是负载本身。
->
-> warm-up 还有第二个作用：`connsPerPeer = 1` 的那条连接必须在 PRE 之前就建好。
-> 否则建连（TCP 握手 + SETTINGS 交换）会被算进这次实验的阻塞里。
-
-抓取脚本（五个 NF 全量抓 block / mutex / sched）：
+**② `~/snap.sh`：抓五个 NF 的 block / mutex / sched 快照**
 
 ```bash
 cat > ~/snap.sh <<'SNAPEOF'
 #!/usr/bin/env bash
-# 用法: ~/snap.sh <标签>     例: ~/snap.sh RQ1500_PRE
+# 用法: ~/snap.sh <标签>     例: ~/snap.sh RQ1500_UE1000_PRE
+# 注意：标签会直接拼进文件名，别带 .txt 之类的后缀。
 LABEL="$1"; [ -z "$LABEL" ] && { echo "需要标签"; exit 1; }
 OUT="$HOME/prof_0826"; mkdir -p "$OUT"
 for np in amf:6061 ausf:6062 udm:6063 udr:6064 pcf:6065; do
@@ -346,8 +355,169 @@ SNAPEOF
 chmod +x ~/snap.sh
 ```
 
-对每个 RQ 点（800 / 1000 / 1500 / 2000 / 2500）重复一遍上面的时序，
-标签用 `RQ1500_PRE` / `RQ1500_POST`。
+**③ `~/pf.sh`：一次起好五个 port-forward（NF pod 每重启一次就要重跑）**
+
+```bash
+cat > ~/pf.sh <<'PFEOF'
+#!/usr/bin/env bash
+# 起 5 个 port-forward 到后台。NF pod 一重启，port-forward 就断，必须重跑本脚本。
+pkill -f "port-forward.*free5gc-" 2>/dev/null || true
+sleep 1
+mkdir -p ~/prof_0826
+i=1
+for nf in amf ausf udm udr pcf; do
+  port=$((6060 + i))
+  kubectl port-forward -n free5gc deploy/free5gc-$nf $port:6060 \
+    > ~/prof_0826/pf_$nf.log 2>&1 &
+  echo "  free5gc-$nf -> localhost:$port  (pid $!)"
+  i=$((i + 1))
+done
+sleep 3
+echo "--- 自检：五行都要出 JSON ---"
+for p in 6061 6062 6063 6064 6065; do
+  echo -n "$p: "; curl -s --max-time 2 "http://localhost:$p/debug/schedstat" || echo FAIL; echo
+done
+PFEOF
+chmod +x ~/pf.sh
+```
+
+### 3.2 跑一个 RQ 点 —— 以 RQ1500 / UE1000 为例
+
+```bash
+# 【终端 A】
+RQ=1500; UE=1000; TAG=RQ${RQ}_UE${UE}
+```
+
+---
+
+**第 1 步【A】起 port-forward**（NF pod 刚重启过就必须做，否则跳过）
+
+```bash
+~/pf.sh
+```
+> 五行都要出 JSON。有 FAIL 就是 pod 没起来或者跑的是旧镜像，回 §2 查。
+
+**第 2 步【A】清空五个 NF pod 里的旧日志（同时清掉本地已合并的文件）**
+
+```bash
+$COLLECT clear
+```
+> `clear` 用的是 `: > file` 截断而不是 `rm`，NF 进程持有的 fd 不会被孤立，
+> 截断后继续从 0 字节往后写。它同时会删掉 `$LOGDIR` 下上一轮的 `HTTP_log.txt` /
+> `DB_log.txt` / `AMF_log.txt` / `AMF_worker_log.txt` 和 `raw/*`，
+> **但不会碰已经被 `rename.sh` 改过名的历史文件**（`HTTP_log_RQ800_UE1000.txt` 等）。
+
+**第 3 步【B】跑一次 warm-up：200 UE**
+
+在 PacketRusher pod 里按你原来的方式跑，UE 数用 **200**，RQ 随意（和正式实验一致最好）。
+跑完就停掉。
+
+**第 4 步【A】等 2 秒**，让 warm-up 的在途请求全部收尾
+
+```bash
+sleep 2
+```
+
+**第 5 步【A】抓 PRE 快照**
+
+```bash
+~/snap.sh ${TAG}_PRE
+```
+
+**第 6 步【A】再清一次日志**（warm-up 的日志不能混进正式数据）
+
+```bash
+$COLLECT clear
+```
+> ⚠️ 这一步违反了 3.0 的第 3 条（PRE 之后不要动 NF）。它是**唯一允许的例外** ——
+> 截断只碰文件、不产生 SBI 请求，代价远小于让 warm-up 的日志污染 §4 的总预算。
+> **不要**把它挪到 PRE 之前，那样 warm-up 的日志会留下来。
+
+**第 7 步【B】启动正式实验：1000 UE @ 目标 RQ，不做 dereg**
+
+在 PacketRusher pod 里按你原来的方式跑。**不要带 `--trtdr`**，让 UE 跑完保持注册状态。
+
+**第 8 步【A】等这一轮跑完，再等 2 秒**
+
+正式实验实测耗时 0.8–1.3 s（见 3.0 第 2 条）。看【终端 B】那边 1000 个 UE 都注册完之后：
+
+```bash
+sleep 2
+```
+
+**第 9 步【A】抓 POST 快照**
+
+```bash
+~/snap.sh ${TAG}_POST
+```
+
+**第 10 步【B】停掉 PacketRusher**（UE 保持注册，不做 dereg）
+
+**第 11 步【A】收日志并改名**
+
+```bash
+$COLLECT collect
+cd $LOGDIR && bash $K8S/rename.sh $RQ $UE && cd -
+ls -l $LOGDIR/*_${TAG}.txt
+```
+> `collect` 是**追加**（`>>`）到合并文件的，所以 `collect` 之后必须**立刻** `rename.sh`，
+> 否则下一轮的记录会叠加到同一个 `HTTP_log.txt` 上。改完名的文件不会再被 `clear` 删掉。
+>
+> 产出：`$LOGDIR/HTTP_log_${TAG}.txt`（七个 NF 合并）、`DB_log_${TAG}.txt`、
+> `AMF_log_${TAG}.txt`、`AMF_worker_log_${TAG}.txt`，
+> 以及 `$LOGDIR/raw/` 下的各 NF 单独文件。
+>
+> PacketRusher 侧的 `ue_registration.txt` 按你原来的方式取。
+
+**第 12 步【A】当场自检三项，不过关就重跑这个 RQ 点**
+
+```bash
+echo "--- ① schedstat 的 count 是否增长了（五行 delta 都要 > 0）---"
+for nf in amf ausf udm udr pcf; do
+  pre=$(jq -r .count  ~/prof_0826/sched_${nf}_${TAG}_PRE.json)
+  post=$(jq -r .count ~/prof_0826/sched_${nf}_${TAG}_POST.json)
+  echo "$nf  PRE=$pre  POST=$post  delta=$((post - pre))"
+done
+
+echo "--- ② block profile 文件非空（几百字节以上）---"
+ls -l ~/prof_0826/block_*_${TAG}_*.pb.gz
+
+echo "--- ③ 每个 NF 对只用了 1 条 socket（§0 的前提）---"
+jq -r 'select(.src != "NaN") | .src + "->" + .dst + "\t" + .conn' \
+  $LOGDIR/HTTP_log_${TAG}.txt | sort -u | cut -f1 | uniq -c
+```
+> ③ 出现某个 NF 对 >1 条 socket，说明它撞到了 250 in-flight stream 上限、
+> 连接池自行扩容了。**先记下来**，它会改变 §5.3 的判读。
+
+### 3.3 换下一个 RQ 点
+
+**推荐：先重启一遍 NF，再跑下一个点。**
+
+```bash
+bash $K8S/restart_free5gc.sh    # 先 NRF 再其他
+~/pf.sh                         # pod 换了，port-forward 断了，必须重起
+```
+然后改 `RQ` 回到 3.2 第 1 步。
+
+> **为什么建议重启**：本流程不做 dereg，所以上一轮的 1000 个 UE 会一直留在
+> AMF 的 UePool / UDR 的 context 里。不重启的话，RQ800 那轮的 NF 是空的、
+> RQ2500 那轮的 NF 里堆着 4000 个 UE context —— 横向比较五个 RQ 点时这是个
+> 混杂变量。重启的代价只是要重跑 `pf.sh` 和 warm-up。
+>
+> 如果坚持不重启：PRE/POST 差值本身仍然成立（累计计数器做差不受影响），
+> 但 §7 横表里跨 RQ 的比较要标注「NF 未重启，UE context 累积」。
+
+五个 RQ 点（800 / 1000 / 1500 / 2000 / 2500）各跑一遍，最终应有：
+
+```
+~/prof_0826/
+  block_{amf,ausf,udm,udr,pcf}_RQ{800,1000,1500,2000,2500}_UE1000_{PRE,POST}.pb.gz   50 个
+  mutex_...                                                                          50 个
+  sched_...json                                                                      50 个
+/local/free5gcLog/
+  HTTP_log_RQ{800,1000,1500,2000,2500}_UE1000.txt                                     5 个
+  DB_log_... / AMF_log_... / AMF_worker_log_...                                      各 5 个
+```
 
 ---
 
@@ -437,7 +607,7 @@ grep -n "reqHeaderMu <- struct{}{}\|respHeaderRecv\|awaitOpenSlotForStreamLocked
 ```bash
 cd ~/prof_0826
 go tool pprof -lines -top -sample_index=delay -nodecount=40 \
-  -base block_udm_RQ1500_PRE.pb.gz block_udm_RQ1500_POST.pb.gz
+  -base block_udm_RQ1500_UE1000_PRE.pb.gz block_udm_RQ1500_UE1000_POST.pb.gz
 ```
 
 输出会从「函数名」变成「函数名 + 文件:行号」：
@@ -460,7 +630,7 @@ go tool pprof -lines -top -sample_index=delay -nodecount=40 \
 
 ```bash
 go tool pprof -sample_index=delay \
-  -base block_udm_RQ1500_PRE.pb.gz block_udm_RQ1500_POST.pb.gz \
+  -base block_udm_RQ1500_UE1000_PRE.pb.gz block_udm_RQ1500_UE1000_POST.pb.gz \
   -list='writeRequest'
 ```
 
@@ -472,8 +642,8 @@ go tool pprof -sample_index=delay \
 ```bash
 cat > ~/blockrep.sh <<'REPEOF'
 #!/usr/bin/env bash
-# 用法: ~/blockrep.sh RQ1500
-RQ="$1"; [ -z "$RQ" ] && { echo "需要 RQ 标签，如 RQ1500"; exit 1; }
+# 用法: ~/blockrep.sh RQ1500_UE1000   (标签必须和 snap.sh 用的一致)
+RQ="$1"; [ -z "$RQ" ] && { echo "需要 RQ 标签，如 RQ1500_UE1000"; exit 1; }
 OUT="$HOME/prof_0826"
 for nf in amf ausf udm udr pcf; do
   echo "########## $nf $RQ ##########"
@@ -483,7 +653,7 @@ for nf in amf ausf udm udr pcf; do
 done
 REPEOF
 chmod +x ~/blockrep.sh
-~/blockrep.sh RQ1500 | tee ~/prof_0826/blockrep_RQ1500.txt
+~/blockrep.sh RQ1500_UE1000 | tee ~/prof_0826/blockrep_RQ1500_UE1000.txt
 ```
 
 > **行号信息会不会被 strip 掉？不会。** Go 的 block profile 是 **runtime 自己在生成
@@ -621,9 +791,9 @@ _Grunning --阻塞在锁/channel--> _Gwaiting --被唤醒--> _Grunnable --拿到
 `~/snap.sh` 已经在 PRE / POST 各存了一份 JSON：
 
 ```json
-// sched_udm_RQ1500_PRE.json
+// sched_udm_RQ1500_UE1000_PRE.json
 {"wall":"2026-08-26T09:12:03.101Z","count":184213,"total_sec":1.8422,"goroutines":91}
-// sched_udm_RQ1500_POST.json
+// sched_udm_RQ1500_UE1000_POST.json
 {"wall":"2026-08-26T09:12:06.447Z","count":297540,"total_sec":3.1078,"goroutines":94}
 ```
 

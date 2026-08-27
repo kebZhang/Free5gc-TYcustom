@@ -21,6 +21,8 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 )
 
+replace golang.org/x/net => ../../xnet
+
 require (
 	github.com/free5gc/aper v1.1.0 // indirect
 	github.com/free5gc/nas v1.2.2 // indirect

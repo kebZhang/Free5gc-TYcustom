@@ -20,6 +20,8 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 )
 
+replace golang.org/x/net => ../../xnet
+
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bytedance/sonic v1.11.6 // indirect
