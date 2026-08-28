@@ -256,14 +256,52 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 			gotFirstByte = time.Now()
 		},
 	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	// instr is the fork-local trace (golang.org/x/net is replaced by ../../xnet).
+	// It carries three things the standard httptrace cannot expose:
+	//   - M, the instant this attempt begins contending for the connection's
+	//     reqHeaderMu, which is inside the transport's send path;
+	//   - the HTTP/2 stream id, which together with conn is the exact-join key
+	//     against the server-side record of the same request;
+	//   - the attempt count, so retried requests can be excluded rather than
+	//     silently mixing two attempts' timestamps into one line.
+	//
+	// Both traces are stacked onto ONE context chain and installed with a single
+	// WithContext. Calling WithContext twice would copy the whole http.Request
+	// struct and allocate a second one on every outbound SBI request, for
+	// nothing. instr doubles as its own context node, so this adds exactly one
+	// allocation per request.
+	ctx := httptrace.WithClientTrace(req.Context(), trace)
+	instr := &http2.ClientRequestTrace{}
+	ctx = http2.WithClientRequestTrace(ctx, instr)
+	req = req.WithContext(ctx)
 
 	reqTime := time.Now()
 	resp, err := base.RoundTrip(req)
 	respTime := time.Now()
 
-	// Always log, even on transport error, so failed attempts are visible.
-	LogHTTP(dst, method, uri, ueID, connID, connSlot, connReused, reqTime, wroteTime, gotFirstByte, respTime)
+	// Read the snapshot the transport published. All atomic loads: this never
+	// blocks and never waits for a goroutine that may still be running.
+	//
+	// retryCount is Attempts()-1, and Attempts() is 0 when no connection was
+	// ever obtained. Note wroteTime keeps the FIRST write while connID keeps the
+	// LAST connection, so on a retried request the two describe different
+	// attempts -- which is why offline analysis must accept retry_count == 0
+	// only.
+	mStart := instr.ReqHeaderMuStart()
+	streamID := instr.StreamID()
+	retryCount := 0
+	if n := instr.Attempts(); n > 0 {
+		retryCount = int(n) - 1
+	}
+
+	// Always log, even on transport error, so failed attempts are visible. Such
+	// records carry stream_id 0 and an empty req_header_mu_start_time; offline
+	// analysis must drop stream_id == 0 before checking join-key uniqueness,
+	// because 0 is not a real stream and several failures on one connection
+	// would otherwise look like duplicate keys.
+	LogHTTP(dst, method, uri, ueID, connID, connSlot, connReused,
+		streamID, retryCount,
+		reqTime, mStart, wroteTime, gotFirstByte, respTime)
 	return resp, err
 }
 
@@ -369,7 +407,27 @@ func InboundLogger() gin.HandlerFunc {
 		c.Next()
 		respTime := time.Now()
 
-		LogHTTPInbound(method, uri, ueID, reqTime, respTime)
+		// TYcustom: read the fork's trace only after respTime, so T3 and T4 keep
+		// exactly the positions and meanings they had before.
+		//
+		// connID needs no fork support: for an HTTP/2 request RemoteAddr is
+		// sc.remoteAddrStr, the same "clientIP:clientPort" string the caller
+		// records as its own conn. stream_id and server_request_id do need the
+		// fork -- http.Request exposes neither.
+		//
+		// Everything is zero-valued for HTTP/1 or a non-instrumented server;
+		// such lines are simply incomplete for offline purposes and are excluded
+		// there rather than being special-cased here.
+		connID := c.Request.RemoteAddr
+		var srvReqID uint64
+		var streamID uint32
+		var handlerGo time.Time
+		if tr := http2.ServerRequestTraceFromContext(c.Request.Context()); tr != nil {
+			srvReqID, streamID, handlerGo = tr.ID, tr.StreamID, tr.HandlerGo
+		}
+
+		LogHTTPInbound(method, uri, ueID, connID, srvReqID, streamID,
+			handlerGo, reqTime, respTime)
 	}
 }
 

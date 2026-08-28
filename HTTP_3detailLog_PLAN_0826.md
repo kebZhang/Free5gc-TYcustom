@@ -133,9 +133,10 @@ UE/URI 或最近时间戳补配。实验前需要预先确定可接受的 `missi
   Flush -> 采集 -> 清空日志"，不得按 request flush（顺序见第 16.3 节）。
 
 异步写入只能消除日志 I/O 对请求的同步阻塞，不能声称绝对零开销；`time.Now()`、字段复制、
-atomic、context node、后台 JSON/文件写入仍会消耗少量 CPU 和 allocation。实现必须通过第 19 节的
-开销 A/B 测试后才能用于正式 latency 结论，特别要覆盖 UE registration 触发间隔小于 1 ms 的
-最高目标负载。
+atomic、context node、后台 JSON/文件写入仍会消耗少量 CPU 和 allocation。这部分开销的量化
+（尤其在 UE registration 触发间隔小于 1 ms 的最高目标负载下）**由实验负责人自行衡量**，
+开销 A/B 不在本计划范围内（见第 19.1 节的范围变更说明）；但第 19.1 节的 clocksource 前置检查
+与第 19.2 节的竞态/完整性验收必须完成。
 
 ---
 
@@ -199,14 +200,14 @@ G 和 W 分别在第 10 节和第 14 节定义。
 
 - **`GotConn` 闭包（244-249 行）** 已经在每个 request 上执行一次
   `info.Conn.LocalAddr().String()`。这是一次字符串 allocation，位于 `base.RoundTrip` 内部、
-  T1 之后，属于 A 组既有成本。第 4.2 节建议把它改成读 fork 预计算好的不可变字符串，
-  这属于 A1 级基础设施改动，必须按第 19.1 节的 A0/A1/B 三组隔离。
+  T1 之后，属于 A 组既有成本。第 4.2 节建议把它改成读 fork 预计算好的不可变字符串；
+  这属于基础设施改动（会同时让原六点变快），报告时应与 M/G/W 的新增成本分开陈述。
 - **T3 之前还有两层 middleware**：`logger_util.NewGinWithLogrus(logger.GinLog)` 装的 gin
   logger + recovery，以及 `metrics.InboundMetrics()`（见各 NF `internal/sbi/server.go`
   的 `newRouter`，例如 `NFs/amf/internal/sbi/server.go:77-78`）。因此 `T3 - G` 天然包含
   这两层的入口开销，第 10.2 节已据此更新。
 
-因此本计划的准确 A/B 口径是：
+因此本计划的准确口径是：
 
 ```text
 A：原有 T1/T2/T3/T4/T5/T6，共 6 次 time.Now()
@@ -225,7 +226,7 @@ marker 时共用一次 `time.Now()`。因此最常见/上界口径约为每 tran
 | 新点 | 相对原六点新增的同步热路径工作 | 日志输出增量 |
 |---|---|---|
 | M | 一次 `time.Now()`；一次 `atomic.Int64.Store`；`clientStream` 创建时一次 context 查找 | 在现有 client JSON 中增加 M 及关联字段，不增加日志行 |
-| G | 一次 `time.Now()`、一次普通字段赋值；创建 trace 时一次 `atomic.Uint64.Add` + 一个 trace 对象 alloc + 一个 `context.WithValue` node alloc | 在现有 server JSON 中增加 G 及关联字段，不增加日志行 |
+| G | serve goroutine 上：一次指针判空 + 一次 `time.Now()` + 一次普通字段赋值；`newWriterAndRequestNoBody` 里一次 `atomic.Uint64.Add`。**无堆分配、无 context 查找**（trace 内联进 `stream`，`stream` 自己实现 `context.Context`，见 12.1 B） | 在现有 server JSON 中增加 G 及关联字段，不增加日志行 |
 | W | `writeHeaderBlock` 一次指针赋值；`bufferedWriter.Write` 一次整数加法 + FIFO push；底层 Write 返回后命中时一次 `time.Now()` + 一次固定大小 non-blocking send | 每个完整 response 新增一条 W JSON event |
 
 M/G 的新增 JSON 字段仍由当前 `LogHTTP`/`LogHTTPInbound` 同步构造后再 enqueue；因此它们没有
@@ -454,13 +455,15 @@ Request 复制 + 一次 Request 分配，这是纯浪费：
 关于 `connID`：**保持现有 `GotConn` 闭包不变**（244-249 行），继续用
 `info.Conn.LocalAddr().String()`。理由：
 
-- 它已经是 A 组既有行为，不改就不引入 A1 级差异；
+- 它已经是 A 组既有行为，不改就不引入与新增点无关的差异；
 - 它与 fork 的 `instr.Conn().LocalAddr` 应当逐字符相同，正好可以作为**关联预检的自校验**：
   离线脚本比对二者，不一致即说明 attempt 与 GotConn 记录的连接不是同一条（retry 场景），
   该行直接判为 incomplete。
 
-若第 19 节的 A/B 显示这次 `LocalAddr().String()` 有可测开销，再作为 A1 级改动换成读
-`instr.Conn().LocalAddr`（fork 已预计算，零 allocation），并按 A0/A1/B 三组报告。
+若认为这次 `LocalAddr().String()` 的开销值得省掉，可换成读 `instr.Conn().LocalAddr`
+（fork 已预计算，零 allocation）——注意当前实现里 `ClientRequestTrace.Conn()` 尚无任何调用点，
+即 fork 每请求 store 了一份 identity 却没人读；改用它可以顺带去掉这次 allocation。
+这属于基础设施改动，报告时与 M/G/W 的新增成本分开陈述。
 
 `retryCount` 与 `wroteTime` 的既有语义要一起读：`wroteTime` 有 `IsZero()` 保护，保留的是
 **第一次**写完成的时间；而 `connID` 由 `GotConn` **后到覆盖**，保留的是最后一次。二者在
@@ -474,8 +477,8 @@ Request 复制 + 一次 Request 分配，这是纯浪费：
 最终 JSON 的准确构造位置是 `NFs/<nf>/internal/accesslog/accesslog.go` 的 `func LogHTTP(...)`。
 它当前在 T6 之后、`RoundTrip` wrapper 真正返回之前同步执行 `formatTime`、JSON append 和
 `enqueue(kindHTTP, b)`。增加 M/stream/retry 字段不会增加日志行，但这些新增字段的格式化与
-append 是 B 相对 A 的 latency 增量，而且发生在 T6 之后，不能只用九点内部时间差发现；必须同时
-用端到端 UE registration A/B 检查。
+append 是 B 相对 A 的 latency 增量，而且发生在 T6 之后，**不能只用九点内部时间差发现**——
+它只会体现在端到端 UE registration latency 上。
 
 ## 5. 是否需要 fork HTTP 库
 
@@ -749,23 +752,52 @@ URI 和时间顺序，在相同 request 并发且 handler/response 完成顺序�
 
 ### 12.1 本地 fork `xnet/http2/server.go`
 
-#### A. 增加 request-scoped server trace 状态
+#### A. 问题：G 会把工作放到 serve goroutine 上（原六点从未碰过这里）
+
+先说清楚**问题是什么**。原有 T3/T4 都在 **handler goroutine**（每请求一个，天然并行）；
+G 必须在 `go sc.runHandler(...)` 之前取时，也就是在 **serve goroutine** 上——每条连接**只有一个**。
+
+而 `connsPerPeer = 1` 把这件事放大了：
+
+```text
+UDM ──(唯一一条 TCP 连接)──> UDR
+                              └─ 唯一一个 serve goroutine
+                                 2000 reg/s 时串行处理约 18000 req/s
+```
+
+serve goroutine 是串行资源，**宿主机 CPU 没用满并不代表它没满**（一个 goroutine 最多用满
+一个核）。这正是此前 `C6525100g_TrueTR_0721_20ms` 的结论——时延爆炸发生在 CPU 有余量时，
+原因是序列化与排队，不是算力不够。所以这里加的每一点工作都要斤斤计较。
+
+按本计划的朴素写法，会往 serve goroutine 上加**四**样东西：
+
+| # | 加了什么 | 能否避免 |
+|---|---|---|
+| 1 | `&ServerRequestTrace{}` 堆分配 | **能**（内联进 `stream`） |
+| 2 | `context.WithValue` 节点堆分配 | **能**（让 `stream` 自己实现 `context.Context`） |
+| 3 | `scheduleHandler` 里一次 context 链查找 | **能**（沿调用链传指针） |
+| 4 | 一次 `time.Now()` | 不能——**这就是被测量本身** |
+
+下面的设计把 1/2/3 全部消掉，serve goroutine 上只剩第 4 项。
+
+#### B. 设计：trace 内联进 `stream`，`stream` 自己当 context（零额外分配）
 
 新增文件 `xnet/http2/instrument_server.go`：
 
 ```go
 package http2
 
-// serverRequestIDCounter 是 NF 进程级的单调计数器。
+// serverRequestIDCounter 是 NF 进程级单调计数器。
 var serverRequestIDCounter atomic.Uint64
 
-// ServerRequestTrace 的生命周期与一个 inbound HTTP/2 request 完全一致。
+// ServerRequestTrace 的生命周期与一个 inbound HTTP/2 request 一致。
 //
-// 可变性规约（必须严格遵守，否则会引入 data race）：
-//   - ID / ConnID / StreamID 在创建时写入，之后【只读】；
-//   - HandlerGo 由 serve goroutine 在 `go sc.runHandler` 之前写入一次，
-//     由 handler goroutine 读取，happens-before 由 go 语句提供；
-//   - 除此之外任何字段都不得再写。W 回调只读创建时字段，绝不读 HandlerGo。
+// 可变性规约（违反即 data race）：
+//   - ID / ConnID / StreamID 创建时写入，之后【只读】；
+//   - HandlerGo 由 serve goroutine 在 `go sc.runHandler` 之前写一次，
+//     由 handler goroutine 读，happens-before 由 go 语句提供；
+//   - W 回调只读前三个字段，【绝不】读 HandlerGo（frame-writer goroutine
+//     对它没有 happens-before 保障）。
 type ServerRequestTrace struct {
 	ID        uint64
 	ConnID    string // == sc.remoteAddrStr，每条连接一份不可变字符串
@@ -776,96 +808,151 @@ type ServerRequestTrace struct {
 type serverTraceKey struct{}
 
 // ServerRequestTraceFromContext 供 free5GC access-log 从 Request.Context() 读取。
-func ServerRequestTraceFromContext(ctx context.Context) *ServerRequestTrace
+func ServerRequestTraceFromContext(ctx context.Context) *ServerRequestTrace {
+	tr, _ := ctx.Value(serverTraceKey{}).(*ServerRequestTrace)
+	return tr
+}
 ```
 
-创建位置：`server.go:2297` 的 `(*serverConn).newWriterAndRequestNoBody`。真实代码在 2317-2329
-行构造 `*http.Request` 并以 `.WithContext(st.ctx)` 收尾（2328 行）。改为：
+**改动 1：`stream` 内联 trace（省掉分配 #1）**
+
+`stream` 本来就在 `newStream`（`server.go:2192`）里分配，把 trace 作为**值字段**塞进去，
+不产生任何新对象：
 
 ```go
-	tr := &ServerRequestTrace{
-		ID:       serverRequestIDCounter.Add(1),
-		ConnID:   sc.remoteAddrStr,
-		StreamID: st.id,
-	}
-	st.trace = tr // 新增 stream 字段，供 writeResHeaders / W 使用
-	req := (&http.Request{ /* 原字段不变 */ }).
-		WithContext(context.WithValue(st.ctx, serverTraceKey{}, tr))
+ type stream struct {
+ 	sc        *serverConn
+ 	id        uint32
+ 	...
++	trace     ServerRequestTrace // TYcustom：值字段，不是指针，零额外分配
+ }
 ```
 
-为什么放这里：
+**改动 2：`stream` 自己实现 `context.Context`（省掉分配 #2）**
 
-- `newWriterAndRequestNoBody` 是**唯一**创建 inbound `*http.Request` 的地方
-  （`newWriterAndRequest`（2228 行）内部调用它，2275 行；另一个调用者是 `startPush`，本部署
-  不可达）。放这里保证"一个 inbound request 恰好一个 ID"，不会给 reset-early 的 stream 白白
-  烧号。
-- 同时写 `st.trace`，让第三阶段的 `writeResHeaders` 可以从 `rws.stream.trace` 直接拿到，
-  不必再查 context。
-- 成本：每 request 一个 `ServerRequestTrace` alloc + 一个 `context.WithValue` node alloc。
-  必须计入第 19 节的 alloc benchmark。不要为了省这一个 node 去自定义 context 类型——
-  收益不抵风险。
-
-#### B. 在直接启动 handler 的路径记录 G
-
-`server.go:2354` 的 `(*serverConn).scheduleHandler`，改动在 2358-2359 行之间：
+已核实 `*stream` 现有方法只有 `isPushed / endStream / copyTrailersToHandlerRequest /
+onReadTimeout / onWriteTimeout / processTrailerHeaders`，**与 `context.Context` 的四个方法
+没有任何冲突**，可以直接实现：
 
 ```go
-	if sc.curHandlers < maxHandlers {
-		sc.curHandlers++
-		if tr := ServerRequestTraceFromContext(req.Context()); tr != nil {
-			tr.HandlerGo = time.Now() // G —— 普通赋值即可，go 语句提供 happens-before
-		}
-		go sc.runHandler(rw, req, handler)
-		return nil
+// stream 转发到自己已有的 st.ctx（newStream 里 context.WithCancel 的产物），
+// 只在 Value 上多认一个 key。这样 req.WithContext(st) 不需要额外的 valueCtx 节点。
+func (st *stream) Deadline() (time.Time, bool) { return st.ctx.Deadline() }
+func (st *stream) Done() <-chan struct{}       { return st.ctx.Done() }
+func (st *stream) Err() error                  { return st.ctx.Err() }
+func (st *stream) Value(k any) any {
+	if k == (serverTraceKey{}) {
+		return &st.trace
 	}
+	return st.ctx.Value(k)
+}
 ```
 
-这里只取时和赋值，不执行 JSON 格式化、channel 投递、文件 I/O 或同步日志调用。
-
-**但 `ServerRequestTraceFromContext(req.Context())` 这次 context 查找不是"随便放哪都行"的：
-`scheduleHandler` 跑在每条连接唯一的 `serve` goroutine 上**（函数第一行就是
-`sc.serveG.check()`）。serve goroutine 是该连接所有 stream 的串行瓶颈——它同时负责收 frame、
-建 stream、调度 handler、驱动 write scheduler。在这里多做的任何工作都会**按 stream 数放大**，
-直接推迟同一条连接上其它 request 的 G，而这恰恰是本实验要测的量。
-
-`context.Value` 是沿链表逐节点比较 key 的线性查找，`st.ctx` 的链是
-`baseCtx(含 LocalAddrContextKey、ServerContextKey 两层) -> WithCancel -> WithValue(我们的)`，
-我们的节点在最外层，所以命中在第一跳——成本很低，但不是零。
-
-因此**推荐直接把 `*ServerRequestTrace` 沿调用链传递，避开 serve goroutine 上的 context 查找**：
-`newWriterAndRequestNoBody` 已经把 trace 写进了 `st.trace`，而 `scheduleHandler` 的调用点
-（`processHeaders`）手上就有 `st`。最小改法是给 `scheduleHandler` 和 `unstartedHandler`
-各加一个 `trace *ServerRequestTrace` 字段/参数，热点退化成一次指针判空 + 一次赋值：
+然后 `newWriterAndRequestNoBody`（`server.go:2297`）里：
 
 ```go
-	if sc.curHandlers < maxHandlers {
-		sc.curHandlers++
-		if trace != nil {
-			trace.HandlerGo = time.Now() // G
-		}
-		go sc.runHandler(rw, req, handler)
-		return nil
-	}
+ 	tr := &st.trace                       // 指向内联字段，不分配
+ 	tr.ID = serverRequestIDCounter.Add(1)
+ 	tr.ConnID = sc.remoteAddrStr
+ 	tr.StreamID = st.id
+ 	req := (&http.Request{ /* 原字段不变 */ }).
+-		WithContext(st.ctx)
++		WithContext(st)                   // TYcustom：st 即 context，零额外分配
 ```
 
-context 查找方案作为备选保留（改动更小），但如果 A/B 显示 `G - T2` 在高 RQ 下有可疑抬升，
-优先怀疑这里。`InboundLogger` 那次 context 查找无所谓——它跑在 per-request 的 handler
-goroutine 上，不占用任何串行资源。
+**安全性检查（已核实）**：七个 NF 的服务端代码里**没有任何一处**包装或替换 inbound
+request 的 context（`grep -rn "\.WithContext(" NFs/*/internal/sbi/ NFs/*/internal/accesslog/`
+只命中 client 侧的 `httptransport.go:259`）。所以 `c.Request.Context()` 就是 `st` 本身，
+`Value()` 一步命中。即使将来有人包了一层，`Value()` 沿链向上仍然找得到，只是多走一跳。
+
+**改动 3：沿调用链传指针，不在 serve goroutine 上查 context（省掉查找 #3）**
+
+```go
+ type unstartedHandler struct {
+ 	streamID uint32
+ 	rw       *responseWriter
+ 	req      *http.Request
+ 	handler  func(http.ResponseWriter, *http.Request)
++	trace    *ServerRequestTrace // TYcustom
+ }
+
+ func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter,
+-	req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
++	req *http.Request, handler func(http.ResponseWriter, *http.Request),
++	trace *ServerRequestTrace) error {
+ 	sc.serveG.check()
+ 	maxHandlers := sc.advMaxStreams
+ 	if sc.curHandlers < maxHandlers {
+ 		sc.curHandlers++
++		if trace != nil {
++			trace.HandlerGo = time.Now() // G —— go 语句提供 happens-before，普通赋值即可
++		}
+ 		go sc.runHandler(rw, req, handler)
+ 		return nil
+ 	}
+```
+
+调用点在 `processHeaders` 里，手上就有 `st`，直接传 `&st.trace` 即可。
+
+**改动 4：正确性核验——把 `st` 当 context 传下去之后，从它派生子 context 仍然正常**
+
+这是这个设计最容易被质疑的一点，必须先说清楚。Go 的 `context.WithCancel(parent)` 内部会调
+`parentCancelCtx(parent)`，逻辑是：
+
+```go
+p, ok := parent.Value(&cancelCtxKey).(*cancelCtx)
+if !ok { return nil, false }                 // 退化成起一个 goroutine 监听，能用但更贵
+pdone, _ := p.done.Load().(chan struct{})
+if pdone != parent.Done() { return nil, false }
+return p, true                               // 走高效路径，直接挂到父 cancelCtx 上
+```
+
+我们的实现天然满足这两个条件：
+
+- `st.Value(&cancelCtxKey)` 会落到 `default` 分支转发给 `st.ctx.Value(...)`，
+  而 `st.ctx` 就是 `newStream` 里 `context.WithCancel(sc.baseCtx)` 产生的 `*cancelCtx`，
+  所以第一个条件成立；
+- `st.Done()` 直接返回 `st.ctx.Done()`，与上一步取到的 `p.done` 是**同一个 channel**，
+  第二个条件也成立。
+
+因此任何人（openapi、mongo driver、业务代码）从 `c.Request.Context()` 派生子 context
+都会走高效路径，行为与改动前完全一致，不会退化成"额外起一个 goroutine 监听父 Done"。
+
+另外三点也已核对：
+
+- `baseCtx` 里的 `http.LocalAddrContextKey` / `http.ServerContextKey` 仍可通过
+  `st.Value -> st.ctx.Value -> baseCtx` 取到，取值路径只多一跳；
+- `req.WithContext(ctx)` 只在 `ctx == nil` 时 panic，`st` 永不为 nil；
+- `runHandler` 的 `defer` 调的是 `rw.rws.stream.cancelCtx()`，与 `st.ctx` 一一对应，不受影响。
+
+**最终 serve goroutine 上的净增量：一次指针判空 + 一次 `time.Now()` + 一次赋值。**
+没有分配、没有 context 查找、没有 atomic（`serverRequestIDCounter.Add` 在
+`newWriterAndRequestNoBody` 里，也在 serve goroutine 上——若 profile 显示这个进程级共享
+计数器有 cache line 争用，按第 19.5 节 R2 改成 `sc` 上的每连接计数器，serve 单线程连
+atomic 都不需要）。
 
 #### C. 在排队后真正启动 handler 的路径记录 G
 
-`server.go:2374` 的 `(*serverConn).handlerDone`，改动在 2388-2389 行之间：
+`server.go:2374` 的 `(*serverConn).handlerDone`，改动在 2388-2389 行之间。
+trace 从 `unstartedHandler` 结构体里直接取（B 节已给它加了 `trace` 字段），
+**同样不查 context**：
 
 ```go
-		sc.curHandlers++
-		if tr := ServerRequestTraceFromContext(u.req.Context()); tr != nil {
-			tr.HandlerGo = time.Now() // G
-		}
-		go sc.runHandler(u.rw, u.req, u.handler)
+ 		sc.curHandlers++
++		if u.trace != nil {
++			u.trace.HandlerGo = time.Now() // G
++		}
+ 		go sc.runHandler(u.rw, u.req, u.handler)
 ```
 
-不能在 request 第一次进入 `unstartedHandlers`（2365 行）时写 G，否则 admission 等待会被错误
-算入 `T3 - G`。
+不能在 request 第一次进入 `unstartedHandlers`（2365 行）时写 G，否则 handler admission
+的排队等待会被错误算进 `T3 - G`（而它应该属于 `G - T2`）。
+
+#### D. `InboundLogger` 侧（handler goroutine，不是串行资源，无需苛求）
+
+读取走 `ServerRequestTraceFromContext(c.Request.Context())` 即可——它跑在每请求独立的
+handler goroutine 上，不占用任何串行资源，一次 `Value()` 命中的成本可以忽略。
+不需要为它做 B 节那样的优化。
 
 ### 12.2 free5GC server access log
 
@@ -922,7 +1009,8 @@ HTTP/1 或 trace 不存在时使用零值（`server_request_id: 0`、`stream_id:
 
 因此 G 的取时发生在 `go sc.runHandler` 之前；G 的 JSON 格式化则发生在 T4 之后、gin
 middleware 返回及 `rw.handlerDone()` 触发的自动 flush 之前。**这部分新增格式化会直接落进
-`W - T4`**，必须纳入 A/B。
+`W - T4`，也会直接推迟对端看到的 T5/T6**——这是三个点里对端到端 latency 影响最直接的一项，
+解释 `W - T4` 时必须记住它包含我们自己的日志构造。
 
 ### 12.3 各相关 NF 的 module 配置
 
@@ -1053,7 +1141,7 @@ server_response_send_path_us = W - T4
 按上面的真实链路，它包含：
 
 - **`LogHTTPInbound` 的 JSON 构造与 enqueue**（这是我们自己的 instrumentation 成本，B 组会比
-  A 组更大——必须在解释时扣除或至少报告）；
+  A 组更大——解释 `W - T4` 时必须报告这一项，不能当成被测系统的行为）；
 - 外层 metrics middleware 与 gin 链的收尾、`handler` 返回、`runHandler` 两层 defer；
 - 小 response 从 request-local 4 KiB buffer 提交出来（`rws.bw.Flush()`）；
 - 向 `wantWriteFrameCh`（容量 8）提交和可能的通道等待；
@@ -1257,7 +1345,7 @@ func ResponseHeadersFlushedDrops() uint64
 
 | 行号 | 场景 | 是否设 trace |
 |---|---|---|
-| `server.go:2717` | 最终 response HEADERS，位于 `if !rws.sentHeader { rws.sentHeader = true; ... }` 内 | **是**：`trace: rws.stream.trace` |
+| `server.go:2717` | 最终 response HEADERS，位于 `if !rws.sentHeader { rws.sentHeader = true; ... }` 内 | **是**：`trace: &rws.stream.trace`（trace 已内联进 `stream`，见 12.1 B，取地址即可） |
 | `server.go:2752` | trailer HEADERS | 否（留 nil） |
 | `server.go:2978` | 1xx informational HEADERS，位于 `writeHeader` 的 `code >= 100 && code <= 199` 分支 | 否（留 nil） |
 
@@ -1579,7 +1667,8 @@ duplicate/ambiguous match 必须为 0；missing/unmatched 允许低于预设上�
 如果 unmatched 呈系统性或显示两侧 connection identity 根本不同（说明 CNI/NAT 改写了源地址），
 不能回退到时间/UE/URI 近似配对，必须改用客户端生成并随 request header 传递的
 `sbi_request_id`（例如 `x-ty-req-id`），同时记录在 client 行、server 行和 W trace 中。
-该 header 会改变 HPACK 编码内容和帧长度，因此启用后必须重新跑第 19 节的扰动 A/B。
+该 header 会改变 HPACK 编码内容和帧长度，属于对被测系统的真实扰动，启用后必须在结论里
+明确声明。
 
 ### 17.4 实施后能否离线找到"哪个 UE 的哪个 request/response"
 
@@ -1812,7 +1901,7 @@ T4 <= W <= T5
    是"服务端写路径批量化"的直接证据；
 6. 对不同 request rate 比较 `W - T4` / `T5 - W` 的 p50、p95 和 p99；
 7. `W - T4` 上升、`T5 - W` 稳定：优先检查 server response 发送路径。注意 `W - T4` 里
-   **包含我们自己的 `LogHTTPInbound` JSON 构造**，解释前先用 A/B 扣除；
+   **包含我们自己的 `LogHTTPInbound` JSON 构造**，解释时必须先扣除或至少明确报告；
 8. `T5 - W` 上升、`W - T4` 稳定：优先检查内核/网络/client readLoop 路径；
 9. 两段同时上升：检查两端 CPU throttling、GC、goroutine 调度及共享连接饱和；
 10. 对每轮实验输出 `client_count`、`server_count`、`w_count`、`complete_nine_point_count`、
@@ -1838,7 +1927,7 @@ T4/W 位于被调方 Pod，T5 位于调用方 Pod。`W - T4` 在同一进程内�
 | 位置 | 每次做什么 | 为什么关键 |
 |---|---|---|
 | `scheduleHandler` / `handlerDone`（G） | 1 次指针判空 + 1 次 `time.Now()` + 1 次赋值 | 跑在**每条连接唯一的 serve goroutine** 上，按该连接的 stream 数放大。若用 context 查找还要多一次链表walk——见第 12.1 节 B，推荐改成传指针 |
-| `newWriterAndRequestNoBody`（G） | 1 次 `atomic.Uint64.Add` + **1 个 `ServerRequestTrace` 分配** + **1 个 `context.WithValue` 节点分配** | 同样在 serve goroutine 上；两个分配是 GC 压力的主要来源 |
+| `newWriterAndRequestNoBody`（G） | 1 次 `atomic.Uint64.Add` + 3 次字段赋值。**按 12.1 B 的设计没有任何堆分配**（trace 是 `stream` 的内联值字段，`req.WithContext(st)` 不需要 valueCtx 节点） | 在 serve goroutine 上。剩下的 atomic 是进程级共享计数器，若 profile 显示 cache line 争用，按 19.5 R2 改成每连接计数器 |
 | `InboundLogger` T4 之后（G） | 多格式化 1 个时间戳（`formatTime` 内部 `Format()` **会分配一个 string**）、多 append 4 个字段（约 150 B）、`uint64` 十进制转换、`conn` 字符串转义 | **这段代码位于 T4 与 `rw.handlerDone()` 之间**，它直接推迟 response HEADERS 的提交，因此**真实地增大 `W - T4`，也真实地增大对端看到的 T5/T6**。这是三个点里对端到端 latency 影响最直接的一项 |
 | `(*bufferedWriter).Write`（W） | 1 次指针判空 + 1 次 `uint64` 加法；命中时 1 次 slice append（可能触发扩容分配） | **每一帧都会执行**（DATA / WINDOW_UPDATE / PING / SETTINGS 全都经过），是三个点里频率最高的 hook，不是每 response 一次 |
 | `(*bufferedWriterTimeoutWriter).Write`（W） | 1 次 `uint64` 加法 + 1 次 slice 长度比较；命中时 1 次 `time.Now()` + N 次 non-blocking channel send | 跑在真正的 socket 写路径上，且这条路径已经被 `sc.writeHeaders` 的 `<-errc` 同步阻塞着 handler goroutine（第 14.7 节） |
@@ -1901,7 +1990,8 @@ marker FIFO、`produced`、`accepted` 都是 connection-local，**但 W 的事�
 **GC 才是这里最容易被低估的一项。** 三个新点本身的 CPU 指令数可以忽略，但每 transaction
 多约 7 个堆对象、日志字节数翻倍，会抬高 GC 频率与 assist 时间，而 GC assist 是**随机落在
 正在跑的业务 goroutine 上**的——它不会出现在九点的任何一段里，只会表现为 p99 抬升。
-这就是第 19.1 节坚持要用端到端 registration latency 做 A/B、而不能只看九点内部差值的原因。
+这就是"GC 尾延迟只能用端到端 registration latency 看出来、不能只看九点内部差值"的原因——
+无论是否做正式 A/B，解释 p99 时都要记住这一项不会出现在任何一段九点差值里。
 
 #### 已经可以确定"零增量"的地方
 
@@ -1917,60 +2007,64 @@ marker FIFO、`produced`、`accepted` 都是 connection-local，**但 W 的事�
 #### 一句话结论
 
 > 三个新点自身的**同步指令开销**很小（约 3 次 `time.Now()` + 若干 atomic/指针操作）；
-> 真正需要用 A/B 量出来的是三件事：**(a) `InboundLogger` 变宽的 JSON 直接落在 `W - T4` 上、
+> 真正需要留意（并在结论中报告）的是三件事：**(a) `InboundLogger` 变宽的 JSON 直接落在 `W - T4` 上、
 > (b) 每 transaction 多约 7 个堆对象带来的 GC 尾延迟、(c) W 事件 channel 这个新的进程级
 > 共享同步对象。** 前两项一定存在且可测；第三项在当前 `connsPerPeer = 1` 下预计可忽略，
 > 但必须 profile 确认，且连接数一旦调大就要重新评估。
 
-### 19.1 对照组
+### 19.1 前置检查：宿主机 clocksource 与 GOMAXPROCS
 
-在完全相同的镜像依赖、Pod CPU/内存限制、NF 数量、连接数、UE 数、registration 触发序列和日志
-采集介质下，至少比较：
+> **范围变更（0827）**：本节与 §19.2 原为"A0/A1/B 三组扰动 A/B"的对照组设计与必测负载/指标
+> 清单。按实验负责人的决定，**该开销 A/B 不在本计划范围内**——M/G/W 的 latency 影响由实验
+> 负责人自行衡量。这里只保留两项与 A/B 无关、但会直接改变开销量级或结论有效性的检查：本节的
+> 宿主机前置检查，以及 §19.2 的竞态/完整性验收。**§19.2 的 `go test -race` 是正确性验收，
+> 不随 A/B 一起取消。**
+>
+> 需要保留的术语：下文其余各节仍用 **A 组** 指"只有原六点的实现"、**B 组** 指"加上 M/G/W
+> 的实现"，仅作为描述用语，不再蕴含"必须跑对照实验"。
 
-```text
-A: 当前已有 HTTP access log，不包含 M/G/W
-B: 增加 M/G/W 后的实现
+**在写任何开销结论之前先跑这一条**，因为它能把"9 次取时"的成本放大 10-50 倍：
+
+```bash
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
 ```
 
-当前每个完整 HTTP transaction 已有一条 client JSON 和一条 server JSON。M/G 只让这两行变宽；
-W 增加第三行，因此记录行数从 `2` 变为 `3`，增量 `+50%`。此外 W 还多一次
-socket-writer → W collector 的 non-blocking send，再由 collector 调用一次现有 `enqueue`；
-这些都是 B 相对 A 的新增成本，不能只 benchmark 三次 `time.Now()`。
+- 结果是 `tsc`：`time.Now()` 走 vDSO，约 20-25 ns。9 次约 200 ns，可忽略，
+  本计划第 19.0 节的全部估算成立。
+- 结果是 `hpet` / `acpi_pm` / `xen`：vDSO 快路径失效，`time.Now()` 退化到
+  **数百 ns 甚至 1 µs**。此时 9 次取时就是 **5-9 µs/transaction**，
+  比本计划讨论的所有分配开销加起来还大一个量级——**这时"多三个点"才真的会有影响**。
 
-**必须用 A0/A1/B 三组的具体情形（本计划几乎必然触发）：**
+如果读到的不是 `tsc`，先解决 clocksource（或者接受并在结论里明确扣除）。
+这一项不改代码，5 秒就能查，却是所有开销假设里最容易被推翻的那个。
 
-```text
-A0: 当前原六点实现
-A1: 与 B 相同的 logger 容量/collector/参数签名基础设施，但 M/G/W 全部关闭
-B : 在 A1 基础上只打开 M/G/W
-```
+同理，若 Pod 设了 CPU limit 而 `GOMAXPROCS` 没有跟着设，GC worker 会加剧
+cgroup throttling；确认 `GOMAXPROCS` 与 limit 匹配（或用 `automaxprocs`）。
 
-之所以说"几乎必然"，是因为本计划至少会带来三处 A1 级基础设施改动：
+### 19.2 竞态与完整性验收（与开销 A/B 无关，不可省略）
 
-1. `LogHTTP`/`LogHTTPInbound` 的初始 buffer 容量必须上调（第 19.3 节第 8 条）；
-2. `accesslog.Flush()` 必须扩展为先排空 W 队列（第 16.3 节第 4 步）；
-3. 若把 `GotConn` 的 `LocalAddr().String()` 换成读 fork 预计算的字符串（第 4.2 节）。
-
-`B - A1` 才是 M/G/W 的纯增量；`A1 - A0` 单独报告。实验前必须给端到端 registration
-p50/p95/p99、throughput 和 success rate 定义可接受的等价阈值，不能在看到结果后再用
-"属于重复波动"解释。
-
-### 19.2 必测负载与指标
-
-- 覆盖正式实验的全部 request rate，并专门覆盖 UE registration 触发间隔小于 1 ms 的最高目标负载；
-- 使用相同的预热时间、采样时间、UE 数和重复轮数；不得只比较单轮；
-- 比较端到端 registration latency 的 p50、p95、p99、最大值、成功率和实际吞吐；
-- 比较各 NF 的 CPU、memory、GC、**allocations/op**（本计划新增了每 request 的
-  `ServerRequestTrace` + `context.WithValue` node + `ClientRequestTrace` 三个对象，
-  这是最需要盯的指标）、goroutine 数、context switch、throttling、HTTP/2 connection 数
-  和 reconnect 数；
-- 比较现有 access-log queue 与 W event queue 的最大占用和 drop counter；
 - **必须跑 `go test -race`**，且要覆盖两条已知的并发读写路径：
   (a) 客户端 `ctx.Done()`/`reqCancel` 提前返回时外层读 `ClientRequestTrace`（第 4.1 节 D）；
   (b) 服务端 `bufferedWriter` 的 marker 状态在 serve goroutine 与 `writeFrameAsync`
   goroutine 之间交替访问（第 15.1 节 C）。
-  用 mutex/block profile（`LOCK_SCHED_PROFILING_GUIDE_0826.md` 已启用）确认没有新增会随并发
-  增长的锁等待或阻塞 channel send。
+
+  特别注意 (b)：`writeResHeaders.staysWithinBuffer()` 恒为 `false`，因此 response HEADERS
+  走的是 `startFrameWrite` 的 `go sc.writeFrameAsync(wr, nil)` 分支——**marker 的 arm 与
+  `(*bufferedWriter).Write` 并不在 serve goroutine 上执行**。无锁访问的正确性完全依赖
+  `sc.writingFrame` 断言与 `sc.wroteFrameCh` 提供的 happens-before，必须用 race detector
+  实测坐实，不能只靠推理。
+
+- 每个 NF module 先跑 `go build ./... && go vet ./...`，确认本地 fork 的 `replace` 与
+  `writeContext` 接口新增方法、`newBufferedWriter` 签名变更没有破坏编译（含 fork 自带测试）。
+
+- 用 mutex/block profile（`LOCK_SCHED_PROFILING_GUIDE_0826.md` 已启用）确认没有新增会随并发
+  增长的锁等待或阻塞 channel send，**特别是 W 事件 channel**（见第 19.0 节类别二）。
+
+- **必须把三个计数器输出到日志**，否则第 19.6 节的完整率/正确性条件无法评估：
+  `accesslog.Dropped()`、`http2.ResponseHeadersFlushedDrops()`、`http2.WAccountingErrors()`。
+  当前实现里这三个函数都还没有任何调用点，需要补一条周期性（或随 `Flush()` 一起）输出的
+  统计行。注意 `WAccountingErrors` 在任何一次连接写错误之后都会合法地 +1，因此报警条件是
+  "非零**且**该轮没有连接写错误"。
 
 ### 19.3 热路径验收
 
@@ -2012,8 +2106,7 @@ p50/p95/p99、throughput 和 success rate 定义可接受的等价阈值，不�
    | W（新建） | — | 约 230 | **320** |
 
    注意 RFC3339Nano 会去掉纳秒尾部的零，所以行长有波动；上表按 max 留余量。
-   容量只在 B 中改变会掩盖新增点成本，因此必须走 A0/A1/B 三组，
-   并把"修容量"这件事明确归到 A1。
+   注意这一项同时让原六点变快，所以它不是 M/G/W 的成本，报告时要与新增点的成本分开陈述。
 
 ### 19.4 【新增】高 RQ（0.5 ms 一个 UE reg）下的必做项与优先级
 
@@ -2062,11 +2155,11 @@ W 只由 **server 端**产生，所以纯 client 的 NF 完全不受影响：
    但 UDR 此前已被排除为瓶颈（48 核宿主机平均约 12% CPU），且它不在 AMF 的
    goroutine 排队路径上。
 
-#### 必做项（按收益排序，全部是 A1 级改动）
+#### 必做项（按收益排序；这些都同时让原六点变快，成本要与 M/G/W 分开报告）
 
 | 优先级 | 项目 | 消除的开销（2000 reg/s，全系统） | 说明 |
 |---|---|---|---|
-| **P1** | **修正 buffer 预留容量**（见 19.3 第 8 条） | 约 **-40 MB/s** 分配 + 每行一次整行 memcpy | 修现有 bug。**单项收益最大**，而且是 A 组今天就在付的成本 |
+| **P1** | **修正 buffer 预留容量**（见 19.3 第 8 条） | 约 **-40 MB/s** 分配 + 每行一次整行 memcpy | 修现有 bug。**分配量上收益最大，但要说清楚它的直接同步开销只有约 40-80 ns/transaction**——真正的价值是降 GC 压力。在 CPU 有余量时 GC 后台 worker 能吸收大部分，所以这是"白捡的收益"，不是"不修就会出事" |
 | **P2** | **行缓冲复用**（`sync.Pool`，writer 写完归还） | 约 **-45 MB/s** 分配 | 这是剩下的最大来源。生产者取、writer 还；drop 的那条不归还即可 |
 | **P3** | **`queueCapacity` 按实测峰值下调** | 每 GC cycle 少扫 **62 MiB**（64 -> 2 MiB） | 先测峰值占用；若从未超过几千，`1<<16` 足够。或改成不含指针的元素类型 |
 | **P4** | **`AppendFormat`**（见 19.5 手段 1） | 约 **-12 MB/s** 分配 + 约 270 字节/tx 的转义扫描 | 顺带让原六点也变快 |
@@ -2089,6 +2182,58 @@ W 只由 **server 端**产生，所以纯 client 的 NF 完全不受影响：
 
 （上面每个数字都是从实测行长 + 已知 transaction 速率推算的估算，
 不是 benchmark 结果。必须用 19.5 节那个 `bench_test.go` 和 `GODEBUG=gctrace=1` 实测替换。）
+
+#### P1 的具体改法（可直接照抄，七个 NF 各一份）
+
+文件：`NFs/<nf>/internal/accesslog/accesslog.go`。实测各日志行长度与现有预留容量：
+
+| 函数 | 实测 avg / max | 现有 cap | 结论 | 改成 |
+|---|---|---|---|---|
+| `LogHTTP`（client 行） | 437 / 479 | 304 | **每行都溢出** | **640** |
+| `LogHTTPInbound`（server 行） | 277 / 320 | 256 | **多数行溢出** | **512** |
+| `LogDB` | 253 / 269 | 256 | 约半数溢出 | **320** |
+| `LogWorker` | 519 / 963 | `256 + n*128` | 基数偏小 | **`384 + n*160`** |
+| `LogNGAP` | 138 / 145 | 160 | **没有溢出，不要动** | 160（不变） |
+
+上表是**加 M/G/W 之前**的实测。加上新字段后 client 行约 +95 B、server 行约 +150 B，
+所以 640 / 512 已经把新字段算进去了。
+
+具体的三处 diff：
+
+```go
+// LogHTTP：304 -> 640
+// 实测 client 行 avg 437 / max 479（尚未含 M/stream_id/retry_count 的约 +95 B）。
+// 原值 304 导致每一行都触发一次 growslice + 整行 memcpy。
+- b := make([]byte, 0, 304)
++ b := make([]byte, 0, 640)
+
+// LogHTTPInbound：256 -> 512
+// 实测 server 行 avg 277 / max 320（尚未含 server_request_id/conn/stream_id/G 的约 +150 B）。
+- b := make([]byte, 0, 256)
++ b := make([]byte, 0, 512)
+
+// LogDB：256 -> 320   实测 avg 253 / max 269，卡在边界上
+- b := make([]byte, 0, 256)
++ b := make([]byte, 0, 320)
+
+// LogWorker：基数与每 SBI 增量都偏小（实测 avg 519 / max 963）
+- b := make([]byte, 0, 256+len(sbi)*128)
++ b := make([]byte, 0, 384+len(sbi)*160)
+```
+
+W 行是新增的，初始容量直接给 **320**（实测同类字段约 230 B）。
+
+`LogNGAP` 的 160 是唯一预留正确的一个（avg 138 / max 145），**不要改**——
+改大它只会白占内存。
+
+**这属于基础设施级改动**（它同时让原六点变快），报告时必须与 M/G/W 的新增成本分开陈述，
+否则会把新增点的成本掩盖掉。
+
+**关于它到底有多重要，要说实话：** 直接的同步开销只有约 40-80 ns/transaction
+（一次多余分配 + 一次整行 memcpy）。真正的价值是把分配速率从约 70 MB/s 降到约 45 MB/s，
+降低 GC 频率。在 CPU 有余量时 GC 后台 worker 能吸收大部分，所以这是
+**"改两个常量白捡的收益"，不是"不改就会出事"**。之所以排在 P1，是因为它收益/改动比最高，
+而不是因为它最危险。
 
 #### 与分配无关、必须单独盯的三项
 
@@ -2186,7 +2331,7 @@ func (t Time) Format(layout string) string {
 1. **分配速率**。按每 transaction 约 288 B、全核心 42000 transaction/s 估算，
    仅时间戳字符串就是约 **12 MB/s 的垃圾**（分摊到 7 个 NF 进程）。消掉它降低 GC 频率，
    而 GC assist 是随机落在业务 goroutine 上的——**这部分只影响 p99，且不会出现在九点的
-   任何一段里**。这正是第 19.1 节坚持要用端到端 registration latency 做 A/B 的原因。
+   任何一段里**——它只会体现在端到端 registration latency 的 p99 上。
 2. **它让 B 组的日志路径比 A 组更便宜**，从而把 W 那条新增日志行的成本部分抵掉。
    问题从"打点会不会拖慢系统"变成"我们既让日志更便宜、又多了一个点"。
 
@@ -2271,8 +2416,8 @@ func BenchmarkLineFormatAppend(b *testing.B) {
 b = append(b, `,"req_time":`...)   // 一次 memmove，替代 append+逐字节扫描+append
 ```
 
-指令数上这一项甚至比时间戳那项更大（虽然不省分配）。属于同一批 A1 级改动，
-要做就一起做、一起进 A1 组。
+指令数上这一项甚至比时间戳那项更大（虽然不省分配）。属于同一批「顺带修掉现有浪费」的改动，
+要做就一起做，并与 M/G/W 的成本分开报告。
 
 #### 手段 2（收益最大，改动中等）：把 server 行的 JSON 构造整体移出 T4 路径
 
@@ -2298,10 +2443,10 @@ T4 之后只剩：读 trace（几次字段读）+ 一次结构体赋值 + 一次
 
 1. `method` / `uri` / `ue_id` 都是已经存在的 string，放进 struct 只拷贝 header，不分配。
    但 **`uri` 来自 `inboundURI(c.Request)`，它内部 `u.String()` 本来就会分配一个 string**——
-   这笔开销在 T3 之前，A/B 两组相同，不用动。
+   这笔开销在 T3 之前，与是否新增 M/G/W 无关，不用动。
 2. 结构体较大（约 130 B），按值进 channel 会拷贝。相比省下的格式化，仍然划算。
-3. 这同样是 **A1 级改动**，而且它把 client 行也一并搬走才公平（否则 client/server 两侧
-   的日志路径不对称，A/B 更难解释）。
+3. 这同样是**同时让原六点变快的基础设施改动**，而且它把 client 行也一并搬走才公平
+   （否则 client/server 两侧的日志路径不对称，两侧的数字不再可比）。
 
 #### 手段 3（不推荐，仅记录）：让 W collector 合并输出一条 server 行
 
@@ -2322,7 +2467,7 @@ W 永不到达时的超时回收，复杂度明显更高，且会引入一个新
 
 | # | 剩余开销 | 怎么省 |
 |---|---|---|
-| R1 | 服务端每 request 一个 `&ServerRequestTrace{}` 分配（约 48 B，在 serve goroutine 上） | **改成 `stream` 的值字段**：`newStream` 本来就要分配 `stream`，把 trace 内联进去（`st.trace ServerRequestTrace`），到处传 `&st.trace`。**净省 1 次分配 / request**。代价：marker FIFO 持有的指针会让整个 `stream`（约 200 B）多存活到 W 触发为止——但那只有微秒级，可以接受 |
+| R1 | ~~服务端每 request 一个 `&ServerRequestTrace{}` 分配~~ | **已提升为默认设计，见 12.1 B**：trace 内联进 `stream`（值字段），`stream` 自己实现 `context.Context`。同时消掉 trace 分配与 `context.WithValue` 节点两次分配。唯一代价：marker FIFO 的指针会让整个 `stream`（约 200 B）多存活到 W 触发，微秒级，可接受 |
 | R2 | `server_request_id` 的进程级 `atomic.Uint64.Add`。它是**全进程共享的一个 cache line**，UDR 在高 RQ 下每请求都要抢一次 | **它其实是冗余的**：server JSON 与 W event 的 join 完全可以用 `(dst, conn, stream_id)`——两边本来就都有这两个字段，而且这个 join 是**同一个 Pod 内部**的，`conn` 不需要跨 Pod 规范化，比 client<->server 那个 join 更安全。去掉后省：1 次共享 atomic、trace 里 8 B、server 行约 42 B、W 行约 42 B。**若保留，也应改成 `sc` 上的每连接计数器**（serve goroutine 单线程，连 atomic 都不需要），join key 用 `(dst, conn, server_request_id)` |
 | R3 | 客户端 2 次分配：`&ClientRequestTrace{}` + `WithClientRequestTrace` 的 context 节点 | 让 `ClientRequestTrace` **自己实现 `context.Context`**（内嵌 parent ctx，`Value()` 命中自己的 key 时返回 self），一个对象同时当 trace 和 ctx 节点，**2 次分配降到 1 次**。约 20 行，无行为变化 |
 
@@ -2368,9 +2513,9 @@ W 永不到达时的超时回收，复杂度明显更高，且会引入一个新
 
 ### 19.6 正式实验准入条件
 
-- A/B 结果表明新增 M/G/W 的端到端 registration latency、throughput 和成功率变化不超过实验前
-  预先定义的扰动预算；超过预算时必须先定位/优化，并在使用九点数据解释系统 latency 前扣除或
-  明确报告 instrumentation effect；
+- （开销 A/B 已按实验负责人决定移出本计划范围。）使用九点数据解释系统 latency 时，必须显式
+  报告已知的 instrumentation effect：`InboundLogger` 变宽的 JSON 落在 `W - T4` 与对端 T5/T6 上、
+  每 transaction 多一条 W 日志行、以及 GC 尾延迟不出现在任何一段九点差值里；
 - HTTP/W 日志队列的 drop/missing rate 低于实验前确定的允许上限；完整率必须随 NF、URI 和
   request rate 一起报告，不能隐藏选择性缺失；
 - exact-join 预检无 duplicate/ambiguous match，且 client `conn` 与 fork 快照 `LocalAddr`
@@ -2421,6 +2566,7 @@ W 永不到达时的超时回收，复杂度明显更高，且会引入一个新
 | 35 | 把"内存大"当作可以放心加大队列的理由 | `queueCapacity = 1<<21` x `record`(32 B) = **64 MiB 含指针的 hchan.buf**，每个 GC cycle 全量扫描，每 NF 一份；队列空也要扫 | 内存大反而变成 GC 负担 | 新增 §19.4：把 queueCapacity 按实测峰值下调列为 P3（64 -> 2 MiB） |
 | 36 | 只说 W 让日志行数 +50% | **实测各 NF 差异极大**：AMF **+0%**（纯 client，不产生 W）、UDR **+100%**（纯 server）、UDM +47%、AUSF/PCF +50% | +50% 只是系统平均，掩盖了 AMF 完全不受影响这个有利事实 | 新增 §19.4 per-NF 表；结论应写明**已知瓶颈 AMF 的新增日志行为 0** |
 | 37 | 优化项没有按高 RQ 收益排序 | 实测推算：修容量约 -40 MB/s、行缓冲复用约 -45 MB/s、AppendFormat 约 -12 MB/s | 之前把 AppendFormat 排在第一，实际它只排第三 | 新增 §19.4 P1-P7 优先级表；做完 P1+P2+P4 后 9 点的 B 组分配速率比今天 6 点的 A 组低一个数量级 |
+| 38 | §12.1 原写法把 trace 与 context 节点都堆分配，并在 `scheduleHandler` 里查 context | 这三样全落在**每条连接唯一的 serve goroutine** 上；`connsPerPeer=1` 时 UDM->UDR 全部约 18000 req/s 串行经过它。宿主机 CPU 有余量**不代表**这个 goroutine 有余量 | 会污染 `G - T2` 这个被测量本身 | §12.1 A/B/C/D 整节重写为零分配设计：trace 内联进 `stream`、`stream` 自己实现 `context.Context`（已核实与其 6 个现有方法无冲突）、`scheduleHandler`/`unstartedHandler` 传指针。serve goroutine 上只剩 `time.Now()`。并核验了从 `st` 派生子 context 仍走 `parentCancelCtx` 高效路径 |
 
 ### 20.1 仍然成立、无需修改的 v1 结论
 
@@ -2431,7 +2577,7 @@ W 永不到达时的超时回收，复杂度明显更高，且会引入一个新
 - G 的两个位置 `server.go:2359`（`scheduleHandler`）与 `server.go:2389`（`handlerDone`）
   **行号完全准确**，且"不能在进入 `unstartedHandlers` 时写 G"的理由成立；
 - `newWriterAndRequestNoBody` 确实以 `.WithContext(st.ctx)` 收尾（2328 行），是创建 server
-  trace 的正确位置；
+  trace 的正确位置；（v2 在此基础上改成 `.WithContext(st)`，见 12.1 B——位置不变，只是不再额外分配 context 节点）
 - `advMaxStreams` 默认 250（`defaultMaxStreams`）；
 - T5 确实等到完整 header block 读取并 HPACK 解码后才触发；
 - 必须 fork `x/net/http2`、不需要 fork 标准库；三阶段共用一份 fork；
@@ -2445,12 +2591,15 @@ W 永不到达时的超时回收，复杂度明显更高，且会引入一个新
         —— 之后每次 git diff 就是 instrumentation 的精确清单
 
 步骤 1  七个 NF go.mod 加 replace + go mod tidy，不改任何代码，构建并跑一轮基线
-        —— 确认 replace 本身零影响（这一轮就是 A0）
+        —— 确认 replace 本身零影响（build list 不变）
 
 步骤 2  第一阶段 M：instrument_client.go + transport.go 五处改动 + LogHTTP 字段
-        验证 T1 <= M <= T2，跑 A/B
+        验证 T1 <= M <= T2
 
-步骤 3  第二阶段 G：instrument_server.go + server.go 三处改动 + LogHTTPInbound 字段
+步骤 3  第二阶段 G：instrument_server.go + server.go 改动 + LogHTTPInbound 字段
+        必须按 12.1 B 的零分配设计做：trace 内联进 stream、stream 实现 context.Context、
+        scheduleHandler/unstartedHandler 传 *ServerRequestTrace 指针。
+        验收标准：serve goroutine 上只多一次 time.Now()，benchmark 显示 0 allocs
         —— 此时 conn / stream_id / server_request_id 齐了，先做第 17.3 节的关联预检
         （client<->server 的 (dst, conn, stream_id) 一对一）
         这一步是整个计划的风险闸门：预检不过就不要继续做 W
@@ -2459,5 +2608,6 @@ W 永不到达时的超时回收，复杂度明显更高，且会引入一个新
         + Flush() 扩展 + 七个 sbi/server.go 注入
         验证 T4 <= W <= T5（按 4 KiB 分组），输出 batch_size 分布
 
-步骤 5  完整 A0/A1/B 三组扰动测试 + go test -race，通过第 19.6 节准入条件后才采正式数据
+步骤 5  go build/vet + go test -race（第 19.2 节两条并发路径）+ clocksource 前置检查
+        + 三个 drop/error 计数器接出来，通过第 19.6 节准入条件后才采正式数据
 ```

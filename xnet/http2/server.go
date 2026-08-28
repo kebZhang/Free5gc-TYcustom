@@ -172,6 +172,19 @@ type Server struct {
 	// The errType consists of only ASCII word characters.
 	CountError func(errType string)
 
+	// ResponseHeadersFlushed is TYcustom instrumentation. If non-nil, one event
+	// is delivered for each response whose complete HEADERS/CONTINUATION block
+	// has been accepted by the underlying net.Conn.Write.
+	//
+	// It is deliberately a channel and not a callback: the send happens on the
+	// goroutine that owns the socket, and an arbitrary caller-supplied function
+	// there could block or panic. Delivery is non-blocking; when the channel is
+	// full the event is dropped and counted by ResponseHeadersFlushedDrops.
+	//
+	// The consumer must be a long-lived goroutine. Nothing in this package
+	// formats or writes a log record.
+	ResponseHeadersFlushed chan<- ResponseHeadersFlushedEvent
+
 	// Internal state. This is a pointer (rather than embedded directly)
 	// so that we don't embed a Mutex in this struct, which will make the
 	// struct non-copyable, which might break some callers.
@@ -430,13 +443,17 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 
 	http1srv := opts.baseConfig()
 	conf := configFromServer(http1srv, s)
+	// TYcustom: compute the peer address once and share it. It is both the
+	// existing remoteAddrStr and the W events' conn field, and RemoteAddr()
+	// .String() allocates.
+	remoteAddrStr := c.RemoteAddr().String()
 	sc := &serverConn{
 		srv:                         s,
 		hs:                          http1srv,
 		conn:                        c,
 		baseCtx:                     baseCtx,
-		remoteAddrStr:               c.RemoteAddr().String(),
-		bw:                          newBufferedWriter(c, conf.WriteByteTimeout),
+		remoteAddrStr:               remoteAddrStr,
+		bw:                          newBufferedWriter(c, conf.WriteByteTimeout, s.ResponseHeadersFlushed, remoteAddrStr),
 		handler:                     opts.handler(),
 		streams:                     make(map[uint32]*stream),
 		readFrameCh:                 make(chan readFrameResult),
@@ -694,11 +711,20 @@ type stream struct {
 
 	trailer    http.Header // accumulated trailers
 	reqTrailer http.Header // handler's Request.Trailer
+
+	// TYcustom: instrumentation state, inline so that creating it costs no
+	// allocation on the serve goroutine. See instrument_server.go.
+	trace ServerRequestTrace
 }
 
 func (sc *serverConn) Framer() *Framer  { return sc.framer }
 func (sc *serverConn) CloseConn() error { return sc.conn.Close() }
 func (sc *serverConn) Flush() error     { return sc.bw.Flush() }
+
+// armResponseHeaderMarker implements the TYcustom part of writeContext.
+func (sc *serverConn) armResponseHeaderMarker(tr *ServerRequestTrace) {
+	sc.bw.armResponseHeaderMarker(tr)
+}
 func (sc *serverConn) HeaderEncoder() (*hpack.Encoder, *bytes.Buffer) {
 	return sc.hpackEncoder, &sc.headerWriteBuf
 }
@@ -2113,7 +2139,7 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 		st.readDeadline = time.AfterFunc(sc.hs.ReadTimeout, st.onReadTimeout)
 	}
 
-	return sc.scheduleHandler(id, rw, req, handler)
+	return sc.scheduleHandler(id, rw, req, handler, &st.trace) // TYcustom
 }
 
 func (sc *serverConn) upgradeRequest(req *http.Request) {
@@ -2136,7 +2162,17 @@ func (sc *serverConn) upgradeRequest(req *http.Request) {
 	// This is the first request on the connection,
 	// so start the handler directly rather than going
 	// through scheduleHandler.
+	//
+	// TYcustom: this path bypasses newWriterAndRequestNoBody, so the trace has
+	// to be initialised and attached here. Unreachable on this deployment (the
+	// NF clients speak prior-knowledge h2c, so ServeConnOpts.UpgradeRequest is
+	// always nil), but instrumented so that "server record with no G" stays an
+	// impossible state rather than something to investigate after the fact.
+	st.initTrace()
+	req = req.WithContext(st)
+	rw.rws.req = req
 	sc.curHandlers++
+	st.trace.HandlerGo = time.Now()
 	go sc.runHandler(rw, req, sc.handler.ServeHTTP)
 }
 
@@ -2297,6 +2333,8 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.ServerRequestParam) (*responseWriter, *http.Request, error) {
 	sc.serveG.check()
 
+	st.initTrace() // TYcustom
+
 	var tlsState *tls.ConnectionState // nil if not scheme https
 	if rp.Scheme == "https" {
 		tlsState = sc.tlsState
@@ -2325,7 +2363,10 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 		Host:       rp.Authority,
 		Body:       body,
 		Trailer:    res.Trailer,
-	}).WithContext(st.ctx)
+		// TYcustom: st itself is the context. It forwards everything to st.ctx
+		// except the trace key, so this carries the trace to InboundLogger
+		// without allocating a context.WithValue node.
+	}).WithContext(st)
 	rw := sc.newResponseWriter(st, req)
 	return rw, req, nil
 }
@@ -2347,26 +2388,42 @@ type unstartedHandler struct {
 	rw       *responseWriter
 	req      *http.Request
 	handler  func(http.ResponseWriter, *http.Request)
+	trace    *ServerRequestTrace // TYcustom
 }
 
 // scheduleHandler starts a handler goroutine,
 // or schedules one to start as soon as an existing handler finishes.
-func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
+//
+// TYcustom: trace is passed as an argument rather than looked up from
+// req.Context(). This function runs on the serve goroutine -- one per
+// connection, carrying every stream on it -- so a context-chain walk here would
+// scale with the connection's request rate.
+func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request), trace *ServerRequestTrace) error {
 	sc.serveG.check()
 	maxHandlers := sc.advMaxStreams
 	if sc.curHandlers < maxHandlers {
 		sc.curHandlers++
+		if trace != nil {
+			// TYcustom G (server_handler_go_time). Must be immediately before
+			// the `go` statement: after it the new goroutine may already be
+			// running, and the `go` statement is also what gives the handler
+			// goroutine a happens-before edge for this plain assignment.
+			trace.HandlerGo = time.Now()
+		}
 		go sc.runHandler(rw, req, handler)
 		return nil
 	}
 	if len(sc.unstartedHandlers) > int(4*sc.advMaxStreams) {
 		return sc.countError("too_many_early_resets", ConnectionError(ErrCodeEnhanceYourCalm))
 	}
+	// Deliberately no G here: from this point the request waits for handler
+	// admission, and that wait belongs to the interval before G, not after it.
 	sc.unstartedHandlers = append(sc.unstartedHandlers, unstartedHandler{
 		streamID: streamID,
 		rw:       rw,
 		req:      req,
 		handler:  handler,
+		trace:    trace,
 	})
 	return nil
 }
@@ -2386,6 +2443,9 @@ func (sc *serverConn) handlerDone() {
 			break
 		}
 		sc.curHandlers++
+		if u.trace != nil {
+			u.trace.HandlerGo = time.Now() // TYcustom G, see scheduleHandler
+		}
 		go sc.runHandler(u.rw, u.req, u.handler)
 		sc.unstartedHandlers[i] = unstartedHandler{} // don't retain references
 	}
@@ -2722,6 +2782,11 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			contentType:   ctype,
 			contentLength: clen,
 			date:          date,
+			// TYcustom: the only writeResHeaders that carries a trace. This
+			// branch sits inside `if !rws.sentHeader`, so it runs exactly once
+			// per response; the trailer and 1xx header blocks built elsewhere
+			// leave trace nil and produce no W.
+			trace: &rws.stream.trace,
 		})
 		if err != nil {
 			return 0, err
@@ -3232,6 +3297,10 @@ func (sc *serverConn) startPush(msg *startPushRequest) {
 		}
 
 		sc.curHandlers++
+		// TYcustom G. Unreachable on this deployment (no NF calls Pusher.Push),
+		// but instrumented anyway so that a server record can never exist
+		// without a G to explain it.
+		promised.trace.HandlerGo = time.Now()
 		go sc.runHandler(rw, req, sc.handler.ServeHTTP)
 		return promisedID, nil
 	}

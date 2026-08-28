@@ -256,14 +256,39 @@ type bufferedWriter struct {
 	conn        net.Conn      // immutable
 	bw          *bufio.Writer // non-nil when data is buffered
 	byteTimeout time.Duration // immutable, WriteByteTimeout
+
+	// TYcustom: W instrumentation. Every field here is connection-local and
+	// needs no lock, because at most one frame is being written to a connection
+	// at any instant (serverConn.writingFrame), and the happens-before between
+	// the serve goroutine and a writeFrameAsync goroutine is supplied by the
+	// `go` statement that starts it and by sc.wroteFrameCh on the way back.
+	//
+	// This type is used by the server only -- newBufferedWriter has exactly one
+	// caller -- so none of this touches the client path.
+	wSink    chan<- ResponseHeadersFlushedEvent // nil disables W entirely
+	connID   string                             // immutable, == sc.remoteAddrStr
+	produced uint64                             // bytes handed to bufio so far
+	accepted uint64                             // bytes the kernel has taken so far
+	pending  *ServerRequestTrace                // armed by writeHeaderBlock, consumed by the next Write
+	markers  wMarkerRing                        // offsets awaiting settlement, ascending
 }
 
-func newBufferedWriter(conn net.Conn, timeout time.Duration) *bufferedWriter {
+func newBufferedWriter(conn net.Conn, timeout time.Duration, wSink chan<- ResponseHeadersFlushedEvent, connID string) *bufferedWriter {
 	return &bufferedWriter{
 		conn:        conn,
 		byteTimeout: timeout,
+		wSink:       wSink,
+		connID:      connID,
 	}
 }
+
+// armResponseHeaderMarker records that the very next Write carries the last
+// fragment of tr's response header block. Passing nil clears it.
+//
+// Invariant: at most one marker is ever pending, and it always belongs to the
+// frame written immediately afterwards. (*bufferedWriter).Write is the only
+// consumer and clears it as soon as it has converted it to a byte offset.
+func (w *bufferedWriter) armResponseHeaderMarker(tr *ServerRequestTrace) { w.pending = tr }
 
 // bufWriterPoolBufferSize is the size of bufio.Writer's
 // buffers created using bufWriterPool.
@@ -292,7 +317,22 @@ func (w *bufferedWriter) Write(p []byte) (n int, err error) {
 		bw.Reset((*bufferedWriterTimeoutWriter)(w))
 		w.bw = bw
 	}
-	return w.bw.Write(p)
+	// TYcustom: turn the pending marker into an exact byte offset BEFORE handing
+	// p to bufio. Framer.endWrite calls this once per whole frame, so
+	// produced+len(p) is precisely the offset one past that frame's last byte --
+	// no assumption about padding or priority fields, unlike computing it from
+	// the fragment length. It must happen before the bufio call because bufio
+	// may pass straight through to the kernel inside that same call, and the
+	// marker has to already be queued when it does.
+	if w.pending != nil {
+		if !w.markers.push(wMarker{endOffset: w.produced + uint64(len(p)), trace: w.pending}) {
+			responseHeadersFlushedDrops.Add(1)
+		}
+		w.pending = nil
+	}
+	n, err = w.bw.Write(p)
+	w.produced += uint64(n)
+	return n, err
 }
 
 func (w *bufferedWriter) Flush() error {
@@ -301,16 +341,86 @@ func (w *bufferedWriter) Flush() error {
 		return nil
 	}
 	err := bw.Flush()
+	// TYcustom self-check, free of charge. A successful Flush means every
+	// buffered byte reached the kernel, so every marker must have been settled
+	// and the two byte counters must agree. If they do not, the offset
+	// bookkeeping has a bug and the W data is invalid -- count it rather than
+	// letting the run look clean.
+	//
+	// The failing branch is expected after a write error, where Reset(nil) below
+	// discards buffered bytes and the counters part company permanently. That
+	// connection is finished anyway.
+	if err == nil && (w.markers.n != 0 || w.produced != w.accepted) {
+		wAccountingErrors.Add(1)
+	}
 	bw.Reset(nil)
 	bufWriterPool.Put(bw)
 	w.bw = nil
 	return err
 }
 
+// settleMarkers emits a W event for every marker the kernel has now consumed.
+// They share one timestamp: this is one write, not several.
+//
+// Markers left unsettled when a connection dies are deliberately not flushed
+// here. Doing so would mean touching this state from the serve goroutine's
+// teardown while a writeFrameAsync goroutine may still be running. Those
+// responses simply have no W, and offline analysis counts them as missing.
+func (w *bufferedWriter) settleMarkers(at time.Time, writeErr bool) {
+	// Count first, so every event in the batch can carry the same batch size --
+	// that number is the measurement.
+	var batch uint16
+	for i := uint32(0); i < w.markers.n; i++ {
+		if w.markers.buf[(w.markers.head+i)%wMarkerRingSize].endOffset > w.accepted {
+			break
+		}
+		batch++
+	}
+	for i := uint16(0); i < batch; i++ {
+		m := w.markers.pop()
+		if m.trace == nil || w.wSink == nil {
+			continue
+		}
+		ev := ResponseHeadersFlushedEvent{
+			At:              at,
+			ConnID:          w.connID,
+			StreamID:        m.trace.StreamID,
+			ServerRequestID: m.trace.ID,
+			BatchSize:       batch,
+			Err:             writeErr,
+		}
+		// Non-blocking by construction. This runs on the only goroutine writing
+		// to the socket, and serverConn.writeHeaders already blocks a handler
+		// goroutine until its frame is written, so blocking here would push back
+		// directly onto request handling. A full queue costs a dropped log line,
+		// never a stalled response.
+		select {
+		case w.wSink <- ev:
+		default:
+			responseHeadersFlushedDrops.Add(1)
+		}
+	}
+}
+
 type bufferedWriterTimeoutWriter bufferedWriter
 
 func (w *bufferedWriterTimeoutWriter) Write(p []byte) (n int, err error) {
-	return writeWithByteTimeout(w.conn, w.byteTimeout, p)
+	// TYcustom: this is the real socket write, and the only place that has both
+	// the connection-local marker state and the knowledge that bytes have
+	// actually been accepted by the kernel. Hooking writeWithByteTimeout instead
+	// would not work: it is a package-level function with no connection state,
+	// and on this deployment WriteByteTimeout is zero, so it is a single
+	// pass-through call to conn.Write.
+	//
+	// accepted advances by the bytes genuinely taken, so a short write leaves
+	// the marker unsettled rather than reporting a W that never happened.
+	bw := (*bufferedWriter)(w)
+	n, err = writeWithByteTimeout(bw.conn, bw.byteTimeout, p)
+	bw.accepted += uint64(n)
+	if m := bw.markers.peek(); m != nil && bw.accepted >= m.endOffset {
+		bw.settleMarkers(time.Now(), err != nil)
+	}
+	return n, err
 }
 
 // writeWithByteTimeout writes to conn.

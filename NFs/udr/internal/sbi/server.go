@@ -202,6 +202,11 @@ func newHttp2ServerWithIdleTimeout(
 
 	h2Server := &http2.Server{
 		IdleTimeout: idleTimeoutPeriod,
+		// TYcustom: without this sink the fork has no consumer for
+		// response-header-flushed events and the run yields zero of them.
+		// h2c.NewHandler below wraps this very *http2.Server, so setting it here
+		// is what makes it take effect.
+		ResponseHeadersFlushed: accesslog.WEventSink(),
 	}
 	server := &http.Server{
 		Addr:    bindAddr,

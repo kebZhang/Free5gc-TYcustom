@@ -313,6 +313,7 @@ func (t *Transport) initConnPool() {
 type ClientConn struct {
 	t             *Transport
 	tconn         net.Conn             // usually *tls.Conn, except specialized impls
+	identity      *ClientConnIdentity  // TYcustom: immutable, computed once in newClientConn; may be nil under test hooks
 	tlsState      *tls.ConnectionState // nil only for specialized impls
 	atomicReused  uint32               // whether conn is being reused; atomic
 	singleUse     bool                 // whether being used for a single http.Request
@@ -402,6 +403,7 @@ type clientStream struct {
 	reqCancel <-chan struct{}
 
 	trace         *httptrace.ClientTrace // or nil
+	instr         *ClientRequestTrace    // TYcustom: or nil
 	ID            uint32
 	bufPipe       pipe // buffered pipe with the flow-controlled response payload
 	requestedGzip bool
@@ -594,6 +596,13 @@ func (t *Transport) RoundTripOpt(req *http.Request, opt RoundTripOpt) (*http.Res
 		}
 		reused := !atomic.CompareAndSwapUint32(&cc.atomicReused, 0, 1)
 		traceGotConn(req, cc, reused)
+		// TYcustom: count this attempt. Deliberately after GetClientConn
+		// succeeded, so the counter means "attempts that reached a connection".
+		// The trace survives retries because shouldRetryRequest shallow-copies
+		// the Request, ctx included.
+		if tr := clientRequestTraceFromContext(req.Context()); tr != nil {
+			tr.attempts.Add(1)
+		}
 		res, err := cc.RoundTrip(req)
 		if err != nil && retry <= 6 {
 			roundTripErr := err
@@ -801,6 +810,15 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	if t.transportTestHooks != nil {
 		t.transportTestHooks.newclientconn(cc)
 		c = cc.tconn
+	}
+	// TYcustom: snapshot the connection identity exactly once. Doing it here
+	// rather than per request is the whole point -- LocalAddr().String()
+	// allocates. c can be nil under transportTestHooks.
+	if c != nil {
+		cc.identity = &ClientConnIdentity{
+			LocalAddr:  c.LocalAddr().String(),
+			RemoteAddr: c.RemoteAddr().String(),
+		}
 	}
 	if VerboseLogs {
 		t.vlogf("http2: Transport creating client conn %p to %v", cc, c.RemoteAddr())
@@ -1277,6 +1295,7 @@ func (cc *ClientConn) roundTrip(req *http.Request, streamf func(*clientStream)) 
 		reqBody:              req.Body,
 		reqBodyContentLength: actualContentLength(req),
 		trace:                httptrace.ContextClientTrace(ctx),
+		instr:                clientRequestTraceFromContext(ctx), // TYcustom
 		peerClosed:           make(chan struct{}),
 		abort:                make(chan struct{}),
 		respHeaderRecv:       make(chan struct{}),
@@ -1421,6 +1440,13 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 			}
 		}
 	}
+	// TYcustom M (req_header_mu_start_time): the instant this attempt begins
+	// contending for reqHeaderMu. It must be taken before the select, not after
+	// the send succeeds -- the wait itself is what we are measuring. One clock
+	// read and one atomic store; nothing else is allowed here.
+	if cs.instr != nil {
+		cs.instr.mUnixNano.Store(time.Now().UnixNano())
+	}
 	select {
 	case cc.reqHeaderMu <- struct{}{}:
 	case <-cs.reqCancel:
@@ -1444,6 +1470,16 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 		cc.doNotReuse = true
 	}
 	cc.mu.Unlock()
+
+	// TYcustom: cs.ID was just assigned by addStreamLocked and cc is fixed, so
+	// this is the earliest point at which the attempt's transport identity is
+	// complete. streamf is always nil on this deployment ((*ClientConn).RoundTrip
+	// passes nil), which is precisely why this cannot be done from outside the
+	// fork.
+	if cs.instr != nil {
+		cs.instr.streamID.Store(cs.ID)
+		cs.instr.connID.Store(cc.identity)
+	}
 
 	if streamf != nil {
 		streamf(cs)

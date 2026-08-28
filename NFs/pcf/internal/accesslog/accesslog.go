@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // srcNF is the name of the NF this binary runs as (the requester for HTTP logs,
@@ -43,7 +45,45 @@ const (
 // and to do the (cheap) formatting work off the single writer for parallelism.
 type record struct {
 	kind recKind
-	line []byte
+	line *[]byte // pooled; see linePool. Owned by the writer once enqueued.
+}
+
+// linePool recycles the buffers that carry formatted lines from the producing
+// goroutine to the writer.
+//
+// With the initial capacities corrected, each line costs exactly one allocation,
+// and at the rates this experiment runs at that is the largest single source of
+// garbage in the process. Recycling removes it.
+//
+// Ownership is strictly linear: a builder takes a buffer, fills it, and hands it
+// to enqueue; from that moment only the writer touches it, and the writer
+// returns it once the bytes have been copied into the file's bufio. A record
+// dropped because the queue was full simply never comes back, which is correct
+// and cheaper than trying to reclaim it. Nothing is ever returned twice, so two
+// goroutines can never end up writing into the same buffer.
+var linePool sync.Pool
+
+// getLine returns an empty buffer with room for at least capHint bytes.
+func getLine(capHint int) *[]byte {
+	if v := linePool.Get(); v != nil {
+		bp := v.(*[]byte)
+		if cap(*bp) >= capHint {
+			*bp = (*bp)[:0]
+			return bp
+		}
+		// Recycled buffer is too small for this kind of line. Size it correctly
+		// now rather than letting append reallocate part-way through and copy
+		// what has already been written; the pointer wrapper is still reused.
+		*bp = make([]byte, 0, capHint)
+		return bp
+	}
+	b := make([]byte, 0, capHint)
+	return &b
+}
+
+func putLine(bp *[]byte) {
+	*bp = (*bp)[:0]
+	linePool.Put(bp)
 }
 
 const (
@@ -59,11 +99,25 @@ const (
 	defaultDBPath   = "/tmp/DB_log.txt"
 )
 
+// wQueueCapacity bounds the W event queue. It is deliberately far smaller than
+// queueCapacity: a Go channel whose element type contains pointers has its whole
+// buffer scanned on every GC cycle, whether or not it holds anything, so an
+// oversized queue is a permanent GC cost rather than free insurance. At most one
+// W event exists per response, the collector only formats JSON, and a full queue
+// costs a counted drop rather than any stall -- so a queue this size is ample.
+const wQueueCapacity = 1 << 16 // 65536
+
 var (
 	queue    chan record
 	dropped  atomic.Uint64      // count of records dropped because the queue was full
 	initOne  sync.Once
 	flushReq chan chan struct{} // request a synchronous flush from the writer
+
+	// wQueue carries response-header-flushed events from the HTTP/2 socket
+	// writer to wCollectorLoop, which turns them into log lines. The socket
+	// writer must never format JSON or block, hence the hand-off.
+	wQueue    chan http2.ResponseHeadersFlushedEvent
+	wFlushReq chan chan struct{}
 )
 
 // Init starts the background writer. It is safe to call multiple times; only the
@@ -73,8 +127,88 @@ func Init() {
 	initOne.Do(func() {
 		queue = make(chan record, queueCapacity)
 		flushReq = make(chan chan struct{})
+		wQueue = make(chan http2.ResponseHeadersFlushedEvent, wQueueCapacity)
+		wFlushReq = make(chan chan struct{})
 		go writerLoop()
+		go wCollectorLoop()
 	})
+}
+
+// WEventSink returns the channel to hand to http2.Server.ResponseHeadersFlushed.
+//
+// It calls Init first on purpose. A nil channel here would be silently fatal:
+// the non-blocking send inside the fork would always take its default branch and
+// the run would produce no W events at all. Package initialisation already calls
+// Init, but this makes the sink independent of import ordering.
+func WEventSink() chan<- http2.ResponseHeadersFlushedEvent {
+	Init()
+	return wQueue
+}
+
+// WDropped reports how many W events were lost, either because this queue was
+// full or because a connection's marker ring overflowed. The counter lives in
+// the fork, next to where the drops happen.
+func WDropped() uint64 { return http2.ResponseHeadersFlushedDrops() }
+
+// WAccountingErrors reports failures of the fork's internal self-check on the W
+// byte-offset bookkeeping. Anything other than zero invalidates the run's W
+// data; it is not a dropped-record count.
+func WAccountingErrors() uint64 { return http2.WAccountingErrors() }
+
+// wCollectorLoop is the single consumer of wQueue. All JSON work for W lines
+// happens here rather than on the socket write path, and the resulting line then
+// takes the ordinary enqueue route, so the process still has exactly one
+// goroutine writing to the log files.
+func wCollectorLoop() {
+	drain := func() {
+		for {
+			select {
+			case ev := <-wQueue:
+				logWFlushed(ev)
+			default:
+				return
+			}
+		}
+	}
+	for {
+		select {
+		case ev := <-wQueue:
+			logWFlushed(ev)
+		case done := <-wFlushReq:
+			drain()
+			close(done)
+		}
+	}
+}
+
+// logWFlushed renders one W event. It is a separate line rather than a field on
+// the server request line because W happens strictly after that line has been
+// emitted: the response headers are not flushed until the handler has returned,
+// and making the handler wait for W would deadlock -- the flush is triggered by
+// the handler returning.
+//
+// conn and dst carry the same values as the server request line, so the join on
+// (dst, server_request_id) can be cross-checked rather than merely trusted.
+func logWFlushed(ev http2.ResponseHeadersFlushedEvent) {
+	outcome := "ok"
+	if ev.Err {
+		outcome = "write_error"
+	}
+	bp := getLine(320)
+	b := *bp
+	b = append(b, '{')
+	b = appendKV(b, "event", "server_response_headers_flushed", true)
+	b = appendKV(b, "src", "NaN", false)
+	b = appendKV(b, "dst", srcNF, false)
+	b = appendKVUint64(b, "server_request_id", ev.ServerRequestID, false)
+	b = appendKV(b, "conn", ev.ConnID, false)
+	b = appendKVInt(b, "stream_id", int(ev.StreamID), false)
+	b = appendKVTime(b, "server_response_headers_flushed_time", ev.At, false)
+	b = appendKVInt(b, "batch_size", int(ev.BatchSize), false)
+	b = appendKV(b, "outcome", outcome, false)
+	b = append(b, '}')
+	*bp = b
+	enqueue(kindHTTP, bp)
 }
 
 // Flush blocks until every record enqueued before this call has been written and
@@ -85,6 +219,21 @@ func Flush() {
 	if flushReq == nil {
 		return
 	}
+	// TYcustom: drain the W collector first and WAIT for it, so that every event
+	// it is holding has been turned into a record and enqueued before the writer
+	// is asked to drain. Doing these two in the other order, or concurrently,
+	// loses the tail: the writer's drain is non-blocking, so records the
+	// collector enqueues a moment later are simply not seen.
+	//
+	// This assumes traffic has already stopped, per the collection procedure. It
+	// guarantees "nothing already queued is lost", not "nothing can arrive
+	// afterwards".
+	if wFlushReq != nil {
+		wDone := make(chan struct{})
+		wFlushReq <- wDone
+		<-wDone
+	}
+
 	done := make(chan struct{})
 	flushReq <- done // writer loops on this channel, so this always completes
 	<-done
@@ -185,16 +334,16 @@ func writeRec(httpW, dbW *bufio.Writer, rec record) {
 	case kindDB:
 		w = dbW
 	}
-	if w == nil {
-		return
+	if w != nil {
+		_, _ = w.Write(*rec.line)
+		_ = w.WriteByte('\n')
 	}
-	_, _ = w.Write(rec.line)
-	_ = w.WriteByte('\n')
+	putLine(rec.line) // every path, including the one where the sink is disabled
 }
 
 // enqueue pushes a record without ever blocking the caller. If the queue is
 // full the record is dropped (and counted) so the data plane is never stalled.
-func enqueue(kind recKind, line []byte) {
+func enqueue(kind recKind, line *[]byte) {
 	select {
 	case queue <- record{kind: kind, line: line}:
 	default:
@@ -241,24 +390,34 @@ func appendJSONString(b []byte, s string) []byte {
 	return append(b, '"')
 }
 
-func appendKV(b []byte, key, val string, first bool) []byte {
+// appendKey writes the `,"key":` prefix of a field.
+//
+// It deliberately does not go through appendJSONString. Every key used in this
+// package is a compile-time constant drawn from [a-z0-9_], so escaping them
+// means running a per-byte switch over roughly 120 characters per line to
+// discover, every time, that nothing needs escaping. Copying them straight in is
+// a single memmove.
+//
+// The invariant this relies on: keys are literals, never user or network data.
+// If that ever stops being true, this must go back through appendJSONString.
+func appendKey(b []byte, key string, first bool) []byte {
 	if !first {
 		b = append(b, ',')
 	}
-	b = appendJSONString(b, key)
-	b = append(b, ':')
-	b = appendJSONString(b, val)
-	return b
+	b = append(b, '"')
+	b = append(b, key...)
+	return append(b, '"', ':')
+}
+
+func appendKV(b []byte, key, val string, first bool) []byte {
+	b = appendKey(b, key, first)
+	return appendJSONString(b, val)
 }
 
 // appendKVBool appends a boolean-valued JSON field. The value is emitted
 // unquoted so downstream analysis reads it as a real boolean, not a string.
 func appendKVBool(b []byte, key string, val bool, first bool) []byte {
-	if !first {
-		b = append(b, ',')
-	}
-	b = appendJSONString(b, key)
-	b = append(b, ':')
+	b = appendKey(b, key, first)
 	if val {
 		return append(b, "true"...)
 	}
@@ -268,29 +427,50 @@ func appendKVBool(b []byte, key string, val bool, first bool) []byte {
 // appendKVInt appends an integer-valued JSON field. The value is emitted
 // unquoted so downstream analysis reads it as a number, not a string.
 func appendKVInt(b []byte, key string, val int, first bool) []byte {
-	if !first {
-		b = append(b, ',')
-	}
-	b = appendJSONString(b, key)
-	b = append(b, ':')
+	b = appendKey(b, key, first)
 	return strconv.AppendInt(b, int64(val), 10)
 }
 
-// formatTime renders a timestamp as RFC3339Nano (UTC) for stable sorting.
-func formatTime(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
+// appendKVUint64 is appendKVInt for values that genuinely need the full uint64
+// range, such as the monotonically increasing server request id.
+func appendKVUint64(b []byte, key string, val uint64, first bool) []byte {
+	b = appendKey(b, key, first)
+	return strconv.AppendUint(b, val, 10)
 }
 
-// formatTimeOrEmpty renders a timestamp like formatTime but yields "" for the
-// zero time, which is how a request that failed before being written (or one
-// whose response never arrived) is recorded. Emitting the key with an empty
-// value keeps every line's field set identical, so the reader never has to
-// special-case a missing key.
-func formatTimeOrEmpty(t time.Time) string {
-	if t.IsZero() {
-		return ""
+// appendKVTime writes a timestamp field straight into b.
+//
+// This replaces appendKV(b, key, formatTime(t), first), which cost one heap
+// allocation per timestamp (Time.Format builds the text in a stack buffer and
+// then copies it to the heap with string(b)) plus a byte-by-byte escape scan of
+// the result. AppendFormat writes into b directly, so both disappear.
+//
+// Two invariants make skipping appendJSONString safe, and both must hold if this
+// is ever changed:
+//
+//	1. .UTC() is applied first, so the zone is always "Z" and never a name.
+//	2. The layout is RFC3339Nano, whose output contains only 0-9 - : . T Z --
+//	   nothing that JSON requires escaping.
+//
+// The zero time renders as "", matching what formatTimeOrEmpty did. Note this
+// now also applies to fields that previously used formatTime and would have
+// rendered a zero time as "0001-01-01T00:00:00Z"; those fields are always taken
+// from time.Now() and are never zero in practice.
+//
+// The caller's buffer capacity matters more than it used to: AppendFormat writes
+// into b, so an undersized b now costs a growslice that copies the whole line so
+// far. The initial capacities below are sized from measured line lengths.
+func appendKVTime(b []byte, key string, t time.Time, first bool) []byte {
+	b = appendKey(b, key, first)
+	b = append(b, '"')
+	if !t.IsZero() {
+		// t.UTC() returns a value and does not allocate. It does strip the
+		// monotonic reading, which is exactly why it is applied here at append
+		// time and never to a variable that is later used in a subtraction:
+		// latency_us must keep using the monotonic clock.
+		b = t.UTC().AppendFormat(b, time.RFC3339Nano)
 	}
-	return formatTime(t)
+	return append(b, '"')
 }
 
 // LogHTTP records one outgoing HTTP request/response from this NF's view.
@@ -312,20 +492,41 @@ func formatTimeOrEmpty(t time.Time) string {
 //   - connReused:   true if an existing connection was reused, false if this
 //     request is what caused a new connection to be established. Grouping the
 //     false records by time shows when (and whether) the connection pool grew.
+//   - streamID:     the HTTP/2 stream id this request was sent on. Together
+//     with conn it identifies the request uniquely on the wire, which is what
+//     lets a client line be joined exactly to the server line for the same
+//     request instead of guessed at by UE id, URI and timestamp order. 0 means
+//     no stream was ever allocated (the request failed earlier); such lines
+//     must be excluded from the join.
+//   - retryCount:   how many transport-level retries preceded the attempt this
+//     line describes (0 = first and only attempt). On a retried request the
+//     recorded timestamps come from different attempts -- wroteTime is the
+//     first write, connID the last connection -- so only retry_count == 0 lines
+//     are safe to analyse as one coherent request.
 //   - reqTime:      when the request was handed to the transport
+//   - headerMuStart: when this attempt began contending for the connection's
+//     HTTP/2 request-header lock, i.e. the start of the transport's serialised
+//     send path. It splits the existing reqTime->wroteTime interval into
+//     "before reaching the send path" and "inside the send path". Zero if the
+//     request failed before reaching it.
 //   - wroteTime:    when every frame of the request had reached the kernel
 //     socket buffer. Zero if the request failed before it was written.
 //   - gotFirstByte: when the first byte of the response reached this process's
 //     read loop. Zero if no response ever arrived.
 //   - respTime:     when the response (or error) was received
 //
-// A zero wroteTime/gotFirstByte is emitted as "" so the reader can skip it.
-// latency_us keeps its original meaning, respTime - reqTime, so existing
-// analysis scripts are unaffected.
+// A zero wroteTime/gotFirstByte/headerMuStart is emitted as "" so the reader can
+// skip it. latency_us keeps its original meaning, respTime - reqTime, so
+// existing analysis scripts are unaffected. Existing field names and their order
+// are unchanged; the three new fields are inserted rather than renaming anything.
 func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused bool,
-	reqTime, wroteTime, gotFirstByte, respTime time.Time,
+	streamID uint32, retryCount int,
+	reqTime, headerMuStart, wroteTime, gotFirstByte, respTime time.Time,
 ) {
-	b := make([]byte, 0, 304)
+	// Measured client lines average 437 B and reach 479 B, before the three
+	// fields added here; 304 made every single line reallocate and memcpy.
+	bp := getLine(640)
+	b := *bp
 	b = append(b, '{')
 	b = appendKV(b, "src", srcNF, true)
 	b = appendKV(b, "dst", dstNF, false)
@@ -335,13 +536,17 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused b
 	b = appendKV(b, "conn", connID, false)
 	b = appendKVInt(b, "conn_slot", connSlot, false)
 	b = appendKVBool(b, "conn_reused", connReused, false)
-	b = appendKV(b, "req_time", formatTime(reqTime), false)
-	b = appendKV(b, "wrote_time", formatTimeOrEmpty(wroteTime), false)
-	b = appendKV(b, "got_first_byte", formatTimeOrEmpty(gotFirstByte), false)
-	b = appendKV(b, "resp_time", formatTime(respTime), false)
+	b = appendKVInt(b, "stream_id", int(streamID), false)
+	b = appendKVInt(b, "retry_count", retryCount, false)
+	b = appendKVTime(b, "req_time", reqTime, false)
+	b = appendKVTime(b, "req_header_mu_start_time", headerMuStart, false)
+	b = appendKVTime(b, "wrote_time", wroteTime, false)
+	b = appendKVTime(b, "got_first_byte", gotFirstByte, false)
+	b = appendKVTime(b, "resp_time", respTime, false)
 	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))
 	b = append(b, '}')
-	enqueue(kindHTTP, b)
+	*bp = b
+	enqueue(kindHTTP, bp)
 }
 
 // LogHTTPInbound records one *incoming* HTTP request/response from the
@@ -352,25 +557,50 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused b
 // The sender NF cannot be reliably identified from the server side (the SBI URI
 // does not carry it, and direct communication carries no token), so "src" is
 // recorded as the literal "NaN". "dst" is this NF (the receiver).
-//   - method:   HTTP method
-//   - uri:      request URI
-//   - ueID:     UE id this request is for (may be ""); for requests whose URI
+//   - method:    HTTP method
+//   - uri:       request URI
+//   - ueID:      UE id this request is for (may be ""); for requests whose URI
 //     does not carry the UE id but whose body does
-//   - reqTime:  when the request arrived at this server
-//   - respTime: when the response was sent back
-func LogHTTPInbound(method, uri, ueID string, reqTime, respTime time.Time) {
-	b := make([]byte, 0, 256)
+//   - connID:    the TCP connection this request arrived on, as
+//     "clientIP:clientPort". Deliberately the same field name and the same
+//     string the SENDER records as its own conn, so the two views join without
+//     any field mapping.
+//   - srvReqID:  process-local id for this inbound request. It joins this line
+//     to the separate server_response_headers_flushed event for the same
+//     response, which cannot be written on this line because it happens after
+//     the handler has returned.
+//   - streamID:  the HTTP/2 stream id. (conn, stream_id) is what joins this
+//     line to the sender's line for the same request.
+//   - handlerGo: when this request's handler goroutine was about to be started,
+//     i.e. before Go scheduling, the gin middleware chain and everything else
+//     that precedes reqTime below. It splits the sender's wrote_time -> reqTime
+//     interval into "before the handler existed" and "after it was submitted".
+//     Zero if the request did not come through an instrumented HTTP/2 server.
+//   - reqTime:   when the request arrived at this server
+//   - respTime:  when the response was sent back
+func LogHTTPInbound(method, uri, ueID, connID string, srvReqID uint64, streamID uint32,
+	handlerGo, reqTime, respTime time.Time,
+) {
+	// Measured server lines average 277 B and reach 320 B, before the four
+	// fields added here.
+	bp := getLine(512)
+	b := *bp
 	b = append(b, '{')
 	b = appendKV(b, "src", "NaN", true)
 	b = appendKV(b, "dst", srcNF, false)
 	b = appendKV(b, "method", method, false)
 	b = appendKV(b, "uri", uri, false)
 	b = appendKV(b, "ue_id", ueID, false)
-	b = appendKV(b, "req_time", formatTime(reqTime), false)
-	b = appendKV(b, "resp_time", formatTime(respTime), false)
+	b = appendKVUint64(b, "server_request_id", srvReqID, false)
+	b = appendKV(b, "conn", connID, false)
+	b = appendKVInt(b, "stream_id", int(streamID), false)
+	b = appendKVTime(b, "server_handler_go_time", handlerGo, false)
+	b = appendKVTime(b, "req_time", reqTime, false)
+	b = appendKVTime(b, "resp_time", respTime, false)
 	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))
 	b = append(b, '}')
-	enqueue(kindHTTP, b)
+	*bp = b
+	enqueue(kindHTTP, bp)
 }
 
 // LogDB records one NF<->MongoDB request/response from this NF's view.
@@ -382,24 +612,25 @@ func LogHTTPInbound(method, uri, ueID string, reqTime, respTime time.Time) {
 //   - reqTime:   when the DB request was issued
 //   - respTime:  when the DB reply was received
 func LogDB(mongo, resource, operation, ueID string, reqTime, respTime time.Time) {
-	b := make([]byte, 0, 256)
+	// Measured DB lines average 253 B and reach 269 B, so 256 sat right on
+	// the boundary and about half of them reallocated.
+	bp := getLine(320)
+	b := *bp
 	b = append(b, '{')
 	b = appendKV(b, "nf", srcNF, true)
 	b = appendKV(b, "mongo", mongo, false)
 	b = appendKV(b, "resource", resource, false)
 	b = appendKV(b, "operation", operation, false)
 	b = appendKV(b, "ue_id", ueID, false)
-	b = appendKV(b, "req_time", formatTime(reqTime), false)
-	b = appendKV(b, "resp_time", formatTime(respTime), false)
+	b = appendKVTime(b, "req_time", reqTime, false)
+	b = appendKVTime(b, "resp_time", respTime, false)
 	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))
 	b = append(b, '}')
-	enqueue(kindDB, b)
+	*bp = b
+	enqueue(kindDB, bp)
 }
 
 func appendDurUs(b []byte, key string, d time.Duration) []byte {
-	b = append(b, ',')
-	b = appendJSONString(b, key)
-	b = append(b, ':')
-	b = strconv.AppendInt(b, d.Microseconds(), 10)
-	return b
+	b = appendKey(b, key, false)
+	return strconv.AppendInt(b, d.Microseconds(), 10)
 }

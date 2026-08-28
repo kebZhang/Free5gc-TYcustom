@@ -43,6 +43,13 @@ type writeContext interface {
 	// HeaderEncoder returns an HPACK encoder that writes to the
 	// returned buffer.
 	HeaderEncoder() (*hpack.Encoder, *bytes.Buffer)
+
+	// armResponseHeaderMarker is TYcustom instrumentation: it marks the frame
+	// about to be written as the one that completes a response's header block,
+	// so that W can be taken when the kernel accepts that frame's last byte.
+	// Passing nil clears the mark. Outside tests *serverConn is the only
+	// implementer of this interface.
+	armResponseHeaderMarker(*ServerRequestTrace)
 }
 
 // writeEndsStream reports whether w writes a frame that will transition
@@ -197,6 +204,13 @@ type writeResHeaders struct {
 	date          string
 	contentType   string
 	contentLength string
+
+	// trace is TYcustom and is set on exactly one of the three places a
+	// writeResHeaders is built: the final response headers. Trailer and 1xx
+	// header blocks leave it nil, which is what makes "W is recorded once per
+	// response, for the final headers only" a structural property rather than a
+	// runtime condition that could drift.
+	trace *ServerRequestTrace
 }
 
 func encKV(enc *hpack.Encoder, k, v string) {
@@ -246,16 +260,34 @@ func (w *writeResHeaders) writeFrame(ctx writeContext) error {
 }
 
 func (w *writeResHeaders) writeHeaderBlock(ctx writeContext, frag []byte, firstFrag, lastFrag bool) error {
+	// TYcustom: arm the W marker before the Framer writes, not after. The
+	// Framer's endWrite hands the whole frame to the connection's buffered
+	// writer, and that call can reach the kernel from inside itself, so the
+	// marker has to be in place already.
+	if lastFrag && w.trace != nil {
+		ctx.armResponseHeaderMarker(w.trace)
+	}
+	var err error
 	if firstFrag {
-		return ctx.Framer().WriteHeaders(HeadersFrameParam{
+		err = ctx.Framer().WriteHeaders(HeadersFrameParam{
 			StreamID:      w.streamID,
 			BlockFragment: frag,
 			EndStream:     w.endStream,
 			EndHeaders:    lastFrag,
 		})
 	} else {
-		return ctx.Framer().WriteContinuation(w.streamID, lastFrag, frag)
+		err = ctx.Framer().WriteContinuation(w.streamID, lastFrag, frag)
 	}
+	if err != nil {
+		// Required, not defensive. WriteHeaders can reject a bad stream id and
+		// endWrite can reject an oversized frame, both before the buffered
+		// writer is ever reached -- leaving the marker armed. It would then
+		// attach to the NEXT frame written on this connection and report some
+		// other stream's byte offset as this response's W: a silent mismatch
+		// rather than a visible failure.
+		ctx.armResponseHeaderMarker(nil)
+	}
+	return err
 }
 
 // writePushPromise is a request to write a PUSH_PROMISE and 0+ CONTINUATION frames.
