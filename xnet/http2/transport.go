@@ -1456,8 +1456,9 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 		// queued for the lock", which offline analysis counts as its own outcome.
 		//
 		// THIS RUNS INSIDE THE reqHeaderMu CRITICAL SECTION (held from here to the
-		// release after encodeAndWriteHeaders below), which at connsPerPeer = 1
-		// serialises every request this NF sends to this peer. Exactly one clock
+		// release after encodeAndWriteHeaders below), which at connsPerPeer = 2
+		// serialises every request this NF sends to this peer over this slot's
+		// connection -- two such serialisation points per pair. Exactly one clock
 		// read and one atomic store are permitted here -- nothing else, ever. Do
 		// not add a counter, a duration computation, a log call or a second clock
 		// read to this branch.
