@@ -1449,6 +1449,21 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 	}
 	select {
 	case cc.reqHeaderMu <- struct{}{}:
+		// TYcustom M2 (req_header_mu_acq_time): the lock is now held.
+		//
+		// Deliberately inside this branch and not after the select: the other two
+		// branches return, so "M set but M2 unset" is exactly "cancelled while
+		// queued for the lock", which offline analysis counts as its own outcome.
+		//
+		// THIS RUNS INSIDE THE reqHeaderMu CRITICAL SECTION (held from here to the
+		// release after encodeAndWriteHeaders below), which at connsPerPeer = 1
+		// serialises every request this NF sends to this peer. Exactly one clock
+		// read and one atomic store are permitted here -- nothing else, ever. Do
+		// not add a counter, a duration computation, a log call or a second clock
+		// read to this branch.
+		if cs.instr != nil {
+			cs.instr.mAcqUnixNano.Store(time.Now().UnixNano())
+		}
 	case <-cs.reqCancel:
 		return errRequestCanceled
 	case <-ctx.Done():

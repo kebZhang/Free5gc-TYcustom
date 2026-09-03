@@ -257,9 +257,11 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		},
 	}
 	// instr is the fork-local trace (golang.org/x/net is replaced by ../../xnet).
-	// It carries three things the standard httptrace cannot expose:
+	// It carries four things the standard httptrace cannot expose:
 	//   - M, the instant this attempt begins contending for the connection's
 	//     reqHeaderMu, which is inside the transport's send path;
+	//   - M2, the instant it actually took that lock, so the pure lock wait can
+	//     be separated from the work done while holding it;
 	//   - the HTTP/2 stream id, which together with conn is the exact-join key
 	//     against the server-side record of the same request;
 	//   - the attempt count, so retried requests can be excluded rather than
@@ -288,6 +290,9 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	// attempts -- which is why offline analysis must accept retry_count == 0
 	// only.
 	mStart := instr.ReqHeaderMuStart()
+	// TYcustom M2: an atomic load, exactly like the ones around it -- this never
+	// blocks and never waits for writeRequest to finish.
+	mAcq := instr.ReqHeaderMuAcquired()
 	streamID := instr.StreamID()
 	retryCount := 0
 	if n := instr.Attempts(); n > 0 {
@@ -301,7 +306,7 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	// would otherwise look like duplicate keys.
 	LogHTTP(dst, method, uri, ueID, connID, connSlot, connReused,
 		streamID, retryCount,
-		reqTime, mStart, wroteTime, gotFirstByte, respTime)
+		reqTime, mStart, mAcq, wroteTime, gotFirstByte, respTime)
 	return resp, err
 }
 

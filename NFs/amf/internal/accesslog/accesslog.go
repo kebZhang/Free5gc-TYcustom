@@ -95,6 +95,19 @@ const (
 	queueCapacity = 1 << 21 // 2097152
 	writerBufferSize = 1 << 20 // 1 MiB
 
+	// httpLineCap is the initial capacity for a client HTTP line. Measured on
+	// C6525100g_NF1HTTP_500ms_3logs_0827v1 (RQ2000/UE1000, nine-point build):
+	// client lines were p50 533 B, p99 572 B, max 573 B. The M2 field added by
+	// HTTP_10thlog_0903.md costs 58 B, and stream_id / latency_us can each still
+	// gain a digit over that longest line, so the real ceiling is ~633 B. 704 is
+	// the next Go size class up and leaves ~70 B of headroom.
+	//
+	// Do not inflate this "to be safe": a bigger capHint costs nothing per line
+	// in steady state (getLine just reslices a pooled buffer) but linePool is
+	// shared by every record kind and each queued record holds its own buffer, so
+	// the burst-memory ceiling is queueCapacity * capHint.
+	httpLineCap = 704
+
 	envHTTPPath   = "HTTP_LOG_PATH"
 	envDBPath     = "DB_LOG_PATH"
 	envNGAPPath   = "NGAP_LOG_PATH"
@@ -388,6 +401,19 @@ func Dropped() uint64 {
 	return dropped.Load()
 }
 
+// lineRealloc counts client lines that outgrew httpLineCap. It lives outside the
+// var block above so that adding it does not re-align that block's existing
+// entries.
+var lineRealloc atomic.Uint64
+
+// LineReallocs returns how many client HTTP lines outgrew httpLineCap while
+// being built. Read it next to Dropped(); anything other than zero means the
+// capacity is mis-sized and those lines each paid an allocation plus a full-line
+// memcpy on the synchronous path.
+func LineReallocs() uint64 {
+	return lineRealloc.Load()
+}
+
 // --- JSON line builders -----------------------------------------------------
 //
 // We build JSON by hand (no reflection / encoding/json) to keep the hot path
@@ -540,23 +566,32 @@ func appendKVTime(b []byte, key string, t time.Time, first bool) []byte {
 //     send path. It splits the existing reqTime->wroteTime interval into
 //     "before reaching the send path" and "inside the send path". Zero if the
 //     request failed before reaching it.
+//   - headerMuAcq:   when this attempt actually took that lock. Together with
+//     headerMuStart it isolates the pure reqHeaderMu queueing time, which the
+//     single headerMuStart point could not separate from the work done inside
+//     the lock. The wait is computed offline as headerMuAcq - headerMuStart; it
+//     is deliberately not computed here, because that would add a second store
+//     inside the lock's critical section. Zero when the lock was never taken --
+//     note that headerMuStart set with this zero means the request was cancelled
+//     WHILE queued for the lock, which is its own outcome and not a gap.
 //   - wroteTime:    when every frame of the request had reached the kernel
 //     socket buffer. Zero if the request failed before it was written.
 //   - gotFirstByte: when the first byte of the response reached this process's
 //     read loop. Zero if no response ever arrived.
 //   - respTime:     when the response (or error) was received
 //
-// A zero wroteTime/gotFirstByte/headerMuStart is emitted as "" so the reader can
-// skip it. latency_us keeps its original meaning, respTime - reqTime, so
-// existing analysis scripts are unaffected. Existing field names and their order
-// are unchanged; the three new fields are inserted rather than renaming anything.
+// A zero wroteTime/gotFirstByte/headerMuStart/headerMuAcq is emitted as "" so the
+// reader can skip it. latency_us keeps its original meaning, respTime - reqTime,
+// so existing analysis scripts are unaffected. Existing field names and their
+// order are unchanged; new fields are inserted in timestamp order rather than
+// renaming anything.
 func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused bool,
 	streamID uint32, retryCount int,
-	reqTime, headerMuStart, wroteTime, gotFirstByte, respTime time.Time,
+	reqTime, headerMuStart, headerMuAcq, wroteTime, gotFirstByte, respTime time.Time,
 ) {
-	// Measured client lines average 437 B and reach 479 B, before the three
-	// fields added here; 304 made every single line reallocate and memcpy.
-	bp := getLine(640)
+	// See httpLineCap above for how the capacity was measured; the check after the
+	// appends verifies it was enough.
+	bp := getLine(httpLineCap)
 	b := *bp
 	b = append(b, '{')
 	b = appendKV(b, "src", srcNF, true)
@@ -571,11 +606,20 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused b
 	b = appendKVInt(b, "retry_count", retryCount, false)
 	b = appendKVTime(b, "req_time", reqTime, false)
 	b = appendKVTime(b, "req_header_mu_start_time", headerMuStart, false)
+	b = appendKVTime(b, "req_header_mu_acq_time", headerMuAcq, false)
 	b = appendKVTime(b, "wrote_time", wroteTime, false)
 	b = appendKVTime(b, "got_first_byte", gotFirstByte, false)
 	b = appendKVTime(b, "resp_time", respTime, false)
 	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))
 	b = append(b, '}')
+	// Compare against the constant, not against the buffer's starting capacity:
+	// linePool is shared with the other record kinds (AMF's LogWorker asks for
+	// 384+160*len(sbi), which can exceed this), so a line that overran
+	// httpLineCap could silently fit in a larger recycled buffer and go
+	// uncounted. This form has no false negatives.
+	if len(b) > httpLineCap {
+		lineRealloc.Add(1)
+	}
 	*bp = b
 	enqueue(kindHTTP, bp)
 }

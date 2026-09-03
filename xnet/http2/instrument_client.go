@@ -2,8 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// TYcustom: fork-local client-side instrumentation for the nine-point HTTP/2
-// latency experiment (HTTP_3detailLog_PLAN_0826.md, phase 1 / point M).
+// TYcustom: fork-local client-side instrumentation for the ten-point HTTP/2
+// latency experiment (HTTP_3detailLog_PLAN_0826.md, phase 1 / point M, and
+// HTTP_10thlog_0903.md, point M2).
 //
 // Nothing here runs unless the caller explicitly attaches a *ClientRequestTrace
 // to the request context. With no trace attached every hook added to
@@ -66,8 +67,13 @@ type ClientRequestTrace struct {
 
 	attempts  atomic.Uint32
 	mUnixNano atomic.Int64
-	streamID  atomic.Uint32
-	connID    atomic.Pointer[ClientConnIdentity]
+	// TYcustom M2: the instant this attempt SUCCEEDED in acquiring
+	// cc.reqHeaderMu. The lock wait itself (M2 - M) is deliberately NOT computed
+	// here -- offline analysis subtracts the two serialised stamps, which keeps
+	// the critical section down to one clock read and one store.
+	mAcqUnixNano atomic.Int64
+	streamID     atomic.Uint32
+	connID       atomic.Pointer[ClientConnIdentity]
 }
 
 // WithClientRequestTrace returns a context carrying tr.
@@ -118,6 +124,28 @@ func (t *ClientRequestTrace) Attempts() uint32 { return t.attempts.Load() }
 // offline correlation only; never subtract it from a Time that does carry one.
 func (t *ClientRequestTrace) ReqHeaderMuStart() time.Time {
 	ns := t.mUnixNano.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// ReqHeaderMuAcquired returns M2: the instant the most recent attempt actually
+// took cc.reqHeaderMu. The zero Time means it was never taken -- either the
+// request failed before reaching the lock at all (then ReqHeaderMuStart is also
+// zero), or it was cancelled WHILE queued for the lock (then ReqHeaderMuStart is
+// set and this is not). That second combination is a distinct outcome and must
+// be counted separately offline, not folded into "incomplete".
+//
+// Note the converse does not hold: an attempt can acquire the lock and then fail
+// in awaitOpenSlotForStreamLocked, leaving StreamID() at 0 while this is set. So
+// StreamID() != 0 implies this is set, but not the other way round.
+//
+// Like ReqHeaderMuStart, the returned Time carries no monotonic reading. The
+// lock wait is M2 - M, computed offline from the two serialised stamps; see
+// HTTP_10thlog_0903.md section 2.4 for the two pitfalls that subtraction has.
+func (t *ClientRequestTrace) ReqHeaderMuAcquired() time.Time {
+	ns := t.mAcqUnixNano.Load()
 	if ns == 0 {
 		return time.Time{}
 	}
