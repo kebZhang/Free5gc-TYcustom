@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,15 +49,15 @@ const (
 )
 
 // connsPerPeer is how many HTTP/2 connections this NF opens to each peer NF up
-// front, and how many round-robin slots requests are dealt across. It is 4: the
-// transport starts with four connections per peer and is left free to add more on
-// its own.
+// front, and how many round-robin slots requests are dealt across. It is 8: the
+// transport starts with eight connections per peer and is left free to add more
+// on its own.
 //
 // Each slot is a separate http2.Transport with its own private pool, so N slots
 // mean N connections held from the start, with requests handed to them one after
-// another in turn. The slots are per PROCESS, not per peer: these same 4
+// another in turn. The slots are per PROCESS, not per peer: these same 8
 // transports serve every peer this NF talks to, and each one keeps its own pool
-// keyed by address. A NF with 4 peers therefore holds 4*4 = 16 connections.
+// keyed by address. A NF with 4 peers therefore holds 8*4 = 32 connections.
 //
 // The history matters for reading this number. It was 2 for the original
 // round-robin experiment (HTTP_MULTI_CONN_ROUNDROBIN_PLAN_0806.md), then went
@@ -72,34 +73,41 @@ const (
 // (HTTP_16CONN_PLAN_0809v1.md), then 2, back to 1 -- the single-connection
 // baseline the per-request timestamp instrumentation (the wrote/first-byte trace
 // here and the M/M2/G/W points in the local x/net fork) was built and read
-// against -- and then 2 again. This is a return to 4.
+// against -- then 2 again, then 4. This is a return to 8.
 //
-// 4 doubles that last step, and it is the step the current instrumentation
+// 8 doubles that last step, and it is the step the current instrumentation
 // exists to measure. Everything the 1-slot runs concentrated on a single socket
 // -- the per-clientConn reqHeaderMu that serialises header writes, HTTP/2
 // head-of-line delay behind whichever stream holds that lock -- now has exactly
-// four independent instances per NF pair. Reading the same M->M2 wait at 1, 2
-// and 4 slots therefore separates contention on that write lock from peer-side
+// eight independent instances per NF pair. Reading the same M->M2 wait at 1, 2,
+// 4 and 8 slots therefore separates contention on that write lock from peer-side
 // and wire delay, which no other knob here isolates: a wait that keeps falling
 // roughly in step with the slot count was queueing on the lock.
 //
-// 4 still keeps the per-slot sample usable: every pair splits its requests four
-// ways, so the thinnest pairs measured (AMF->PCF and PCF->UDR at 1000 requests)
-// drop from ~500 to ~250 per slot -- enough to read a per-slot P95/P99, and well
-// above the ~62 per slot that 16 slots gave. Tail statistics stay readable on
-// every pair at this setting.
+// 8 halves the per-slot sample against 4: every pair splits its requests eight
+// ways -- exactly eight ways, because each peer carries its own round-robin
+// cursor (tlsNext/clearNext below). Under the single process-wide cursor this
+// replaced, a pair's slots were only a subsequence of one shared cycle, and
+// solely a single-peer NF split evenly; AMF did not. So the thinnest pairs
+// measured (AMF->PCF and PCF->UDR at 1000 requests)
+// drop from ~250 to ~125 per slot. That is still readable for a per-slot median
+// and for the shape of the distribution, and well above the ~62 per slot that 16
+// slots gave, but a per-slot P99 on those two pairs then rests on one or two
+// points -- read tails on AMF->UDM (~750 per slot) and UDM->UDR (~1125 per slot)
+// instead. A materially lower request rate or UE count would make the 8-slot
+// split too sparse to interpret at all.
 //
-// Growth beyond these 4 is still permitted: StrictMaxConcurrentStreams is
+// Growth beyond these 8 is still permitted: StrictMaxConcurrentStreams is
 // deliberately left unset (see below), so when a slot's in-flight streams reach
 // the peer's 250-stream limit the transport dials an additional connection by
 // itself. Runs from 4 to 16 held exactly connsPerPeer sockets per pair with zero
 // redials, and their peak in-flight stream counts (37/65/156 at the 0807
-// measurement) never reached 250; splitting the load four ways puts that
-// headroom back where the earlier 4-slot run had it, so conn_reused false
-// records remain the thing to watch -- they show whether the pool grew past the
-// four connections held from the start. conn_slot is the field that shows
-// whether the split across those four is even.
-const connsPerPeer = 4
+// measurement) never reached 250; splitting the load eight ways puts even more
+// of that headroom back, so conn_reused false records remain the thing to watch
+// -- they show whether the pool grew past the eight connections held from the
+// start. conn_slot is the field that shows whether the split across those eight
+// is even.
+const connsPerPeer = 8
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
@@ -112,11 +120,55 @@ type loggingRoundTripper struct {
 	tls   [connsPerPeer]http.RoundTripper // h2 over TLS  (https)
 	clear [connsPerPeer]http.RoundTripper // h2c cleartext (http)
 
-	// next is the round-robin cursor, shared by both schemes. Atomic rather
-	// than mutex-guarded: this is on every request's path, and an atomic add is
-	// a single instruction with no contention point, so the cost does not grow
-	// with concurrency the way lock acquisition would.
-	next atomic.Uint64
+	// One round-robin cursor PER PEER, keyed by the peer's "host:port" -- the
+	// same granularity the connection pool uses (client_conn_pool.go keys its
+	// conns map by host:port), so a cursor and the pool it drives always agree
+	// on what "a peer" is.
+	//
+	// Per peer, not per process, and that distinction is the whole point. A
+	// single process-wide cursor is a true round-robin only for an NF that
+	// talks to one peer. With several peers the slot a request gets depends on
+	// how many requests went to OTHER peers before it, so any one pair sees an
+	// arbitrary subsequence of 0..connsPerPeer-1 rather than a cycle. The
+	// degenerate case is real rather than theoretical: if an NF emits L
+	// requests per UE in a repeating order and gcd(L, connsPerPeer) != 1, the
+	// same peer lands on the same few slots every UE and the remaining
+	// connections are never dialled at all -- so the shared cursor could also
+	// silently cost connections, not just even distribution. AMF is the NF this
+	// applies to; it calls AUSF, UDM, PCF, NSSF, SMF and NRF from one process.
+	// Keying per peer gives every pair its own strict 0,1,...,connsPerPeer-1
+	// cycle no matter what the other pairs are doing.
+	//
+	// Held separately for the two schemes because they index two separate
+	// transport arrays: one cursor shared across both pools would reintroduce
+	// the very same subsequence problem one level down.
+	//
+	// sync.Map rather than a map plus mutex: peers are discovered once and then
+	// never change, which is exactly the read-mostly case sync.Map exists for.
+	// After warm-up every request takes the read-only path -- an atomic load
+	// and a lookup, no mutex -- then one atomic add on that peer's own cursor.
+	// The hot path stays lock-free, and peers no longer contend on a single
+	// counter's cache line the way one global cursor made them.
+	tlsNext   sync.Map // map[string]*atomic.Uint64, keyed by host:port
+	clearNext sync.Map // map[string]*atomic.Uint64, keyed by host:port
+}
+
+// nextSlot returns the round-robin slot for one peer and advances that peer's
+// own cursor. cursors is the map for the scheme in use; host is the peer's
+// "host:port" as it appears in the request URL.
+//
+// Add returns the value AFTER incrementing, so subtracting 1 makes the first
+// request to a given peer land on slot 0 and keeps connSlot 0-based in the log.
+func nextSlot(cursors *sync.Map, host string) int {
+	c, ok := cursors.Load(host)
+	if !ok {
+		// LoadOrStore rather than Store: two goroutines can reach a new peer at
+		// the same instant, and the loser must adopt the winner's cursor.
+		// Storing unconditionally would give each of them a private counter and
+		// discard whatever the other had already counted.
+		c, _ = cursors.LoadOrStore(host, new(atomic.Uint64))
+	}
+	return int((c.(*atomic.Uint64).Add(1) - 1) % connsPerPeer)
 }
 
 func newLoggingRoundTripper() *loggingRoundTripper {
@@ -140,9 +192,9 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 		// With the default, a transport may dial an extra connection when its
 		// in-flight stream count reaches the peer's limit. That is accepted:
 		// connsPerPeer sets how many connections are held from the start; it is
-		// not meant to cap the total. At connsPerPeer = 4 a pair holds four
-		// sockets from the start, so a FIFTH one -- a conn_reused false record
-		// arriving after the four opening dials -- is the signal that one slot
+		// not meant to cap the total. At connsPerPeer = 8 a pair holds eight
+		// sockets from the start, so a NINTH one -- a conn_reused false record
+		// arriving after the eight opening dials -- is the signal that one slot
 		// hit 250 in-flight streams, not a sign the setting was ignored.
 		l.tls[i] = &http2.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // matches openapi default
@@ -164,25 +216,37 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 
 func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Take the address rather than the array: a Go array is a value, so
-	// assigning it would copy every element on each request.
+	// assigning it would copy every element on each request. The cursor map is
+	// selected by the same test, so a request is always counted on the cursor
+	// belonging to the pool that will actually carry it.
 	pool := &l.clear
+	cursors := &l.clearNext
 	if req.URL != nil && req.URL.Scheme == "https" {
 		pool = &l.tls
+		cursors = &l.tlsNext
 	}
 
-	// Round-robin over the connsPerPeer transports. The cursor is shared
-	// between the tls and clear pools; this deployment is http-only, so only
-	// the clear pool is ever indexed in practice and sharing costs nothing.
+	// Round-robin over the connsPerPeer transports, per peer.
 	//
-	// Add returns the value AFTER incrementing, so subtracting 1 makes the
-	// first request land on slot 0 and keeps connSlot 0-based in the log.
+	// host is the peer's identity here, matching how the connection pool keys
+	// its conns. A request with no URL cannot be attributed to a peer and has
+	// nowhere to go in any case; it takes the "" key, which keeps this call
+	// total and lets such requests round-robin among themselves instead of
+	// stepping a real peer's cycle.
 	//
-	// At connsPerPeer = 4 the modulo cycles 0,1,2,3,0..., so consecutive
-	// requests out of this NF are dealt to the four transports in turn and land
-	// on four different connections to the same peer. conn_slot in the log
-	// records which of the four carried each request, and its cost is a single
-	// uncontended atomic add per request.
-	connSlot := int((l.next.Add(1) - 1) % connsPerPeer)
+	// At connsPerPeer = 8 each peer's own modulo cycles 0,1,...,7,0..., so
+	// consecutive requests THIS NF SENDS TO THAT PEER are dealt to the eight
+	// transports in turn and land on eight different connections to it.
+	// Requests this NF sends to other peers advance their own cursors and leave
+	// this one untouched. conn_slot in the log records which of the eight
+	// carried each request; an even conn_slot split is now guaranteed by the
+	// code rather than being something the traffic pattern has to happen to
+	// produce.
+	host := ""
+	if req.URL != nil {
+		host = req.URL.Host
+	}
+	connSlot := nextSlot(cursors, host)
 	base := pool[connSlot]
 
 	dst := dstNFFromURL(req)
