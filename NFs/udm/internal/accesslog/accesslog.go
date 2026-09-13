@@ -96,14 +96,17 @@ const (
 	// C6525100g_NF1HTTP_500ms_3logs_0827v1 (RQ2000/UE1000, nine-point build):
 	// client lines were p50 533 B, p99 572 B, max 573 B. The M2 field added by
 	// HTTP_10thlog_0903.md costs 58 B, and stream_id / latency_us can each still
-	// gain a digit over that longest line, so the real ceiling is ~633 B. 704 is
-	// the next Go size class up and leaves ~70 B of headroom.
+	// gain a digit over that longest line, so the ten-point ceiling was ~633 B.
+	// The M3 field req_header_mu_rel_time has the same name length as M2's and
+	// so costs another 58 B, putting the eleven-point ceiling at ~691 B -- past
+	// what 704 covers with any usable margin. 768 is the next Go size class and
+	// restores ~77 B of headroom.
 	//
 	// Do not inflate this "to be safe": a bigger capHint costs nothing per line
 	// in steady state (getLine just reslices a pooled buffer) but linePool is
 	// shared by every record kind and each queued record holds its own buffer, so
 	// the burst-memory ceiling is queueCapacity * capHint.
-	httpLineCap = 704
+	httpLineCap = 768
 
 	envHTTPPath = "HTTP_LOG_PATH"
 	envDBPath   = "DB_LOG_PATH"
@@ -543,20 +546,36 @@ func appendKVTime(b []byte, key string, t time.Time, first bool) []byte {
 //     inside the lock's critical section. Zero when the lock was never taken --
 //     note that headerMuStart set with this zero means the request was cancelled
 //     WHILE queued for the lock, which is its own outcome and not a gap.
-//   - wroteTime:    when every frame of the request had reached the kernel
-//     socket buffer. Zero if the request failed before it was written.
+//   - headerMuRel:   when this attempt released that lock, i.e. the end of the
+//     connection's serialised send path. The hold time is headerMuRel -
+//     headerMuAcq, again subtracted offline. This is the field that makes the
+//     hold time readable on EVERY request rather than only on requests without a
+//     body: reqHeaderMu covers the header path only, so a body is written after
+//     the release and wroteTime - headerMuAcq silently sums the hold time and the
+//     body write. Zero only when the lock was never taken, since both release
+//     sites are stamped; headerMuRel set with wroteTime empty is an attempt that
+//     held the lock and then failed to encode or write its headers.
+//     Stamped just AFTER the release, so headerMuRel of one request can land
+//     marginally after headerMuAcq of the next on the same connection when the
+//     releasing goroutine is preempted; those pairs are a preemption artefact and
+//     must be counted, not clamped.
+//   - wroteTime:    when every frame of the request -- headers AND body -- had
+//     reached the kernel socket buffer. Later than headerMuRel by the body write
+//     for a request with a body, equal to it within nanoseconds for one without.
+//     Zero if the request failed before it was written.
 //   - gotFirstByte: when the first byte of the response reached this process's
 //     read loop. Zero if no response ever arrived.
 //   - respTime:     when the response (or error) was received
 //
-// A zero wroteTime/gotFirstByte/headerMuStart/headerMuAcq is emitted as "" so the
+// A zero wroteTime/gotFirstByte/headerMuStart/headerMuAcq/headerMuRel is emitted
+// as "" so the
 // reader can skip it. latency_us keeps its original meaning, respTime - reqTime,
 // so existing analysis scripts are unaffected. Existing field names and their
 // order are unchanged; new fields are inserted in timestamp order rather than
 // renaming anything.
 func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused bool,
 	streamID uint32, retryCount int,
-	reqTime, headerMuStart, headerMuAcq, wroteTime, gotFirstByte, respTime time.Time,
+	reqTime, headerMuStart, headerMuAcq, headerMuRel, wroteTime, gotFirstByte, respTime time.Time,
 ) {
 	// See httpLineCap above for how the capacity was measured; the check after the
 	// appends verifies it was enough.
@@ -576,6 +595,7 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused b
 	b = appendKVTime(b, "req_time", reqTime, false)
 	b = appendKVTime(b, "req_header_mu_start_time", headerMuStart, false)
 	b = appendKVTime(b, "req_header_mu_acq_time", headerMuAcq, false)
+	b = appendKVTime(b, "req_header_mu_rel_time", headerMuRel, false)
 	b = appendKVTime(b, "wrote_time", wroteTime, false)
 	b = appendKVTime(b, "got_first_byte", gotFirstByte, false)
 	b = appendKVTime(b, "resp_time", respTime, false)

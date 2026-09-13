@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// TYcustom: fork-local client-side instrumentation for the ten-point HTTP/2
-// latency experiment (HTTP_3detailLog_PLAN_0826.md, phase 1 / point M, and
-// HTTP_10thlog_0903.md, point M2).
+// TYcustom: fork-local client-side instrumentation for the eleven-point HTTP/2
+// latency experiment (HTTP_3detailLog_PLAN_0826.md, phase 1 / point M,
+// HTTP_10thlog_0903.md, point M2, and point M3 below).
 //
 // Nothing here runs unless the caller explicitly attaches a *ClientRequestTrace
 // to the request context. With no trace attached every hook added to
@@ -72,6 +72,11 @@ type ClientRequestTrace struct {
 	// here -- offline analysis subtracts the two serialised stamps, which keeps
 	// the critical section down to one clock read and one store.
 	mAcqUnixNano atomic.Int64
+	// TYcustom M3: the instant this attempt RELEASED cc.reqHeaderMu, stamped
+	// just after the release rather than just before it. See writeRequest for
+	// why that side was chosen and what it costs offline. The time spent holding
+	// the lock (M3 - M2) is, like the wait, deliberately NOT computed here.
+	mRelUnixNano atomic.Int64
 	streamID     atomic.Uint32
 	connID       atomic.Pointer[ClientConnIdentity]
 }
@@ -146,6 +151,39 @@ func (t *ClientRequestTrace) ReqHeaderMuStart() time.Time {
 // HTTP_10thlog_0903.md section 2.4 for the two pitfalls that subtraction has.
 func (t *ClientRequestTrace) ReqHeaderMuAcquired() time.Time {
 	ns := t.mAcqUnixNano.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// ReqHeaderMuReleased returns M3: the instant the most recent attempt released
+// cc.reqHeaderMu, i.e. the end of the serialised send path. The zero Time means
+// the lock was never released by this attempt, which -- because both release
+// sites are stamped -- can only mean it was never acquired either (then
+// ReqHeaderMuAcquired is also zero).
+//
+// M3 is stamped AFTER the release, not before it, so it is the instant the lock
+// was already available to the next waiter rather than the instant this attempt
+// finished its last work under it. The difference is a channel receive, tens of
+// nanoseconds, EXCEPT when the goroutine is preempted between the release and
+// the stamp. Offline analysis must therefore tolerate M3 of one request landing
+// slightly after M2 of the next request on the same connection: that ordering is
+// a preemption artefact, not a measurement error, and such pairs must be counted
+// rather than clamped to zero silently. Stamping before the release would have
+// made the ordering exact but would have put a second clock read inside the
+// critical section, which M2's contract forbids.
+//
+// The lock hold time is M3 - M2, computed offline. Note this is NOT the same as
+// M3 - the time the request was written: cc.reqHeaderMu covers only the header
+// path (stream-id allocation plus encodeAndWriteHeaders). A request body is
+// written after the release, under cc.wmu alone, so for a request with a body
+// wrote_time is later than M3 by however long the body took. That gap is
+// exactly what M3 exists to separate from the hold time.
+//
+// Like the other stamps here, the returned Time carries no monotonic reading.
+func (t *ClientRequestTrace) ReqHeaderMuReleased() time.Time {
+	ns := t.mRelUnixNano.Load()
 	if ns == 0 {
 		return time.Time{}
 	}

@@ -41,3 +41,5 @@ cert/*_*.pem
 
 # ./test.sh All
 testing_output/
+# External dependency source (free5gc v4.2.2 -> openapi v1.2.3), not tracked here
+openapi/

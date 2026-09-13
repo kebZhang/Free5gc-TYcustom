@@ -1479,6 +1479,14 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 	if err := cc.awaitOpenSlotForStreamLocked(cs); err != nil {
 		cc.mu.Unlock()
 		<-cc.reqHeaderMu
+		// TYcustom M3 on the error path. Stamped here as well as on the normal
+		// path below so that M3 has ONE meaning -- "this attempt left the
+		// critical section" -- and never doubles as a signal for which exit it
+		// took. An attempt that ends here has M2 and M3 set but stream_id 0,
+		// which is the combination that identifies it.
+		if cs.instr != nil {
+			cs.instr.mRelUnixNano.Store(time.Now().UnixNano())
+		}
 		return err
 	}
 	cc.addStreamLocked(cs) // assigns stream ID
@@ -1516,6 +1524,29 @@ func (cs *clientStream) writeRequest(req *http.Request, streamf func(*clientStre
 	// we must take care when referencing the Request from here on.
 	err = cs.encodeAndWriteHeaders(req)
 	<-cc.reqHeaderMu
+	// TYcustom M3 (req_header_mu_rel_time): the lock is released and the next
+	// waiter may now proceed.
+	//
+	// Deliberately AFTER the receive rather than before it, so nothing is added
+	// to the critical section -- M2's "one clock read and one atomic store,
+	// nothing else, ever" applies to the whole section, not just to its opening
+	// branch, and this NF pair's throughput is bounded by how long this section
+	// is held. The cost of that choice is that a preemption between the receive
+	// and this store can push M3 past the next request's M2; see
+	// ReqHeaderMuReleased for how offline analysis must treat those pairs.
+	//
+	// Placed before the err check so a request whose headers FAILED to encode or
+	// write still carries M3. Such an attempt held the lock for real and its hold
+	// time belongs in the distribution; it is identified by M3 set with
+	// wrote_time empty.
+	//
+	// This is the end of the serialised send path. Everything after it --
+	// writeRequestBody's DATA frames and their flow-control waits -- runs under
+	// cc.wmu only and is no longer serialised against other requests' headers,
+	// which is precisely the boundary wrote_time alone could not show.
+	if cs.instr != nil {
+		cs.instr.mRelUnixNano.Store(time.Now().UnixNano())
+	}
 	if err != nil {
 		return err
 	}
