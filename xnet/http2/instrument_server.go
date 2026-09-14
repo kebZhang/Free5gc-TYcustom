@@ -75,7 +75,61 @@ type ServerRequestTrace struct {
 	// HandlerGo is G: the instant just before the handler goroutine is started.
 	// Zero if the request never reached that point.
 	HandlerGo time.Time
+
+	// recvWholeReqUnixNano is TYcustom recvwholereq: the instant every frame
+	// belonging to this request had been read and parsed by this process.
+	// recvWholeReqHadBody says which frame carried END_STREAM -- a DATA frame
+	// (true) or the HEADERS frame itself (false, i.e. a request with no body at
+	// all, such as a GET).
+	//
+	// Unlike the fields above these MUST be atomic. HandlerGo is written before
+	// `go sc.runHandler(...)`, so starting the goroutine establishes the
+	// happens-before that makes a plain field safe. recvwholereq has no such
+	// luck: for a request WITH a body it is stamped by the serve goroutine in
+	// (*stream).endStream while the handler goroutine is already running, and
+	// the handler goroutine is what reads it back at log time. A plain
+	// time.Time there is a genuine data race and `go test -race` says so.
+	//
+	// Adding atomics makes ServerRequestTrace non-copyable. It is only ever
+	// passed as &st.trace, so nothing copies it; `go vet` copylocks enforces
+	// that this stays true.
+	recvWholeReqUnixNano atomic.Int64
+	recvWholeReqHadBody  atomic.Bool
 }
+
+// markRecvWholeReq records that this request has now been received in full.
+//
+// hadBody is stored BEFORE the timestamp on purpose. sync/atomic operations are
+// sequentially consistent, and readers gate on the timestamp being non-zero, so
+// storing in this order guarantees that a reader which sees a timestamp also
+// sees the matching hadBody rather than a stale zero value.
+//
+// Exactly two atomic stores and one clock read. This runs on the serve
+// goroutine, which drives every stream on the connection: nothing else may be
+// added here.
+func (t *ServerRequestTrace) markRecvWholeReq(hadBody bool) {
+	t.recvWholeReqHadBody.Store(hadBody)
+	t.recvWholeReqUnixNano.Store(time.Now().UnixNano())
+}
+
+// RecvWholeReq returns recvwholereq, or the zero Time if the request was never
+// received in full -- which is a real outcome, not only an error one: a group
+// middleware that calls c.Abort() before the handler reads the body leaves the
+// request half-open, and its record legitimately carries no recvwholereq.
+// Offline analysis must drop the zero ones rather than treat them as epoch.
+//
+// Like the client-side stamps, the returned Time carries no monotonic reading.
+func (t *ServerRequestTrace) RecvWholeReq() time.Time {
+	ns := t.recvWholeReqUnixNano.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// RecvWholeReqHadBody reports whether END_STREAM arrived on a DATA frame (true)
+// or on the HEADERS frame (false). Meaningless unless RecvWholeReq is non-zero.
+func (t *ServerRequestTrace) RecvWholeReqHadBody() bool { return t.recvWholeReqHadBody.Load() }
 
 type serverTraceKey struct{}
 

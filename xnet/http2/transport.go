@@ -177,6 +177,19 @@ type Transport struct {
 	// The errType consists of only ASCII word characters.
 	CountError func(errType string)
 
+	// RecvWholeResp is TYcustom instrumentation. If non-nil, one event is sent
+	// on it every time a response has been received in full -- see
+	// HTTP_recvwholereq_recvwholeresp_changecode_0914.md.
+	//
+	// The send happens on the connection's read loop, which serves every stream
+	// on that connection, so it is deliberately NON-BLOCKING: when the channel
+	// is full the event is dropped and counted by RecvWholeRespDrops. A full
+	// queue costs a dropped log line, never a stalled read loop.
+	//
+	// Nil disables the instrumentation entirely, at the cost of one nil
+	// comparison per response.
+	RecvWholeResp chan<- RecvWholeRespEvent
+
 	// t1, if non-nil, is the standard library Transport using
 	// this transport. Its settings are used (but not its
 	// RoundTrip method, etc).
@@ -2400,7 +2413,9 @@ func (rl *clientConnReadLoop) processHeaders(f *MetaHeadersFrame) error {
 	cs.res = res
 	close(cs.respHeaderRecv)
 	if f.StreamEnded() {
-		rl.endStream(cs)
+		// TYcustom: hadBody=false -- END_STREAM rode on the HEADERS frame, so
+		// this response never had any DATA frames at all.
+		rl.endStream(cs, false)
 	}
 	return nil
 }
@@ -2573,7 +2588,8 @@ func (rl *clientConnReadLoop) processTrailers(cs *clientStream, f *MetaHeadersFr
 	}
 	cs.trailer = trailer
 
-	rl.endStream(cs)
+	// TYcustom: hadBody=true -- trailers only follow a body.
+	rl.endStream(cs, true)
 	return nil
 }
 
@@ -2786,16 +2802,53 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 	}
 
 	if f.StreamEnded() {
-		rl.endStream(cs)
+		// TYcustom: hadBody=true -- END_STREAM arrived on a DATA frame.
+		rl.endStream(cs, true)
 	}
 	return nil
 }
 
-func (rl *clientConnReadLoop) endStream(cs *clientStream) {
+// endStream marks one response as fully received.
+//
+// hadBody is TYcustom: it says which frame carried END_STREAM -- a DATA frame
+// (true) or the HEADERS frame itself (false, e.g. a 204). The two cases are the
+// same event as far as the protocol is concerned but not as far as measurement
+// is concerned, so the recvwholeresp record carries the distinction rather than
+// forcing offline analysis to guess it.
+func (rl *clientConnReadLoop) endStream(cs *clientStream, hadBody bool) {
 	// TODO: check that any declared content-length matches, like
 	// server.go's (*stream).endStream method.
 	if !cs.readClosed {
 		cs.readClosed = true
+
+		// TYcustom recvwholeresp. This is the single convergence point for every
+		// way a response can end, and the !cs.readClosed guard above makes it
+		// fire exactly once per response.
+		//
+		// It MUST stay ahead of closeWithErrorAndCode below. That call wakes the
+		// goroutine blocked in bufPipe.Read; stamping after it would let the
+		// woken goroutine run first and produce a timestamp that appears to
+		// precede the arrival it describes.
+		//
+		// Exactly one clock read and one non-blocking send are permitted here.
+		// This runs on the connection's read loop, which serves every stream on
+		// the connection: no JSON, no allocation, no lock, no blocking send. The
+		// consumer does all formatting.
+		if cs.instr != nil {
+			if sink := rl.cc.t.RecvWholeResp; sink != nil {
+				ev := RecvWholeRespEvent{At: time.Now(), StreamID: cs.ID, HadBody: hadBody}
+				if id := rl.cc.identity; id != nil {
+					ev.ConnID = id.LocalAddr
+					ev.Peer = id.RemoteAddr
+				}
+				select {
+				case sink <- ev:
+				default:
+					recvWholeRespDrops.Add(1)
+				}
+			}
+		}
+
 		// Close cs.bufPipe and cs.peerClosed with cc.mu held to avoid a
 		// race condition: The caller can read io.EOF from Response.Body
 		// and close the body before we close cs.peerClosed, causing

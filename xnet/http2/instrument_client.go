@@ -199,3 +199,55 @@ func (t *ClientRequestTrace) StreamID() uint32 { return t.streamID.Load() }
 // nil if no connection was reached. The pointer is to an object owned by the
 // ClientConn, so reading it allocates nothing.
 func (t *ClientRequestTrace) Conn() *ClientConnIdentity { return t.connID.Load() }
+
+// --- recvwholeresp: the whole response has arrived --------------------------
+
+// RecvWholeRespEvent reports that every frame belonging to one response has been
+// read and parsed by this process's HTTP/2 read loop, i.e. the response is
+// complete as far as this process is concerned.
+//
+// It is NOT a field on the client access-log line because that line is written
+// when RoundTrip returns, which in HTTP/2 is as soon as the response HEADERS
+// have been decoded -- the DATA frames can arrive either before or after it,
+// depending on load. Reading a value there would silently miss exactly the
+// high-load case the experiment is about, so this is a separate record, the same
+// way ResponseHeadersFlushedEvent is on the server side.
+//
+// It is a fixed-size value: the read loop must be able to hand one off without
+// allocating. ConnID and Peer point at the ClientConn's own immutable address
+// strings, so copying them copies headers, not bytes.
+type RecvWholeRespEvent struct {
+	// At is the instant the last frame of this response was processed. It is
+	// stamped before the response body pipe is closed, so it is guaranteed to
+	// precede the moment the waiting goroutine can observe io.EOF.
+	At time.Time
+
+	// ConnID is the local "ip:port" of the connection, identical to the conn
+	// field on this request's client access-log line. (ConnID, StreamID) is the
+	// join key against that line.
+	ConnID   string
+	StreamID uint32
+
+	// Peer is the dial target. Diagnostics and cross-checking only; never a join
+	// key, for the same reason ClientConnIdentity.RemoteAddr is not.
+	Peer string
+
+	// HadBody distinguishes the two ways a response can end:
+	//
+	//   true  -- END_STREAM arrived on a DATA frame, so At is when the last body
+	//            byte was taken off the wire and parsed.
+	//   false -- END_STREAM rode on the HEADERS frame (a 204, say). There never
+	//            were any DATA frames, so At is the same network event as
+	//            got_first_byte plus the in-process work between them.
+	//
+	// Offline analysis MUST filter on this before computing any transport
+	// statistic: the two cases do not measure the same thing.
+	HadBody bool
+}
+
+var recvWholeRespDrops atomic.Uint64
+
+// RecvWholeRespDrops returns how many recvwholeresp events this process could
+// not deliver because the consumer's queue was full. A non-zero value means the
+// record is incomplete and the run's completeness accounting must say so.
+func RecvWholeRespDrops() uint64 { return recvWholeRespDrops.Load() }

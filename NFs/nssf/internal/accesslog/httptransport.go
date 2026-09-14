@@ -205,6 +205,11 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // matches openapi default
 			ReadIdleTimeout: readIdleTimeoutPeriod,
 			PingTimeout:     pingTimeoutPeriod,
+			// TYcustom recvwholeresp. Every slot's transport gets the same sink;
+			// the events carry (conn, stream_id), so the slot a response came
+			// back on is recovered from the client line rather than from which
+			// channel it arrived over.
+			RecvWholeResp: RecvWholeRespSink(),
 		}
 		l.clear[i] = &http2.Transport{
 			AllowHTTP: true,
@@ -214,6 +219,7 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 			},
 			ReadIdleTimeout: readIdleTimeoutPeriod,
 			PingTimeout:     pingTimeoutPeriod,
+			RecvWholeResp:   RecvWholeRespSink(), // TYcustom, see l.tls above
 		}
 	}
 	return l
@@ -510,12 +516,24 @@ func InboundLogger() gin.HandlerFunc {
 		var srvReqID uint64
 		var streamID uint32
 		var handlerGo time.Time
+		// TYcustom recvwholereq: when this request was received in full. Read
+		// here, after c.Next(), because for a request WITH a body the stamp is
+		// taken by the serve goroutine while this handler is still running --
+		// reading it any earlier could see it unset. Both accessors are atomic
+		// loads; neither blocks.
+		//
+		// Zero means the request was never received in full (e.g. a group
+		// middleware aborted before the body was read). Offline drops those
+		// rather than treating the zero Time as a real measurement.
+		var recvWholeReq time.Time
+		var reqHadBody bool
 		if tr := http2.ServerRequestTraceFromContext(c.Request.Context()); tr != nil {
 			srvReqID, streamID, handlerGo = tr.ID, tr.StreamID, tr.HandlerGo
+			recvWholeReq, reqHadBody = tr.RecvWholeReq(), tr.RecvWholeReqHadBody()
 		}
 
 		LogHTTPInbound(method, uri, ueID, connID, srvReqID, streamID,
-			handlerGo, reqTime, respTime)
+			handlerGo, reqTime, respTime, recvWholeReq, reqHadBody)
 	}
 }
 

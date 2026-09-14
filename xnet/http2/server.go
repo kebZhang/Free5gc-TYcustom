@@ -1990,6 +1990,14 @@ func (st *stream) endStream() {
 	sc := st.sc
 	sc.serveG.check()
 
+	// TYcustom recvwholereq, hook A: the request had a body and its last DATA
+	// frame (or its trailers block) has now been parsed.
+	//
+	// It MUST stay ahead of the body close below. That call wakes the handler
+	// goroutine blocked reading the body; stamping after it would let the woken
+	// goroutine reach the log line first and find the field still empty.
+	st.trace.markRecvWholeReq(true)
+
 	if st.declBodyBytes != -1 && st.declBodyBytes != st.bodyBytes {
 		st.body.CloseWithError(fmt.Errorf("request declared a Content-Length of %d but only wrote %d bytes",
 			st.declBodyBytes, st.bodyBytes))
@@ -2169,6 +2177,10 @@ func (sc *serverConn) upgradeRequest(req *http.Request) {
 	// always nil), but instrumented so that "server record with no G" stays an
 	// impossible state rather than something to investigate after the fact.
 	st.initTrace()
+	// TYcustom recvwholereq: this path builds the stream as stateHalfClosedRemote,
+	// i.e. no request body, so hook B applies. Unreachable on this deployment for
+	// the same reason the G stamp below is, and instrumented for the same reason.
+	st.trace.markRecvWholeReq(false)
 	req = req.WithContext(st)
 	rw.rws.req = req
 	sc.curHandlers++
@@ -2313,6 +2325,17 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		return nil, nil, err
 	}
 	bodyOpen := !f.StreamEnded()
+	if !bodyOpen {
+		// TYcustom recvwholereq, hook B: END_STREAM rode on the HEADERS frame,
+		// so there will never be any DATA frames and (*stream).endStream is
+		// never called for this request. The request is complete right here.
+		//
+		// This runs inside processHeaders, before scheduleHandler, so the value
+		// is in place before the handler goroutine even exists -- earlier than
+		// G, and with no lock held. st.initTrace() has already run inside the
+		// newWriterAndRequestNoBody call just above.
+		st.trace.markRecvWholeReq(false)
+	}
 	if bodyOpen {
 		if vv, ok := rp.Header["Content-Length"]; ok {
 			if cl, err := strconv.ParseUint(vv[0], 10, 63); err == nil {

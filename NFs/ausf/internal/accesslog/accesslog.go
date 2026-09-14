@@ -123,6 +123,17 @@ const (
 // costs a counted drop rather than any stall -- so a queue this size is ample.
 const wQueueCapacity = 1 << 16 // 65536
 
+// rQueueCapacity bounds the recvwholeresp event queue. Sized exactly like
+// wQueueCapacity and for the same reason: the element type contains strings, so
+// the whole buffer is scanned on every GC cycle whether or not it holds
+// anything. At most one recvwholeresp event exists per outbound response, the
+// collector only formats JSON, and a full queue costs a counted drop rather than
+// any stall on the connection's read loop.
+//
+// Do NOT size this like queueCapacity (1 << 21): that queue holds *[]byte, one
+// pointer each, and is drained by the writer rather than by a formatter.
+const rQueueCapacity = 1 << 16 // 65536
+
 var (
 	queue    chan record
 	dropped  atomic.Uint64      // count of records dropped because the queue was full
@@ -134,6 +145,13 @@ var (
 	// writer must never format JSON or block, hence the hand-off.
 	wQueue    chan http2.ResponseHeadersFlushedEvent
 	wFlushReq chan chan struct{}
+
+	// rQueue carries recvwholeresp events from the HTTP/2 client read loop to
+	// rCollectorLoop, which turns them into log lines. Same hand-off rule as
+	// wQueue: the read loop must never format JSON or block, because it serves
+	// every stream on its connection.
+	rQueue    chan http2.RecvWholeRespEvent
+	rFlushReq chan chan struct{}
 )
 
 // Init starts the background writer. It is safe to call multiple times; only the
@@ -145,8 +163,11 @@ func Init() {
 		flushReq = make(chan chan struct{})
 		wQueue = make(chan http2.ResponseHeadersFlushedEvent, wQueueCapacity)
 		wFlushReq = make(chan chan struct{})
+		rQueue = make(chan http2.RecvWholeRespEvent, rQueueCapacity)
+		rFlushReq = make(chan chan struct{})
 		go writerLoop()
 		go wCollectorLoop()
+		go rCollectorLoop()
 	})
 }
 
@@ -170,6 +191,21 @@ func WDropped() uint64 { return http2.ResponseHeadersFlushedDrops() }
 // byte-offset bookkeeping. Anything other than zero invalidates the run's W
 // data; it is not a dropped-record count.
 func WAccountingErrors() uint64 { return http2.WAccountingErrors() }
+
+// RecvWholeRespSink returns the channel to hand to http2.Transport.RecvWholeResp.
+//
+// Like WEventSink it calls Init first: a nil channel here would be silently
+// fatal, because the non-blocking send inside the fork would always take its
+// default branch and the run would produce no recvwholeresp events at all.
+func RecvWholeRespSink() chan<- http2.RecvWholeRespEvent {
+	Init()
+	return rQueue
+}
+
+// RecvWholeRespDropped reports how many recvwholeresp events were lost because
+// this queue was full. The counter lives in the fork, next to where the drops
+// happen. Anything other than zero invalidates the run's recvwholeresp data.
+func RecvWholeRespDropped() uint64 { return http2.RecvWholeRespDrops() }
 
 // wCollectorLoop is the single consumer of wQueue. All JSON work for W lines
 // happens here rather than on the socket write path, and the resulting line then
@@ -227,6 +263,61 @@ func logWFlushed(ev http2.ResponseHeadersFlushedEvent) {
 	enqueue(kindHTTP, bp)
 }
 
+// rCollectorLoop is the single consumer of rQueue. Structurally identical to
+// wCollectorLoop: all JSON work for recvwholeresp lines happens here rather than
+// on the HTTP/2 read loop, and the resulting line then takes the ordinary
+// enqueue route, so the process still has exactly one goroutine writing to the
+// log files.
+func rCollectorLoop() {
+	drain := func() {
+		for {
+			select {
+			case ev := <-rQueue:
+				logRecvWholeResp(ev)
+			default:
+				return
+			}
+		}
+	}
+	for {
+		select {
+		case ev := <-rQueue:
+			logRecvWholeResp(ev)
+		case done := <-rFlushReq:
+			drain()
+			close(done)
+		}
+	}
+}
+
+// logRecvWholeResp renders one recvwholeresp event. It is a separate line rather
+// than a field on the client request line because the whole response can arrive
+// either before or after RoundTrip returns -- in HTTP/2 RoundTrip returns on the
+// response HEADERS, and the DATA frames race the caller's goroutine being
+// scheduled. Reading the value where the client line is written would therefore
+// miss it in exactly the high-load case this experiment is about.
+//
+// src is this NF (the side that RECEIVED the response); dst is not knowable on
+// the read loop and is left as "NaN" -- offline takes it from the client line
+// via the (conn, stream_id) join. peer is the dial target, for cross-checking
+// only, never a join key.
+func logRecvWholeResp(ev http2.RecvWholeRespEvent) {
+	bp := getLine(320)
+	b := *bp
+	b = append(b, '{')
+	b = appendKV(b, "event", "recvwholeresp", true)
+	b = appendKV(b, "src", srcNF, false)
+	b = appendKV(b, "dst", "NaN", false)
+	b = appendKV(b, "conn", ev.ConnID, false)
+	b = appendKVInt(b, "stream_id", int(ev.StreamID), false)
+	b = appendKVTime(b, "recvwholeresp", ev.At, false)
+	b = appendKVBool(b, "resp_had_body", ev.HadBody, false)
+	b = appendKV(b, "peer", ev.Peer, false)
+	b = append(b, '}')
+	*bp = b
+	enqueue(kindHTTP, bp)
+}
+
 // Flush blocks until every record enqueued before this call has been written and
 // fsync'd-to-buffer and the buffers flushed to the files. Call it from the NF's
 // shutdown path (e.g. on SIGTERM) so the last records are not lost when the pod
@@ -248,6 +339,12 @@ func Flush() {
 		wDone := make(chan struct{})
 		wFlushReq <- wDone
 		<-wDone
+	}
+	// TYcustom: same for the recvwholeresp collector, and for the same reason.
+	if rFlushReq != nil {
+		rDone := make(chan struct{})
+		rFlushReq <- rDone
+		<-rDone
 	}
 
 	done := make(chan struct{})
@@ -643,7 +740,7 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused b
 //   - reqTime:   when the request arrived at this server
 //   - respTime:  when the response was sent back
 func LogHTTPInbound(method, uri, ueID, connID string, srvReqID uint64, streamID uint32,
-	handlerGo, reqTime, respTime time.Time,
+	handlerGo, reqTime, respTime, recvWholeReq time.Time, reqHadBody bool,
 ) {
 	// Measured server lines average 277 B and reach 320 B, before the four
 	// fields added here.
@@ -661,6 +758,10 @@ func LogHTTPInbound(method, uri, ueID, connID string, srvReqID uint64, streamID 
 	b = appendKVTime(b, "server_handler_go_time", handlerGo, false)
 	b = appendKVTime(b, "req_time", reqTime, false)
 	b = appendKVTime(b, "resp_time", respTime, false)
+	// TYcustom recvwholereq. Appended after the existing fields so every key
+	// that was already on this line keeps its name, its value and its position.
+	b = appendKVTime(b, "recvwholereq", recvWholeReq, false)
+	b = appendKVBool(b, "req_had_body", reqHadBody, false)
 	b = appendDurUs(b, "latency_us", respTime.Sub(reqTime))
 	b = append(b, '}')
 	*bp = b
