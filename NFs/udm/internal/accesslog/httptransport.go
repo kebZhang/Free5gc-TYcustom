@@ -49,18 +49,17 @@ const (
 )
 
 // connsPerPeer is how many HTTP/2 connections this NF opens to each peer NF up
-// front, and how many round-robin slots requests are dealt across. It is 8: the
-// transport starts with eight connections per peer and is left free to add
-// more on its own.
+// front, and how many round-robin slots requests are dealt across. It is 4: the
+// transport starts with four connections per peer and is left free to add more
+// on its own.
 //
 // Each slot is a separate http2.Transport with its own private pool, so N slots
 // mean N connections held from the start, with requests handed to them one after
-// another in turn. The slots are per PROCESS, not per peer: these same 8
+// another in turn. The slots are per PROCESS, not per peer: these same 4
 // transports serve every peer this NF talks to, and each one keeps its own pool
 // keyed by address. Slot i's connection to UDR and slot i's connection to UDM
-// are two different sockets, which is what makes this eight connections PER
-// PAIR rather than eight in total: a NF with 4 peers holds 4*8 = 32
-// connections.
+// are two different sockets, which is what makes this four connections PER PAIR
+// rather than four in total: a NF with 4 peers holds 4*4 = 16 connections.
 //
 // The history matters for reading this number. It was 2 for the original
 // round-robin experiment (HTTP_MULTI_CONN_ROUNDROBIN_PLAN_0806.md), then went
@@ -77,50 +76,51 @@ const (
 // baseline the per-request timestamp instrumentation (the wrote/first-byte trace
 // here and the M/M2/M3/G/W points in the local x/net fork) was built and read
 // against -- then 2 again, then 4, then 8, then 4, then 2, then 1, then 2, then
-// 4, then 8, then 16. This is a return to 8.
+// 4, then 8, then 16, then 8. This is a return to 4.
 //
-// The run it pairs with is the 16-slot one immediately before it. Both carry the
-// full stamp set -- M3 (reqHeaderMu released), which splits the old
-// mAcq->wroteTime into the time the send path was held exclusively and the body
-// write that follows it outside the lock, and the recvwholereq/recvwholeresp
-// points (HTTP_recvwholereq_recvwholeresp_changecode_0914.md) -- so the step is
-// read stamp for stamp, with nothing borrowed from the older runs that predate
-// them. If the 16-slot setting was changed through to here without a run of its
-// own, the nearest neighbour holding the full stamp set is the earlier 8-slot
-// run, and this is then a repeat of that setting rather than a step.
+// The run it pairs with is the 8-slot one immediately before it, which already
+// carries the readFrameCh capacity of 1 in the local x/net fork (serveConn in
+// xnet/http2/server.go, Readframech_buffer1_0930.md). That capacity is held
+// fixed here, so the slot count is the only thing that moves between the two.
+// Both also carry the full stamp set -- M3 (reqHeaderMu released), which splits
+// the old mAcq->wroteTime into the time the send path was held exclusively and
+// the body write that follows it outside the lock, and the
+// recvwholereq/recvwholeresp points
+// (HTTP_recvwholereq_recvwholeresp_changecode_0914.md) -- so the step is read
+// stamp for stamp. The earlier 4-slot run with the full stamp set (0914)
+// predates the readFrameCh change: against it this run differs in that one line
+// of the fork rather than in the slot count, so it reads the capacity change at
+// 4 slots, not the step from 8 to 4.
 //
 // What the 1-slot run concentrated on a single socket -- the per-clientConn
 // reqHeaderMu that serialises header writes, HTTP/2 head-of-line delay behind
-// whichever stream holds that lock -- the 16-slot run split in sixteen per NF
-// pair, and this one splits in eight. Against that 16-slot neighbour it is one
-// clean halving, the same step read in the opposite direction: an M->M2 wait
-// that roughly doubles was queueing on the lock, one that does not move is
-// peer-side or wire delay, and M2->M3 says how long the lock was held once won
-// either way.
+// whichever stream holds that lock -- the 8-slot run split in eight per NF
+// pair, and this one splits in four. Against that 8-slot neighbour it is one
+// clean halving: an M->M2 wait that roughly doubles was queueing on the lock,
+// one that does not move is peer-side or wire delay, and M2->M3 says how long
+// the lock was held once won either way.
 //
-// Each pair walks its own 0..7 cycle (see tlsNext/clearNext below), so the deal
-// is exact: eight consecutive requests from this NF to one peer go out on
-// eight different connections, whatever the other pairs are doing. Per-slot
-// samples double against the 16-slot run. The thinnest pairs measured, AMF->PCF
-// and PCF->UDR at 1000 requests, come back to ~125 records per slot from the
-// ~62 that 16 slots gave them. That is enough to check the deal is even and to
-// read a per-slot median, but a per-slot P99 on those two pairs still rests on
-// about one record, so read tail latency off the thick pairs instead: AMF->UDM
-// at ~750 and UDM->UDR at ~1125 per slot.
+// Each pair walks its own 0,1,2,3 cycle (see tlsNext/clearNext below), so the
+// deal is exact: four consecutive requests from this NF to one peer go out on
+// four different connections, whatever the other pairs are doing. Per-slot
+// samples double against the 8-slot run. The thinnest pairs measured, AMF->PCF
+// and PCF->UDR at 1000 requests, hold ~250 records per slot -- against the ~125
+// that 8 slots gave them -- so a per-slot P99 becomes usable on every pair, not
+// just on the thick ones (AMF->UDM at ~1500 and UDM->UDR at ~2250 per slot).
 //
-// Growth beyond these 8 is still permitted: StrictMaxConcurrentStreams is
+// Growth beyond these 4 is still permitted: StrictMaxConcurrentStreams is
 // deliberately left unset (see below), so when a slot's in-flight streams reach
 // the peer's 250-stream limit the transport dials an additional connection by
 // itself. Runs from 4 to 16 held exactly connsPerPeer sockets per pair with zero
 // redials, and their peak in-flight stream counts (37/65/156 at the 0807
 // measurement) never reached 250. Those peaks are PER SLOT, so the fewer the
-// slots the more each carries; at 8 every slot carries twice what one slot of
-// the 16-slot run carried, so overflow is likelier here than there -- though no
-// likelier than in the earlier 8-slot runs at the same load. A NINTH socket on a
-// pair -- a conn_reused false record arriving after the eight opening dials --
-// is that overflow, not a sign the setting was ignored; conn_slot is the field
-// that shows whether the split across the eight held slots is even.
-const connsPerPeer = 8
+// slots the more each carries; at 4 every slot carries twice what one slot of
+// the 8-slot run carried, so overflow is likelier here than there -- though no
+// likelier than in the earlier 4-slot runs at the same load. A FIFTH socket on a
+// pair -- a conn_reused false record arriving after the four opening dials -- is
+// that overflow, not a sign the setting was ignored; conn_slot is the field that
+// shows whether the split across the four held slots is even.
+const connsPerPeer = 4
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
@@ -205,9 +205,9 @@ func newLoggingRoundTripper() *loggingRoundTripper {
 		// With the default, a transport may dial an extra connection when its
 		// in-flight stream count reaches the peer's limit. That is accepted:
 		// connsPerPeer sets how many connections are held from the start; it is
-		// not meant to cap the total. At connsPerPeer = 8 a pair holds eight
-		// sockets from the start, so a NINTH one -- a conn_reused false
-		// record arriving after the eight opening dials -- is the signal that
+		// not meant to cap the total. At connsPerPeer = 4 a pair holds four
+		// sockets from the start, so a FIFTH one -- a conn_reused false
+		// record arriving after the four opening dials -- is the signal that
 		// one slot hit 250 in-flight streams, not a sign the setting was
 		// ignored.
 		l.tls[i] = &http2.Transport{
@@ -254,13 +254,13 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	// total and lets such requests round-robin among themselves instead of
 	// stepping a real peer's cycle.
 	//
-	// At connsPerPeer = 8 each peer's own modulo cycles 0,1,...,7,0,1,...,7,
-	// so eight consecutive requests THIS NF SENDS TO THAT PEER are dealt
-	// strictly one per transport and land on eight different connections to it.
+	// At connsPerPeer = 4 each peer's own modulo cycles 0,1,2,3,0,1,2,3,...,
+	// so four consecutive requests THIS NF SENDS TO THAT PEER are dealt
+	// strictly one per transport and land on four different connections to it.
 	// Requests this NF sends to other peers advance their own cursors and leave
 	// this one untouched, so the deal on this pair is never perturbed by traffic
-	// to another. conn_slot in the log records which of the eight carried each
-	// request; an even 12.5% per slot is guaranteed by the code rather than being
+	// to another. conn_slot in the log records which of the four carried each
+	// request; an even 25% per slot is guaranteed by the code rather than being
 	// something the traffic pattern has to happen to produce.
 	host := ""
 	if req.URL != nil {
