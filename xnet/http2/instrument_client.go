@@ -95,6 +95,16 @@ func clientRequestTraceFromContext(ctx context.Context) *ClientRequestTrace {
 	return tr
 }
 
+// requestTrace is clientRequestTraceFromContext gated on t.RecvWholeResp: a
+// transport with a nil sink is uninstrumented, so it does not even search the
+// context. Every client-side stamp hangs off the trace this returns.
+func (t *Transport) requestTrace(ctx context.Context) *ClientRequestTrace {
+	if t.RecvWholeResp == nil {
+		return nil
+	}
+	return clientRequestTraceFromContext(ctx)
+}
+
 // The four context.Context methods. Deadline/Done/Err forward verbatim, so
 // deriving a child context from a ClientRequestTrace still takes the efficient
 // path inside package context: parentCancelCtx finds the parent's *cancelCtx

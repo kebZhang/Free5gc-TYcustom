@@ -101,7 +101,9 @@ func bindRouter(udr app.App, router *gin.Engine, tlsKeyLogPath string) (*http.Se
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
-	router.Use(accesslog.InboundLogger())
+	if accesslog.Enabled {
+		router.Use(accesslog.InboundLogger())
+	}
 
 	dataRepositoryGroup := router.Group(factory.UdrDrResUriPrefix)
 	dataRepositoryGroup.Use(func(c *gin.Context) {

@@ -14,8 +14,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
-	_ "net/http/pprof" // registers /debug/pprof handlers on the default mux
+	// "net/http" // [OFF 1026] profiling, see main()
+	// _ "net/http/pprof" // [OFF 1026] registers /debug/pprof handlers on the default mux
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,7 +25,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/free5gc/pcf/internal/accesslog"
+	// "github.com/free5gc/pcf/internal/accesslog" // [OFF 1026] only for RegisterSchedStat, see main()
 	"github.com/free5gc/pcf/internal/logger"
 	"github.com/free5gc/pcf/pkg/factory"
 	"github.com/free5gc/pcf/pkg/service"
@@ -36,6 +36,11 @@ import (
 var PCF *service.PcfApp
 
 func main() {
+	// TYcustom: no profiling or sampling. The heap-allocation profiler is the
+	// one profiler the Go runtime runs by default (MemProfileRate = 512 KiB), so
+	// switch it off too, as early as possible per the runtime docs.
+	runtime.MemProfileRate = 0
+
 	defer func() {
 		if p := recover(); p != nil {
 			// Print stack for panic to log. Fatalf() will let program exit.
@@ -44,6 +49,10 @@ func main() {
 	}()
 
 	// --- Lock-contention + scheduler profiling (TYcustom, 0826) ---
+	// [OFF 1026] Commented out, not deleted. To turn it back on: uncomment
+	// the code lines below and the imports marked [OFF 1026], and delete the
+	// runtime.MemProfileRate = 0 line at the top of main.
+	//
 	// Turn on mutex + block profiling, register /debug/schedstat, and expose
 	// pprof on :6060. Snapshot /debug/pprof/{block,mutex} and /debug/schedstat
 	// before and after each RQ run and diff them: the block profile attributes
@@ -55,14 +64,14 @@ func main() {
 	// Safe to leave on: sampling is cheap and both endpoints are pull-only.
 	// Remove/guard for production if the extra port is unwanted.
 	// See LOCK_SCHED_PROFILING_GUIDE_0826.md for the full procedure.
-	runtime.SetMutexProfileFraction(5) // sample ~1/5 of mutex contention events
-	runtime.SetBlockProfileRate(10000) // sample a blocking event ~every 10us blocked
-	accesslog.RegisterSchedStat()      // must precede the ListenAndServe below
-	go func() {
-		if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
-			logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
-		}
-	}()
+	// runtime.SetMutexProfileFraction(5) // sample ~1/5 of mutex contention events
+	// runtime.SetBlockProfileRate(10000) // sample a blocking event ~every 10us blocked
+	// accesslog.RegisterSchedStat()      // must precede the ListenAndServe below
+	// go func() {
+	// 	if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
+	// 		logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
+	// 	}
+	// }()
 
 	app := cli.NewApp()
 	app.Name = "pcf"

@@ -147,7 +147,9 @@ func (s *Server) shutdownHttpServer() {
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
-	router.Use(accesslog.InboundLogger())
+	if accesslog.Enabled {
+		router.Use(accesslog.InboundLogger())
+	}
 
 	// EE
 	udmEERoutes := s.getEventExposureRoutes()

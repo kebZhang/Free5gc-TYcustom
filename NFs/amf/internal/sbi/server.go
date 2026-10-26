@@ -75,7 +75,9 @@ func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 
 	router.Use(metrics.InboundMetrics())
-	router.Use(accesslog.InboundLogger())
+	if accesslog.Enabled {
+		router.Use(accesslog.InboundLogger())
+	}
 	amfHttpCallBackGroup := router.Group(factory.AmfCallbackResUriPrefix)
 	amfHttpCallBackRoutes := s.getHttpCallBackRoutes()
 	applyRoutes(amfHttpCallBackGroup, amfHttpCallBackRoutes)

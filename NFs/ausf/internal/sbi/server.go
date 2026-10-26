@@ -68,7 +68,9 @@ func NewServer(ausf ServerAusf, tlsKeyLogPath string) (*Server, error) {
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
-	router.Use(accesslog.InboundLogger())
+	if accesslog.Enabled {
+		router.Use(accesslog.InboundLogger())
+	}
 
 	for _, serviceName := range factory.AusfConfig.Configuration.ServiceNameList {
 		switch models.ServiceName(serviceName) {

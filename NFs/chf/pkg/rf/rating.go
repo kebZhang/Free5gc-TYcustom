@@ -20,7 +20,7 @@ import (
 	"context"
 	"log"
 	"math"
-	_ "net/http/pprof"
+	// _ "net/http/pprof" // [OFF 1026] commented out, not deleted
 	"strconv"
 	"strings"
 	"sync"

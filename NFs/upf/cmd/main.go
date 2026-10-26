@@ -3,6 +3,7 @@ package main
 import (
 	"math/rand"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"time"
 
@@ -16,6 +17,11 @@ import (
 )
 
 func main() {
+	// TYcustom: no profiling or sampling. The heap-allocation profiler is the
+	// one profiler the Go runtime runs by default (MemProfileRate = 512 KiB), so
+	// switch it off too, as early as possible per the runtime docs.
+	runtime.MemProfileRate = 0
+
 	defer func() {
 		if p := recover(); p != nil {
 			// Print stack for panic to log. Fatalf() will let program exit.

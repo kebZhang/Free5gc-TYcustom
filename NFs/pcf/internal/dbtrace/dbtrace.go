@@ -4,6 +4,9 @@
 // collection + UE id, emits one DB access-log entry (asynchronously, see
 // accesslog), and then delegates to the real mongoapi call.
 //
+// With accesslog.Enabled false every wrapper goes straight to mongoapi: no clock
+// read, no UE id extraction, no log entry.
+//
 // Usage: replace `mongoapi.RestfulAPIXxx(` call sites with `dbtrace.RestfulAPIXxx(`.
 // Signatures and semantics are identical, so this is a one-token change.
 //
@@ -52,6 +55,9 @@ func logDB(collName, operation string, filter bson.M, start time.Time) {
 }
 
 func RestfulAPIGetOne(collName string, filter bson.M, argOpt ...interface{}) (map[string]interface{}, error) {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIGetOne(collName, filter, argOpt...)
+	}
 	start := time.Now()
 	res, err := mongoapi.RestfulAPIGetOne(collName, filter, argOpt...)
 	logDB(collName, "GetOne", filter, start)
@@ -59,6 +65,9 @@ func RestfulAPIGetOne(collName string, filter bson.M, argOpt ...interface{}) (ma
 }
 
 func RestfulAPIGetMany(collName string, filter bson.M, argOpt ...interface{}) ([]map[string]interface{}, error) {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIGetMany(collName, filter, argOpt...)
+	}
 	start := time.Now()
 	res, err := mongoapi.RestfulAPIGetMany(collName, filter, argOpt...)
 	logDB(collName, "GetMany", filter, start)
@@ -68,6 +77,9 @@ func RestfulAPIGetMany(collName string, filter bson.M, argOpt ...interface{}) ([
 func RestfulAPIPutOne(
 	collName string, filter bson.M, putData map[string]interface{}, argOpt ...interface{},
 ) (bool, error) {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIPutOne(collName, filter, putData, argOpt...)
+	}
 	start := time.Now()
 	existed, err := mongoapi.RestfulAPIPutOne(collName, filter, putData, argOpt...)
 	logDB(collName, "PutOne", filter, start)
@@ -75,6 +87,9 @@ func RestfulAPIPutOne(
 }
 
 func RestfulAPIDeleteOne(collName string, filter bson.M, argOpt ...interface{}) error {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIDeleteOne(collName, filter, argOpt...)
+	}
 	start := time.Now()
 	err := mongoapi.RestfulAPIDeleteOne(collName, filter, argOpt...)
 	logDB(collName, "DeleteOne", filter, start)
@@ -82,6 +97,9 @@ func RestfulAPIDeleteOne(collName string, filter bson.M, argOpt ...interface{}) 
 }
 
 func RestfulAPIDeleteMany(collName string, filter bson.M, argOpt ...interface{}) error {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIDeleteMany(collName, filter, argOpt...)
+	}
 	start := time.Now()
 	err := mongoapi.RestfulAPIDeleteMany(collName, filter, argOpt...)
 	logDB(collName, "DeleteMany", filter, start)
@@ -91,6 +109,9 @@ func RestfulAPIDeleteMany(collName string, filter bson.M, argOpt ...interface{})
 func RestfulAPIMergePatch(
 	collName string, filter bson.M, patchData map[string]interface{}, argOpt ...interface{},
 ) error {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIMergePatch(collName, filter, patchData, argOpt...)
+	}
 	start := time.Now()
 	err := mongoapi.RestfulAPIMergePatch(collName, filter, patchData, argOpt...)
 	logDB(collName, "MergePatch", filter, start)
@@ -98,6 +119,9 @@ func RestfulAPIMergePatch(
 }
 
 func RestfulAPIJSONPatch(collName string, filter bson.M, patchJSON []byte, argOpt ...interface{}) error {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIJSONPatch(collName, filter, patchJSON, argOpt...)
+	}
 	start := time.Now()
 	err := mongoapi.RestfulAPIJSONPatch(collName, filter, patchJSON, argOpt...)
 	logDB(collName, "JSONPatch", filter, start)
@@ -107,6 +131,9 @@ func RestfulAPIJSONPatch(collName string, filter bson.M, patchJSON []byte, argOp
 func RestfulAPIJSONPatchExtend(
 	collName string, filter bson.M, patchJSON []byte, dataName string, argOpt ...interface{},
 ) error {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIJSONPatchExtend(collName, filter, patchJSON, dataName, argOpt...)
+	}
 	start := time.Now()
 	err := mongoapi.RestfulAPIJSONPatchExtend(collName, filter, patchJSON, dataName, argOpt...)
 	logDB(collName, "JSONPatchExtend", filter, start)
@@ -116,6 +143,9 @@ func RestfulAPIJSONPatchExtend(
 func RestfulAPIPullOne(
 	collName string, filter bson.M, putData map[string]interface{}, argOpt ...interface{},
 ) error {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIPullOne(collName, filter, putData, argOpt...)
+	}
 	start := time.Now()
 	err := mongoapi.RestfulAPIPullOne(collName, filter, putData, argOpt...)
 	logDB(collName, "PullOne", filter, start)
@@ -125,6 +155,9 @@ func RestfulAPIPullOne(
 func RestfulAPIPost(
 	collName string, filter bson.M, postData map[string]interface{}, argOpt ...interface{},
 ) (bool, error) {
+	if !accesslog.Enabled {
+		return mongoapi.RestfulAPIPost(collName, filter, postData, argOpt...)
+	}
 	start := time.Now()
 	existed, err := mongoapi.RestfulAPIPost(collName, filter, postData, argOpt...)
 	logDB(collName, "Post", filter, start)

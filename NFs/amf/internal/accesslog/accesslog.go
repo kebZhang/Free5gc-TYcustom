@@ -33,6 +33,21 @@ import (
 // and the "NF" side for DB logs). Set once at package init.
 const srcNF = "AMF"
 
+// Enabled is the compile-time switch for everything this package writes. With
+// it false the NF writes nothing to HTTP_log / DB_log / AMF_log /
+// AMF_worker_log, and none of the code that would produce a line runs:
+//   - Init starts no goroutine, makes no channel and opens no file;
+//   - every Log* function returns before formatting anything;
+//   - Client() still deals requests round-robin over connsPerPeer connections
+//     but attaches no trace to them;
+//   - WEventSink / RecvWholeRespSink return nil, which also switches off the
+//     x/net fork's own per-request instrumentation on both server and client;
+//   - call sites outside this package test Enabled themselves, so they skip
+//     building their arguments too.
+//
+// Being a constant, the disabled branches are removed by the compiler.
+const Enabled = false
+
 // recKind distinguishes which file a record belongs to.
 type recKind uint8
 
@@ -165,6 +180,9 @@ var (
 // first call has any effect. It is invoked automatically on first use, but NFs
 // may call it explicitly at startup.
 func Init() {
+	if !Enabled {
+		return
+	}
 	initOne.Do(func() {
 		queue = make(chan record, queueCapacity)
 		flushReq = make(chan chan struct{})
@@ -184,6 +202,9 @@ func Init() {
 // the non-blocking send inside the fork would always take its default branch and
 // the run would produce no W events at all. Package initialisation already calls
 // Init, but this makes the sink independent of import ordering.
+//
+// With Enabled false Init makes no channel and this returns nil on purpose: a
+// nil sink is what switches the fork's server-side instrumentation off.
 func WEventSink() chan<- http2.ResponseHeadersFlushedEvent {
 	Init()
 	return wQueue
@@ -204,6 +225,9 @@ func WAccountingErrors() uint64 { return http2.WAccountingErrors() }
 // Like WEventSink it calls Init first: a nil channel here would be silently
 // fatal, because the non-blocking send inside the fork would always take its
 // default branch and the run would produce no recvwholeresp events at all.
+//
+// With Enabled false this returns nil on purpose: a nil sink is what switches
+// the fork's client-side instrumentation off.
 func RecvWholeRespSink() chan<- http2.RecvWholeRespEvent {
 	Init()
 	return rQueue
@@ -705,6 +729,9 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused b
 	streamID uint32, retryCount int,
 	reqTime, headerMuStart, headerMuAcq, headerMuRel, wroteTime, gotFirstByte, respTime time.Time,
 ) {
+	if !Enabled {
+		return
+	}
 	// See httpLineCap above for how the capacity was measured; the check after the
 	// appends verifies it was enough.
 	bp := getLine(httpLineCap)
@@ -773,6 +800,9 @@ func LogHTTP(dstNF, method, uri, ueID, connID string, connSlot int, connReused b
 func LogHTTPInbound(method, uri, ueID, connID string, srvReqID uint64, streamID uint32,
 	handlerGo, reqTime, respTime, recvWholeReq time.Time, reqHadBody bool,
 ) {
+	if !Enabled {
+		return
+	}
 	// Measured server lines average 277 B and reach 320 B, before the four
 	// fields added here.
 	bp := getLine(512)
@@ -808,6 +838,9 @@ func LogHTTPInbound(method, uri, ueID, connID string, srvReqID uint64, streamID 
 //   - reqTime:   when the DB request was issued
 //   - respTime:  when the DB reply was received
 func LogDB(mongo, resource, operation, ueID string, reqTime, respTime time.Time) {
+	if !Enabled {
+		return
+	}
 	// Measured DB lines average 253 B and reach 269 B, so 256 sat right on
 	// the boundary and about half of them reallocated.
 	bp := getLine(320)
@@ -834,6 +867,9 @@ func LogDB(mongo, resource, operation, ueID string, reqTime, respTime time.Time)
 //   - ueID:      UE id involved (may be "")
 //   - sctpTime:  SCTP read time (UL) or SCTP write time (DL)
 func LogNGAP(direction, nasType, ueID string, sctpTime time.Time) {
+	if !Enabled {
+		return
+	}
 	bp := getLine(160)
 	b := *bp
 	b = append(b, '{')
@@ -876,6 +912,9 @@ type SBIView struct {
 // RFC3339Nano UTC as every other log, so all files can be joined by ue_id and
 // sorted by time. Enqueue only — never blocks the worker.
 func LogWorker(ueID, nasType string, start, end time.Time, sbi []SBIView) {
+	if !Enabled {
+		return
+	}
 	// Measured worker lines average 519 B and reach 963 B; both the base and
 	// the per-SBI increment were short.
 	bp := getLine(384+len(sbi)*160)

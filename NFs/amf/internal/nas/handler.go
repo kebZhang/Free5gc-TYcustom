@@ -21,19 +21,26 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 	// when this function returns). HandleNAS is the outermost synchronous frame
 	// for one uplink NAS message on the AMF side, so the pair brackets exactly
 	// the work attributable to it. Creating the trace is a plain allocation.
-	tr := msgtrace.New(time.Now()) // T2
-	defer func() {
-		// Only messages we care about get a line: logUplinkNAS sets NasType for
-		// the three uplink types of interest, so an early return (or any other
-		// NAS type) leaves it empty and writes nothing — matching AMF_log.
-		if tr.NasType != "" {
-			accesslog.LogWorker(tr.UeID, tr.NasType, tr.Start, time.Now(), toSBIViews(tr.SBI)) // T8
-		}
-		// Unbind so a later message on this UE can never append to this trace.
-		if ranUe != nil && ranUe.AmfUe != nil {
-			ranUe.AmfUe.WorkerTrace = nil
-		}
-	}()
+	//
+	// With accesslog.Enabled false no trace is created: tr stays nil and is never
+	// bound to the AmfUe, so every Track / SetDLNas / DLNas further down is a
+	// nil no-op that reads no clock.
+	var tr *msgtrace.Trace
+	if accesslog.Enabled {
+		tr = msgtrace.New(time.Now()) // T2
+		defer func() {
+			// Only messages we care about get a line: logUplinkNAS sets NasType for
+			// the three uplink types of interest, so an early return (or any other
+			// NAS type) leaves it empty and writes nothing — matching AMF_log.
+			if tr.NasType != "" {
+				accesslog.LogWorker(tr.UeID, tr.NasType, tr.Start, time.Now(), toSBIViews(tr.SBI)) // T8
+			}
+			// Unbind so a later message on this UE can never append to this trace.
+			if ranUe != nil && ranUe.AmfUe != nil {
+				ranUe.AmfUe.WorkerTrace = nil
+			}
+		}()
+	}
 
 	isNasMsgRcv := false
 	metricCause := ""
@@ -88,7 +95,9 @@ func HandleNAS(ranUe *amf_context.RanUe, procedureCode int64, nasPdu []byte, ini
 	// This also fills in tr's ue_id/nas_type (only known after decode) and binds
 	// tr to the AmfUe. The binding happens here, before Dispatch below drives the
 	// FSM and triggers the SBI calls, so every one of them sees the trace.
-	logUplinkNAS(ranUe, msg, tr, recvTime)
+	if accesslog.Enabled {
+		logUplinkNAS(ranUe, msg, tr, recvTime)
+	}
 
 	ranUe.AmfUe.NasPduValue = nasPdu
 	ranUe.AmfUe.MacFailed = !integrityProtected

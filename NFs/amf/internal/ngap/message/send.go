@@ -80,7 +80,7 @@ func SendToRanUe(ue *context.RanUe, packet []byte) (bool, string) {
 	// AMF_log: record the DL SCTP write time here (SendToRanUe has the UE context).
 	// The GMM send path marked the pending downlink NAS type on this UE's worker
 	// trace; read it back and log asynchronously. No goroutine-local map / lock.
-	if ok && ue.AmfUe != nil {
+	if accesslog.Enabled && ok && ue.AmfUe != nil {
 		if nasType, ueID, has := ue.AmfUe.WorkerTrace.DLNas(); has {
 			accesslog.LogNGAP("DL", nasType, ueID, time.Now())
 		}

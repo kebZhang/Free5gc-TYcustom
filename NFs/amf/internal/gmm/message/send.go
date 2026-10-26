@@ -3,6 +3,7 @@ package message
 import (
 	"fmt"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	"github.com/free5gc/amf/internal/context"
 	gmm_common "github.com/free5gc/amf/internal/gmm/common"
 	"github.com/free5gc/amf/internal/logger"
@@ -187,7 +188,9 @@ func SendAuthenticationRequest(ue *context.RanUe) {
 	// AMF_log: mark the downlink NAS type on this UE's worker trace so the SCTP
 	// write time is recorded in ngap message SendToRanUe (asynchronous; never
 	// blocks the send path). No goroutine-local map / lock.
-	amfUe.WorkerTrace.SetDLNas("AuthenticationRequest", dlUeID(amfUe))
+	if accesslog.Enabled {
+		amfUe.WorkerTrace.SetDLNas("AuthenticationRequest", dlUeID(amfUe))
+	}
 	ngap_message.SendDownlinkNasTransport(ue, nasMsg, nil)
 
 	if context.GetSelf().T3560Cfg.Enable {
@@ -478,7 +481,9 @@ func SendSecurityModeCommand(ue *context.RanUe, accessType models.AccessType, ea
 	isNasMsgSent = true
 	// AMF_log: mark the downlink NAS type on this UE's worker trace so the SCTP
 	// write time is recorded in ngap message SendToRanUe. No goroutine-local map.
-	amfUe.WorkerTrace.SetDLNas("SecurityModeCommand", dlUeID(amfUe))
+	if accesslog.Enabled {
+		amfUe.WorkerTrace.SetDLNas("SecurityModeCommand", dlUeID(amfUe))
+	}
 	ngap_message.SendDownlinkNasTransport(ue, nasMsg, nil)
 
 	if context.GetSelf().T3560Cfg.Enable {
@@ -622,7 +627,9 @@ func SendRegistrationAccept(
 		// anType is 3GPP_ACCESS
 		// AMF_log: mark the downlink NAS type on this UE's worker trace so the SCTP
 		// write time is recorded in ngap message SendToRanUe. No goroutine-local map.
-		amfUe.WorkerTrace.SetDLNas("RegistrationAccept", dlUeID(amfUe))
+		if accesslog.Enabled {
+			amfUe.WorkerTrace.SetDLNas("RegistrationAccept", dlUeID(amfUe))
+		}
 		ngap_message.SendN2Message(amfUe, anType, nasMsg, cxtList, nil, nil, nil, nil)
 	}
 

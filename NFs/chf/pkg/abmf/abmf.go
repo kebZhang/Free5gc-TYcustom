@@ -19,7 +19,7 @@ import (
 	"bytes"
 	"context"
 	"math"
-	_ "net/http/pprof"
+	// _ "net/http/pprof" // [OFF 1026] commented out, not deleted
 	"strconv"
 	"sync"
 	"time"

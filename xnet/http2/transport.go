@@ -187,7 +187,9 @@ type Transport struct {
 	// queue costs a dropped log line, never a stalled read loop.
 	//
 	// Nil disables the instrumentation entirely, at the cost of one nil
-	// comparison per response.
+	// comparison per response. That covers every client-side TYcustom stamp,
+	// not only this event: with a nil sink the per-request ClientRequestTrace
+	// is never looked up (see requestTrace) and no connection identity is kept.
 	RecvWholeResp chan<- RecvWholeRespEvent
 
 	// t1, if non-nil, is the standard library Transport using
@@ -613,7 +615,7 @@ func (t *Transport) RoundTripOpt(req *http.Request, opt RoundTripOpt) (*http.Res
 		// succeeded, so the counter means "attempts that reached a connection".
 		// The trace survives retries because shouldRetryRequest shallow-copies
 		// the Request, ctx included.
-		if tr := clientRequestTraceFromContext(req.Context()); tr != nil {
+		if tr := t.requestTrace(req.Context()); tr != nil {
 			tr.attempts.Add(1)
 		}
 		res, err := cc.RoundTrip(req)
@@ -826,8 +828,9 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	}
 	// TYcustom: snapshot the connection identity exactly once. Doing it here
 	// rather than per request is the whole point -- LocalAddr().String()
-	// allocates. c can be nil under transportTestHooks.
-	if c != nil {
+	// allocates. c can be nil under transportTestHooks. Skipped when the
+	// transport is uninstrumented: identity is only read by instrumented paths.
+	if c != nil && t.RecvWholeResp != nil {
 		cc.identity = &ClientConnIdentity{
 			LocalAddr:  c.LocalAddr().String(),
 			RemoteAddr: c.RemoteAddr().String(),
@@ -1308,7 +1311,7 @@ func (cc *ClientConn) roundTrip(req *http.Request, streamf func(*clientStream)) 
 		reqBody:              req.Body,
 		reqBodyContentLength: actualContentLength(req),
 		trace:                httptrace.ContextClientTrace(ctx),
-		instr:                clientRequestTraceFromContext(ctx), // TYcustom
+		instr:                cc.t.requestTrace(ctx), // TYcustom
 		peerClosed:           make(chan struct{}),
 		abort:                make(chan struct{}),
 		respHeaderRecv:       make(chan struct{}),

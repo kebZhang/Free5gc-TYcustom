@@ -75,7 +75,9 @@ func NewServer(pcf pcf, tlsKeyLogPath string) (*Server, error) {
 	}
 
 	s.router.Use(metrics.InboundMetrics())
-	s.router.Use(accesslog.InboundLogger())
+	if accesslog.Enabled {
+		s.router.Use(accesslog.InboundLogger())
+	}
 
 	smPolicyRoutes := s.getSmPolicyRoutes()
 	smPolicyGroup := s.router.Group(factory.PcfSMpolicyCtlResUriPrefix)

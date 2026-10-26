@@ -269,6 +269,13 @@ func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	connSlot := nextSlot(cursors, host)
 	base := pool[connSlot]
 
+	// Logging off: keep the connection layout above (connsPerPeer connections,
+	// dealt round-robin) and send the request untouched -- no body sniffing, no
+	// httptrace or fork trace on its context, no clock reads, no log line.
+	if !Enabled {
+		return base.RoundTrip(req)
+	}
+
 	dst := dstNFFromURL(req)
 	method := req.Method
 	uri := ""

@@ -48,7 +48,9 @@ func NewServer(nrf ServerNrf, tlsKeyLogPath string) (*Server, error) {
 		router:    logger_util.NewGinWithLogrus(logger.GinLog),
 	}
 	s.router.Use(metrics.InboundMetrics())
-	s.router.Use(accesslog.InboundLogger())
+	if accesslog.Enabled {
+		s.router.Use(accesslog.InboundLogger())
+	}
 	cfg := s.Config()
 	bindAddr := cfg.GetSbiBindingAddr()
 	logger.SBILog.Infof("Binding addr: [%s]", bindAddr)

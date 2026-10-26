@@ -317,6 +317,9 @@ func (w *bufferedWriter) Write(p []byte) (n int, err error) {
 		bw.Reset((*bufferedWriterTimeoutWriter)(w))
 		w.bw = bw
 	}
+	if w.wSink == nil {
+		return w.bw.Write(p) // TYcustom off: upstream behaviour, no byte accounting
+	}
 	// TYcustom: turn the pending marker into an exact byte offset BEFORE handing
 	// p to bufio. Framer.endWrite calls this once per whole frame, so
 	// produced+len(p) is precisely the offset one past that frame's last byte --
@@ -350,7 +353,7 @@ func (w *bufferedWriter) Flush() error {
 	// The failing branch is expected after a write error, where Reset(nil) below
 	// discards buffered bytes and the counters part company permanently. That
 	// connection is finished anyway.
-	if err == nil && (w.markers.n != 0 || w.produced != w.accepted) {
+	if w.wSink != nil && err == nil && (w.markers.n != 0 || w.produced != w.accepted) {
 		wAccountingErrors.Add(1)
 	}
 	bw.Reset(nil)
@@ -415,6 +418,9 @@ func (w *bufferedWriterTimeoutWriter) Write(p []byte) (n int, err error) {
 	// accepted advances by the bytes genuinely taken, so a short write leaves
 	// the marker unsettled rather than reporting a W that never happened.
 	bw := (*bufferedWriter)(w)
+	if bw.wSink == nil {
+		return writeWithByteTimeout(bw.conn, bw.byteTimeout, p) // TYcustom off: upstream behaviour
+	}
 	n, err = writeWithByteTimeout(bw.conn, bw.byteTimeout, p)
 	bw.accepted += uint64(n)
 	if m := bw.markers.peek(); m != nil && bw.accepted >= m.endOffset {

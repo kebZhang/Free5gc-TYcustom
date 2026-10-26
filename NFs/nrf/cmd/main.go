@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	// "net/http" // [OFF 1026] profiling, see main()
+	// _ "net/http/pprof" // [OFF 1026] registers /debug/pprof handlers on the default mux
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"github.com/urfave/cli/v2"
@@ -19,6 +22,25 @@ import (
 var NRF *service.NrfApp
 
 func main() {
+	// TYcustom: no profiling or sampling. The heap-allocation profiler is the
+	// one profiler the Go runtime runs by default (MemProfileRate = 512 KiB), so
+	// switch it off too, as early as possible per the runtime docs.
+	runtime.MemProfileRate = 0
+
+	// --- pprof on :6060 (TYcustom, noGC experiment) ---
+	// [OFF 1026] Commented out, not deleted. To turn it back on: uncomment
+	// the code lines below and the imports marked [OFF 1026], and delete the
+	// runtime.MemProfileRate = 0 line at the top of main.
+	//
+	// Same listener as amf/ausf/pcf/udm/udr. GoRuntime_NoGC_Readme.md runs every
+	// NF with GOGC=off and collects it by hand between runs through
+	// GET :6060/debug/pprof/heap?gc=1 (force_gc_allNF.sh), which needs this port.
+	// go func() {
+	// 	if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
+	// 		logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
+	// 	}
+	// }()
+
 	app := cli.NewApp()
 	app.Name = "nrf"
 	app.Usage = "5G Network Repository Function (NRF)"

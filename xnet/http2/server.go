@@ -183,6 +183,10 @@ type Server struct {
 	//
 	// The consumer must be a long-lived goroutine. Nothing in this package
 	// formats or writes a log record.
+	//
+	// Nil switches off every piece of server-side TYcustom instrumentation, not
+	// only W: no server_request_id, no G, no recvwholereq, no trace on the
+	// request context. See serverConn.instr.
 	ResponseHeadersFlushed chan<- ResponseHeadersFlushedEvent
 
 	// Internal state. This is a pointer (rather than embedded directly)
@@ -469,6 +473,7 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 		maxFrameSize:                initialMaxFrameSize,
 		pingTimeout:                 conf.PingTimeout,
 		countErrorFunc:              conf.CountError,
+		instr:                       s.ResponseHeadersFlushed != nil, // TYcustom
 		serveG:                      newGoroutineLock(),
 		pushEnabled:                 true,
 		sawClientPreface:            opts.SawClientPreface,
@@ -620,6 +625,7 @@ type serverConn struct {
 	remoteAddrStr    string
 	writeSched       WriteScheduler
 	countErrorFunc   func(errType string)
+	instr            bool // TYcustom: srv.ResponseHeadersFlushed != nil; gates all server-side instrumentation
 
 	// Everything following is owned by the serve loop; use serveG.check():
 	serveG                      goroutineLock // used to verify funcs are on serve()
@@ -1996,7 +2002,9 @@ func (st *stream) endStream() {
 	// It MUST stay ahead of the body close below. That call wakes the handler
 	// goroutine blocked reading the body; stamping after it would let the woken
 	// goroutine reach the log line first and find the field still empty.
-	st.trace.markRecvWholeReq(true)
+	if sc.instr {
+		st.trace.markRecvWholeReq(true)
+	}
 
 	if st.declBodyBytes != -1 && st.declBodyBytes != st.bodyBytes {
 		st.body.CloseWithError(fmt.Errorf("request declared a Content-Length of %d but only wrote %d bytes",
@@ -2147,7 +2155,12 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 		st.readDeadline = time.AfterFunc(sc.hs.ReadTimeout, st.onReadTimeout)
 	}
 
-	return sc.scheduleHandler(id, rw, req, handler, &st.trace) // TYcustom
+	// TYcustom: a nil trace is what makes scheduleHandler/handlerDone skip G.
+	var trace *ServerRequestTrace
+	if sc.instr {
+		trace = &st.trace
+	}
+	return sc.scheduleHandler(id, rw, req, handler, trace)
 }
 
 func (sc *serverConn) upgradeRequest(req *http.Request) {
@@ -2176,15 +2189,19 @@ func (sc *serverConn) upgradeRequest(req *http.Request) {
 	// NF clients speak prior-knowledge h2c, so ServeConnOpts.UpgradeRequest is
 	// always nil), but instrumented so that "server record with no G" stays an
 	// impossible state rather than something to investigate after the fact.
-	st.initTrace()
-	// TYcustom recvwholereq: this path builds the stream as stateHalfClosedRemote,
-	// i.e. no request body, so hook B applies. Unreachable on this deployment for
-	// the same reason the G stamp below is, and instrumented for the same reason.
-	st.trace.markRecvWholeReq(false)
-	req = req.WithContext(st)
-	rw.rws.req = req
+	if sc.instr {
+		st.initTrace()
+		// TYcustom recvwholereq: this path builds the stream as stateHalfClosedRemote,
+		// i.e. no request body, so hook B applies. Unreachable on this deployment for
+		// the same reason the G stamp below is, and instrumented for the same reason.
+		st.trace.markRecvWholeReq(false)
+		req = req.WithContext(st)
+		rw.rws.req = req
+	}
 	sc.curHandlers++
-	st.trace.HandlerGo = time.Now()
+	if sc.instr {
+		st.trace.HandlerGo = time.Now()
+	}
 	go sc.runHandler(rw, req, sc.handler.ServeHTTP)
 }
 
@@ -2325,7 +2342,7 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		return nil, nil, err
 	}
 	bodyOpen := !f.StreamEnded()
-	if !bodyOpen {
+	if !bodyOpen && sc.instr {
 		// TYcustom recvwholereq, hook B: END_STREAM rode on the HEADERS frame,
 		// so there will never be any DATA frames and (*stream).endStream is
 		// never called for this request. The request is complete right here.
@@ -2356,7 +2373,15 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.ServerRequestParam) (*responseWriter, *http.Request, error) {
 	sc.serveG.check()
 
-	st.initTrace() // TYcustom
+	// TYcustom: st itself is the request's context when instrumented. It
+	// forwards everything to st.ctx except the trace key, so this carries the
+	// trace to InboundLogger without allocating a context.WithValue node.
+	// Uninstrumented, the request gets st.ctx exactly as upstream does.
+	var reqCtx context.Context = st.ctx
+	if sc.instr {
+		st.initTrace()
+		reqCtx = st
+	}
 
 	var tlsState *tls.ConnectionState // nil if not scheme https
 	if rp.Scheme == "https" {
@@ -2386,10 +2411,7 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp httpcommon.Server
 		Host:       rp.Authority,
 		Body:       body,
 		Trailer:    res.Trailer,
-		// TYcustom: st itself is the context. It forwards everything to st.ctx
-		// except the trace key, so this carries the trace to InboundLogger
-		// without allocating a context.WithValue node.
-	}).WithContext(st)
+	}).WithContext(reqCtx) // TYcustom, see above
 	rw := sc.newResponseWriter(st, req)
 	return rw, req, nil
 }
@@ -2797,6 +2819,10 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		}
 
 		endStream := (rws.handlerDone && !rws.hasTrailers() && len(p) == 0) || isHeadResp
+		var wTrace *ServerRequestTrace // TYcustom: stays nil on an uninstrumented conn, so no W marker
+		if rws.conn.instr {
+			wTrace = &rws.stream.trace
+		}
 		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
 			streamID:      rws.stream.id,
 			httpResCode:   rws.status,
@@ -2809,7 +2835,7 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			// branch sits inside `if !rws.sentHeader`, so it runs exactly once
 			// per response; the trailer and 1xx header blocks built elsewhere
 			// leave trace nil and produce no W.
-			trace: &rws.stream.trace,
+			trace: wTrace,
 		})
 		if err != nil {
 			return 0, err
@@ -3323,7 +3349,9 @@ func (sc *serverConn) startPush(msg *startPushRequest) {
 		// TYcustom G. Unreachable on this deployment (no NF calls Pusher.Push),
 		// but instrumented anyway so that a server record can never exist
 		// without a G to explain it.
-		promised.trace.HandlerGo = time.Now()
+		if sc.instr {
+			promised.trace.HandlerGo = time.Now()
+		}
 		go sc.runHandler(rw, req, sc.handler.ServeHTTP)
 		return promisedID, nil
 	}
