@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/free5gc/amf/internal/accesslog"
 	"github.com/free5gc/amf/internal/logger"
 )
 
@@ -263,7 +264,14 @@ func (s *UEScheduler) DispatchTask(task Task) bool {
 			task.UEID, workerIndex)
 	}
 
-	s.markWorkerUsed(workerIndex)
+	// [OFF 1120] The worker_num.txt bookkeeping follows the other TYcustom logs
+	// (HTTP/DB/AMF/AMF_worker): with accesslog.Enabled = false the per-dispatch
+	// CAS, the first-use log line and the /tmp/worker_num.txt write are all
+	// skipped, and the compiler drops this branch. Set accesslog.Enabled back to
+	// true to restore the file; markWorkerUsed itself is unchanged.
+	if accesslog.Enabled {
+		s.markWorkerUsed(workerIndex)
+	}
 
 	worker := s.workers[workerIndex]
 	return worker.Submit(task)

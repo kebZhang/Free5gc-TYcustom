@@ -79,11 +79,13 @@ const (
 // against -- then 2 again, then 4, then 8, then 4, then 2, then 1, then 2, then
 // 4, then 8, then 16, then 8, then 4. This is a return to 8.
 //
-// The run it pairs with is the 4-slot one immediately before it. Both are built
-// with accesslog.Enabled = false and the profiling in every main() commented
-// out, and both keep the readFrameCh capacity of 1 in the local x/net fork
-// (serveConn in xnet/http2/server.go, Readframech_buffer1_0930.md), so the slot
-// count is the only thing that moves between the two. Neither run carries the
+// The run it pairs with is the 8-slot one built right before it (commit
+// ec302c0, image 1026v8). Both are built with accesslog.Enabled = false and
+// the profiling in every main() commented out, and both use 8 slots; that
+// earlier build kept the readFrameCh capacity of 1 in the local x/net fork
+// (serveConn in xnet/http2/server.go, Readframech_buffer1_0930.md), this one
+// [cap0 1120] puts it back to the upstream 0, so that capacity is the only
+// thing that moves between the two. Neither run carries the
 // stamp set, so the step is read from end-to-end latency only. To read it stamp
 // for stamp -- M/M2/M3, recvwholereq/recvwholeresp and the rest -- set
 // accesslog.Enabled back to true in every instrumented NF; the instrumentation

@@ -460,7 +460,7 @@ func (s *Server) serveConn(c net.Conn, opts *ServeConnOpts, newf func(*serverCon
 		bw:                          newBufferedWriter(c, conf.WriteByteTimeout, s.ResponseHeadersFlushed, remoteAddrStr),
 		handler:                     opts.handler(),
 		streams:                     make(map[uint32]*stream),
-		readFrameCh:                 make(chan readFrameResult, 1), // TYcustom: gate keeps <=1 frame in flight, so readFrames never parks on this send
+		readFrameCh:                 make(chan readFrameResult), // TYcustom [cap0 1120]: back to upstream unbuffered; was make(chan readFrameResult, 1) (Readframech_buffer1_0930.md) -- put the ", 1" back to restore
 		wantWriteFrameCh:            make(chan FrameWriteRequest, 8),
 		serveMsgCh:                  make(chan interface{}, 8),
 		wroteFrameCh:                make(chan frameWriteResult, 1), // buffered; one send in writeFrameAsync

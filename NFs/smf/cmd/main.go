@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"math/rand"
-	// "net/http" // [OFF 1026] profiling, see main()
-	// _ "net/http/pprof" // [OFF 1026] registers /debug/pprof handlers on the default mux
+	"net/http"         // [ON 1120] pprof listener on :6060 only, see main()
+	_ "net/http/pprof" // [ON 1120] registers /debug/pprof handlers on the default mux
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -39,18 +39,20 @@ func main() {
 	}()
 
 	// --- pprof on :6060 (TYcustom, noGC experiment) ---
-	// [OFF 1026] Commented out, not deleted. To turn it back on: uncomment
-	// the code lines below and the imports marked [OFF 1026], and delete the
-	// runtime.MemProfileRate = 0 line at the top of main.
+	// [ON 1120] Turned back on (was [OFF 1026]). runtime.MemProfileRate = 0
+	// stays at the top of main: serving the endpoints turns on no sampling; the
+	// heap profile is then empty, but the runtime.MemStats it ends with (what
+	// force_gc_allNF.sh reads) is still there. To turn it off again: comment
+	// out the block below and the two imports marked [ON 1120].
 	//
 	// Same listener as amf/ausf/pcf/udm/udr. GoRuntime_NoGC_Readme.md runs every
 	// NF with GOGC=off and collects it by hand between runs through
 	// GET :6060/debug/pprof/heap?gc=1 (force_gc_allNF.sh), which needs this port.
-	// go func() {
-	// 	if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
-	// 		logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
-	// 	}
-	// }()
+	go func() {
+		if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
+			logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
+		}
+	}()
 
 	app := cli.NewApp()
 	app.Name = "smf"

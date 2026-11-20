@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	// "net/http" // [OFF 1026] profiling, see main()
-	// _ "net/http/pprof" // [OFF 1026] registers /debug/pprof handlers on the default mux
+	"net/http"         // [ON 1120] pprof listener on :6060 only, see main()
+	_ "net/http/pprof" // [ON 1120] registers /debug/pprof handlers on the default mux
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,8 +36,9 @@ func main() {
 
 	// --- Lock-contention + scheduler profiling (TYcustom, 0826) ---
 	// [OFF 1026] Commented out, not deleted. To turn it back on: uncomment
-	// the code lines below and the imports marked [OFF 1026], and delete the
-	// runtime.MemProfileRate = 0 line at the top of main.
+	// the three code lines below and the accesslog import marked [OFF 1026],
+	// and delete the runtime.MemProfileRate = 0 line at the top of main. The
+	// :6060 listener that serves them is on by itself, see the next block.
 	//
 	// Turn on mutex + block profiling, register /debug/schedstat, and expose
 	// pprof on :6060. Snapshot /debug/pprof/{block,mutex} and /debug/schedstat
@@ -53,11 +54,21 @@ func main() {
 	// runtime.SetMutexProfileFraction(5) // sample ~1/5 of mutex contention events
 	// runtime.SetBlockProfileRate(10000) // sample a blocking event ~every 10us blocked
 	// accesslog.RegisterSchedStat()      // must precede the ListenAndServe below
-	// go func() {
-	// 	if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
-	// 		logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
-	// 	}
-	// }()
+
+	// --- pprof listener on :6060 (TYcustom, noGC experiment) ---
+	// [ON 1120] Turned back on by itself, for force_gc_allNF.sh: with GOGC=off
+	// the NF never collects on its own, so the script runs one full GC between
+	// runs through GET :6060/debug/pprof/heap?gc=1. Serving the endpoints turns
+	// on no sampling: the mutex/block lines above stay off, and
+	// runtime.MemProfileRate = 0 stays at the top of main -- the heap profile
+	// is then empty, but the runtime.MemStats it ends with (what the script
+	// reads) is still there. To turn it off again: comment out the block below
+	// and the two imports marked [ON 1120].
+	go func() {
+		if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
+			logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
+		}
+	}()
 
 	app := cli.NewApp()
 	app.Name = "udm"

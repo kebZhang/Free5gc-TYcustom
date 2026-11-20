@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/free5gc/amf/internal/accesslog"
 )
 
 // mockAddr is a trivial net.Addr so worker logging (which reads RemoteAddr)
@@ -263,6 +265,11 @@ func TestScheduler_UsedWorkerCount(t *testing.T) {
 	// In dGNB mode each new association is pinned round-robin to a worker, so
 	// dispatching on N distinct connections (N <= pool size) must exercise
 	// exactly N distinct workers, counted once each.
+	// [OFF 1120] DispatchTask calls markWorkerUsed only with accesslog.Enabled.
+	if !accesslog.Enabled {
+		t.Skip("worker_num bookkeeping is off: accesslog.Enabled = false")
+	}
+
 	numWorkers := 4
 	var wg sync.WaitGroup
 
