@@ -1,0 +1,5 @@
+# Used by BuildKit for "docker build -f Build/Dockerfile.custom ...".
+# Keeps the image tars that build.sh saves next to it out of the build
+# context; otherwise every build would send them to the daemon and
+# COPY . . would put them into the builder.
+Build/*.tar
