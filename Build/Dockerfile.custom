@@ -157,7 +157,8 @@ RUN set -eux; \
 #
 # 按官方二进制的方式编：go1.21.8、CGO_ENABLED=0、同样的 ldflags（只把
 # VERSION 改成 v3.4.3-TYcustom）。这样相对官方 UPF 只多了 TYcustom 的代码
-# （PFCP_log、:6060、MemProfileRate=0），Go 版本不变。
+# （PFCP_log、:6060；[profON 1122] 起再加 block/mutex 采样、/debug/schedstat，
+# MemProfileRate=0 那行已注释、恢复默认分配采样），Go 版本不变。
 # 想改用和控制面相同的 Go 版本：把下面的 FROM 换成 golang:1.25-bookworm，
 # 并删掉检查 go1.21.8 的那一行。
 # ============================================================

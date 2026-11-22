@@ -21,7 +21,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	// "github.com/free5gc/ausf/internal/accesslog" // [OFF 1026] only for RegisterSchedStat, see main()
+	"github.com/free5gc/ausf/internal/accesslog" // [profON 1122] for RegisterSchedStat, see main()
 	"github.com/free5gc/ausf/internal/logger"
 	"github.com/free5gc/ausf/pkg/factory"
 	"github.com/free5gc/ausf/pkg/service"
@@ -32,10 +32,14 @@ import (
 var AUSF *service.AusfApp
 
 func main() {
-	// TYcustom: no profiling or sampling. The heap-allocation profiler is the
-	// one profiler the Go runtime runs by default (MemProfileRate = 512 KiB), so
-	// switch it off too, as early as possible per the runtime docs.
-	runtime.MemProfileRate = 0
+	// TYcustom: heap-allocation sampling.
+	// [profON 1122] Back on (was [OFF 1026]): the line below is commented out,
+	// so the runtime keeps its default MemProfileRate (one sample per 512 KiB
+	// allocated) and /debug/pprof/allocs and heap have samples again. Runs with
+	// and without it are not directly comparable: it changes the GC count. To
+	// turn it off again, uncomment the line; keep it first in main, as the
+	// runtime docs ask.
+	// runtime.MemProfileRate = 0
 
 	defer func() {
 		if p := recover(); p != nil {
@@ -45,10 +49,12 @@ func main() {
 	}()
 
 	// --- Lock-contention + scheduler profiling (TYcustom, 0826) ---
-	// [OFF 1026] Commented out, not deleted. To turn it back on: uncomment
-	// the three code lines below and the accesslog import marked [OFF 1026],
-	// and delete the runtime.MemProfileRate = 0 line at the top of main. The
-	// :6060 listener that serves them is on by itself, see the next block.
+	// [profON 1122] Back on (was [OFF 1026]) so that
+	// trace_cpu_sche_block_mutex_allNF_gctrace_allocM.sh collects block, mutex
+	// and schedstat from this NF. To turn it off again: comment out the three
+	// code lines below and the accesslog import marked [profON 1122], and
+	// uncomment runtime.MemProfileRate = 0 at the top of main. The :6060
+	// listener that serves them is the next block.
 	//
 	// Turn on mutex + block profiling, register /debug/schedstat, and expose
 	// pprof on :6060. Snapshot /debug/pprof/{block,mutex} and /debug/schedstat
@@ -61,19 +67,18 @@ func main() {
 	// Safe to leave on: sampling is cheap and both endpoints are pull-only.
 	// Remove/guard for production if the extra port is unwanted.
 	// See LOCK_SCHED_PROFILING_GUIDE_0826.md for the full procedure.
-	// runtime.SetMutexProfileFraction(5) // sample ~1/5 of mutex contention events
-	// runtime.SetBlockProfileRate(10000) // sample a blocking event ~every 10us blocked
-	// accesslog.RegisterSchedStat()      // must precede the ListenAndServe below
+	runtime.SetMutexProfileFraction(5) // sample ~1/5 of mutex contention events
+	runtime.SetBlockProfileRate(10000) // sample a blocking event ~every 10us blocked
+	accesslog.RegisterSchedStat()      // must precede the ListenAndServe below
 
 	// --- pprof listener on :6060 (TYcustom, noGC experiment) ---
 	// [ON 1120] Turned back on by itself, for force_gc_allNF.sh: with GOGC=off
 	// the NF never collects on its own, so the script runs one full GC between
 	// runs through GET :6060/debug/pprof/heap?gc=1. Serving the endpoints turns
-	// on no sampling: the mutex/block lines above stay off, and
-	// runtime.MemProfileRate = 0 stays at the top of main -- the heap profile
-	// is then empty, but the runtime.MemStats it ends with (what the script
-	// reads) is still there. To turn it off again: comment out the block below
-	// and the two imports marked [ON 1120].
+	// on no sampling by itself; the sampling is the mutex/block rates above and
+	// MemProfileRate at the top of main, all on since [profON 1122]. To turn the
+	// listener off again: comment out the block below and the two imports
+	// marked [ON 1120].
 	go func() {
 		if err := http.ListenAndServe("0.0.0.0:6060", nil); err != nil {
 			logger.MainLog.Warnf("pprof server on :6060 exited: %v", err)
