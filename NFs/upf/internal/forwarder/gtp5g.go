@@ -22,12 +22,11 @@ import (
 	"github.com/free5gc/go-upf/internal/report"
 	"github.com/free5gc/go-upf/pkg/factory"
 	logger_util "github.com/free5gc/util/logger"
-	"github.com/free5gc/util/pfcp"
 )
 
 const (
-	expectedMinGtp5gVersion string = "0.9.5"
-	expectedMaxGtp5gVersion string = "0.11.0"
+	expectedMinGtp5gVersion string = "0.8.6"
+	expectedMaxGtp5gVersion string = "0.9.0"
 )
 
 type Gtp5g struct {
@@ -163,7 +162,7 @@ func (g *Gtp5g) checkVersion() error {
 	}
 	if nowVer.LessThan(expMinVer) || nowVer.GreaterThanOrEqual(expMaxVer) {
 		return errors.Errorf(
-			"gtp5g version(%v) should be %s <= version < %s , please update it",
+			"gtp5g version(%v) should be %s <= verion < %s , please update it",
 			nowVer, expectedMinGtp5gVersion, expectedMaxGtp5gVersion)
 	}
 
@@ -256,30 +255,12 @@ func convertSlice(ports [][]uint16) []byte {
 
 func (g *Gtp5g) newSdfFilter(i *ie.IE, srcIf uint8) (nl.AttrList, error) {
 	var attrs nl.AttrList
-	// i.Payload[0] corresponds to Octet 5 (Flags) in the spec
-	flags := i.Payload[0]
-	hasFD := (flags & 0x01) != 0 // Bit 1: Flow Description
-	offset := 2
-	if hasFD {
-		if len(i.Payload) < offset+2 {
-			return nil, errors.New("SDF Filter IE with FD flag needs Length of Flow Description")
-		}
-		// Read FDLength from i.Payload[2-3] (Octets 7-8 in spec)
-		fdLength := uint16(i.Payload[offset])<<8 | uint16(i.Payload[offset+1])
-		// Flow Description data starts at i.Payload[4] (Octet 9)
-		flowDescStart := offset + 2
-		availableBytes := len(i.Payload) - flowDescStart
-		if int(fdLength) > availableBytes {
-			return nil, errors.Errorf(
-				"SDF Filter FDLength %d exceeds available payload %d bytes",
-				fdLength, availableBytes)
-		}
-	}
+
 	v, err := i.SDFFilter()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse SDF Filter")
+		return nil, err
 	}
-	// Process validated SDF Filter fields
+
 	if v.HasFD() {
 		swapSrcDst := (srcIf == ie.SrcInterfaceAccess)
 		fd, err := g.newFlowDesc(v.FlowDescription, swapSrcDst)
@@ -345,10 +326,6 @@ func (g *Gtp5g) newPdi(i *ie.IE) (nl.AttrList, error) {
 			if err != nil {
 				break
 			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDI_SRC_INTF,
-				Value: nl.AttrU8(v),
-			})
 			srcIf = v
 		case ie.FTEID:
 			v, err := x.FTEID()
@@ -379,11 +356,6 @@ func (g *Gtp5g) newPdi(i *ie.IE) (nl.AttrList, error) {
 				Value: nl.AttrBytes(v.IPv4Address),
 			})
 		case ie.SDFFilter:
-			// Validate SDF Filter IE payload length early (TS 29.244 Section 8.2.5)
-			// Minimum: 1 byte (flags) + 1 byte (spare) + at least 1 byte for content
-			if len(x.Payload) < 3 {
-				return nil, errors.Errorf("SDF Filter IE payload too short: %d bytes (minimum 3)", len(x.Payload))
-			}
 			sdfIEs = append(sdfIEs, x)
 		case ie.ApplicationID:
 		}
@@ -391,16 +363,199 @@ func (g *Gtp5g) newPdi(i *ie.IE) (nl.AttrList, error) {
 
 	for _, x := range sdfIEs {
 		v, err := g.newSdfFilter(x, srcIf)
-		if err != nil {
-			return nil, errors.Wrap(err, "newSdfFilter failed")
+		if err == nil {
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDI_SDF_FILTER,
+				Value: v,
+			})
 		}
-		attrs = append(attrs, nl.Attr{
-			Type:  gtp5gnl.PDI_SDF_FILTER,
-			Value: v,
-		})
 	}
 
 	return attrs, nil
+}
+
+func (g *Gtp5g) CreatePDR(lSeid uint64, req *ie.IE) error {
+	var pdrid uint64
+	var attrs []nl.Attr
+
+	ies, err := req.CreatePDR()
+	if err != nil {
+		return err
+	}
+
+	for _, i := range ies {
+		switch i.Type {
+		case ie.PDRID:
+			v, err := i.PDRID()
+			if err != nil {
+				break
+			}
+			pdrid = uint64(v)
+		case ie.Precedence:
+			v, err := i.Precedence()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_PRECEDENCE,
+				Value: nl.AttrU32(v),
+			})
+		case ie.PDI:
+			v, err := g.newPdi(i)
+			if err != nil {
+				break
+			}
+			if v != nil {
+				attrs = append(attrs, nl.Attr{
+					Type:  gtp5gnl.PDR_PDI,
+					Value: v,
+				})
+			}
+		case ie.OuterHeaderRemoval:
+			v, err := i.OuterHeaderRemovalDescription()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_OUTER_HEADER_REMOVAL,
+				Value: nl.AttrU8(v),
+			})
+			// ignore GTPUExternsionHeaderDeletion
+		case ie.FARID:
+			v, err := i.FARID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_FAR_ID,
+				Value: nl.AttrU32(v),
+			})
+		case ie.QERID:
+			v, err := i.QERID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_QER_ID,
+				Value: nl.AttrU32(v),
+			})
+		case ie.URRID:
+			v, err := i.URRID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_URR_ID,
+				Value: nl.AttrU32(v),
+			})
+		}
+	}
+
+	// TODO:
+	// Not in 3GPP spec, just used for routing
+	// var roleAddrIpv4 net.IP
+	// roleAddrIpv4 = net.IPv4(34, 35, 36, 37)
+	// pdr.RoleAddrIpv4 = &roleAddrIpv4
+
+	// TODO:
+	// Not in 3GPP spec, just used for buffering
+	attrs = append(attrs, nl.Attr{
+		Type:  gtp5gnl.PDR_UNIX_SOCKET_PATH,
+		Value: nl.AttrString(gtp5gnl.PdrAddrForNetlink),
+	})
+
+	oid := gtp5gnl.OID{lSeid, pdrid}
+	return gtp5gnl.CreatePDROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) UpdatePDR(lSeid uint64, req *ie.IE) error {
+	var pdrid uint64
+	var attrs []nl.Attr
+
+	ies, err := req.UpdatePDR()
+	if err != nil {
+		return err
+	}
+
+	for _, i := range ies {
+		switch i.Type {
+		case ie.PDRID:
+			v, err := i.PDRID()
+			if err != nil {
+				break
+			}
+			pdrid = uint64(v)
+		case ie.Precedence:
+			v, err := i.Precedence()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_PRECEDENCE,
+				Value: nl.AttrU32(v),
+			})
+		case ie.PDI:
+			v, err := g.newPdi(i)
+			if err != nil {
+				break
+			}
+			if v != nil {
+				attrs = append(attrs, nl.Attr{
+					Type:  gtp5gnl.PDR_PDI,
+					Value: v,
+				})
+			}
+		case ie.OuterHeaderRemoval:
+			v, err := i.OuterHeaderRemovalDescription()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_OUTER_HEADER_REMOVAL,
+				Value: nl.AttrU8(v),
+			})
+			// ignore GTPUExternsionHeaderDeletion
+		case ie.FARID:
+			v, err := i.FARID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_FAR_ID,
+				Value: nl.AttrU32(v),
+			})
+		case ie.QERID:
+			v, err := i.QERID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_QER_ID,
+				Value: nl.AttrU32(v),
+			})
+		case ie.URRID:
+			v, err := i.URRID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.PDR_URR_ID,
+				Value: nl.AttrU32(v),
+			})
+		}
+	}
+
+	oid := gtp5gnl.OID{lSeid, pdrid}
+	return gtp5gnl.UpdatePDROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) RemovePDR(lSeid uint64, req *ie.IE) error {
+	v, err := req.PDRID()
+	if err != nil {
+		return errors.New("not found PDRID")
+	}
+	oid := gtp5gnl.OID{lSeid, uint64(v)}
+	return gtp5gnl.RemovePDROID(g.client, g.link.link, oid)
 }
 
 func (g *Gtp5g) newForwardingParameter(ies []*ie.IE) (nl.AttrList, error) {
@@ -411,10 +566,8 @@ func (g *Gtp5g) newForwardingParameter(ies []*ie.IE) (nl.AttrList, error) {
 		case ie.DestinationInterface:
 		case ie.NetworkInstance:
 		case ie.OuterHeaderCreation:
-			// Use parser from util/pfcp to work around go-pfcp bug with C-TAG/S-TAG
-			v, err := pfcp.ParseOuterHeaderCreation(x.Payload)
+			v, err := x.OuterHeaderCreation()
 			if err != nil {
-				g.log.Warnf("Invalid OuterHeaderCreation IE: %v", err)
 				break
 			}
 			var hc nl.AttrList
@@ -422,7 +575,7 @@ func (g *Gtp5g) newForwardingParameter(ies []*ie.IE) (nl.AttrList, error) {
 				Type:  gtp5gnl.OUTER_HEADER_CREATION_DESCRIPTION,
 				Value: nl.AttrU16(v.OuterHeaderCreationDescription),
 			})
-			if v.HasTEID() {
+			if x.HasTEID() {
 				hc = append(hc, nl.Attr{
 					Type:  gtp5gnl.OUTER_HEADER_CREATION_O_TEID,
 					Value: nl.AttrU32(v.TEID),
@@ -438,7 +591,7 @@ func (g *Gtp5g) newForwardingParameter(ies []*ie.IE) (nl.AttrList, error) {
 					Value: nl.AttrU16(v.PortNumber),
 				})
 			}
-			if v.HasIPv4() {
+			if x.HasIPv4() {
 				hc = append(hc, nl.Attr{
 					Type:  gtp5gnl.OUTER_HEADER_CREATION_PEER_ADDR_IPV4,
 					Value: nl.AttrBytes(v.IPv4Address),
@@ -470,6 +623,419 @@ func (g *Gtp5g) newForwardingParameter(ies []*ie.IE) (nl.AttrList, error) {
 	}
 
 	return attrs, nil
+}
+
+func (g *Gtp5g) CreateFAR(lSeid uint64, req *ie.IE) error {
+	var farid uint64
+	var attrs []nl.Attr
+
+	ies, err := req.CreateFAR()
+	if err != nil {
+		return err
+	}
+	for _, i := range ies {
+		switch i.Type {
+		case ie.FARID:
+			v, err := i.FARID()
+			if err != nil {
+				return err
+			}
+			farid = uint64(v)
+		case ie.ApplyAction:
+			b, err := i.ApplyAction()
+			if err != nil {
+				return err
+			}
+			var act report.ApplyAction
+			err = act.Unmarshal(b)
+			if err != nil {
+				return err
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.FAR_APPLY_ACTION,
+				Value: nl.AttrU16(act.Flags),
+			})
+		case ie.ForwardingParameters:
+			xs, err := i.ForwardingParameters()
+			if err != nil {
+				return err
+			}
+			v, err := g.newForwardingParameter(xs)
+			if err != nil {
+				break
+			}
+			if v != nil {
+				attrs = append(attrs, nl.Attr{
+					Type:  gtp5gnl.FAR_FORWARDING_PARAMETER,
+					Value: v,
+				})
+			}
+		case ie.BARID:
+			v, err := i.BARID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.FAR_BAR_ID,
+				Value: nl.AttrU8(v),
+			})
+		}
+	}
+
+	oid := gtp5gnl.OID{lSeid, farid}
+	return gtp5gnl.CreateFAROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) UpdateFAR(lSeid uint64, req *ie.IE) error {
+	var farid uint64
+	var attrs []nl.Attr
+
+	ies, err := req.UpdateFAR()
+	if err != nil {
+		return err
+	}
+	for _, i := range ies {
+		switch i.Type {
+		case ie.FARID:
+			v, err := i.FARID()
+			if err != nil {
+				return err
+			}
+			farid = uint64(v)
+		case ie.ApplyAction:
+			b, err := i.ApplyAction()
+			if err != nil {
+				return err
+			}
+			var act report.ApplyAction
+			err = act.Unmarshal(b)
+			if err != nil {
+				return err
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.FAR_APPLY_ACTION,
+				Value: nl.AttrU16(act.Flags),
+			})
+			g.applyAction(lSeid, int(farid), act)
+		case ie.UpdateForwardingParameters:
+			xs, err := i.UpdateForwardingParameters()
+			if err != nil {
+				return err
+			}
+			v, err := g.newForwardingParameter(xs)
+			if err != nil {
+				break
+			}
+			if v != nil {
+				attrs = append(attrs, nl.Attr{
+					Type:  gtp5gnl.FAR_FORWARDING_PARAMETER,
+					Value: v,
+				})
+			}
+		case ie.BARID:
+			v, err := i.BARID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.FAR_BAR_ID,
+				Value: nl.AttrU8(v),
+			})
+		}
+	}
+
+	oid := gtp5gnl.OID{lSeid, farid}
+	return gtp5gnl.UpdateFAROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) RemoveFAR(lSeid uint64, req *ie.IE) error {
+	v, err := req.FARID()
+	if err != nil {
+		return errors.New("not found FARID")
+	}
+	oid := gtp5gnl.OID{lSeid, uint64(v)}
+	return gtp5gnl.RemoveFAROID(g.client, g.link.link, oid)
+}
+
+func (g *Gtp5g) CreateQER(lSeid uint64, req *ie.IE) error {
+	var qerid uint64
+	var attrs []nl.Attr
+
+	ies, err := req.CreateQER()
+	if err != nil {
+		return err
+	}
+	for _, i := range ies {
+		switch i.Type {
+		case ie.QERID:
+			// M
+			v, err := i.QERID()
+			if err != nil {
+				break
+			}
+			qerid = uint64(v)
+		case ie.QERCorrelationID:
+			// C
+			v, err := i.QERCorrelationID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_CORR_ID,
+				Value: nl.AttrU32(v),
+			})
+		case ie.GateStatus:
+			// M
+			v, err := i.GateStatus()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_GATE,
+				Value: nl.AttrU8(v),
+			})
+		case ie.MBR:
+			// C
+			ul, err := i.MBRUL()
+			if err != nil {
+				break
+			}
+			dl, err := i.MBRDL()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type: gtp5gnl.QER_MBR,
+				Value: nl.AttrList{
+					{
+						Type:  gtp5gnl.QER_MBR_UL_HIGH32,
+						Value: nl.AttrU32(ul >> 8),
+					},
+					{
+						Type:  gtp5gnl.QER_MBR_UL_LOW8,
+						Value: nl.AttrU8(ul),
+					},
+					{
+						Type:  gtp5gnl.QER_MBR_DL_HIGH32,
+						Value: nl.AttrU32(dl >> 8),
+					},
+					{
+						Type:  gtp5gnl.QER_MBR_DL_LOW8,
+						Value: nl.AttrU8(dl),
+					},
+				},
+			})
+		case ie.GBR:
+			// C
+			ul, err := i.GBRUL()
+			if err != nil {
+				break
+			}
+			dl, err := i.GBRDL()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type: gtp5gnl.QER_GBR,
+				Value: nl.AttrList{
+					{
+						Type:  gtp5gnl.QER_GBR_UL_HIGH32,
+						Value: nl.AttrU32(ul >> 8),
+					},
+					{
+						Type:  gtp5gnl.QER_GBR_UL_LOW8,
+						Value: nl.AttrU8(ul),
+					},
+					{
+						Type:  gtp5gnl.QER_GBR_DL_HIGH32,
+						Value: nl.AttrU32(dl >> 8),
+					},
+					{
+						Type:  gtp5gnl.QER_GBR_DL_LOW8,
+						Value: nl.AttrU8(dl),
+					},
+				},
+			})
+		case ie.QFI:
+			// C
+			v, err := i.QFI()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_QFI,
+				Value: nl.AttrU8(v),
+			})
+		case ie.RQI:
+			// C
+			v, err := i.RQI()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_RQI,
+				Value: nl.AttrU8(v),
+			})
+		case ie.PagingPolicyIndicator:
+			// C
+			v, err := i.PagingPolicyIndicator()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_PPI,
+				Value: nl.AttrU8(v),
+			})
+		}
+	}
+
+	oid := gtp5gnl.OID{lSeid, qerid}
+	return gtp5gnl.CreateQEROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) UpdateQER(lSeid uint64, req *ie.IE) error {
+	var qerid uint64
+	var attrs []nl.Attr
+
+	ies, err := req.UpdateQER()
+	if err != nil {
+		return err
+	}
+	for _, i := range ies {
+		switch i.Type {
+		case ie.QERID:
+			// M
+			v, err := i.QERID()
+			if err != nil {
+				break
+			}
+			qerid = uint64(v)
+		case ie.QERCorrelationID:
+			// C
+			v, err := i.QERCorrelationID()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_CORR_ID,
+				Value: nl.AttrU32(v),
+			})
+		case ie.GateStatus:
+			// M
+			v, err := i.GateStatus()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_GATE,
+				Value: nl.AttrU8(v),
+			})
+		case ie.MBR:
+			// C
+			ul, err := i.MBRUL()
+			if err != nil {
+				break
+			}
+			dl, err := i.MBRDL()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type: gtp5gnl.QER_MBR,
+				Value: nl.AttrList{
+					{
+						Type:  gtp5gnl.QER_MBR_UL_HIGH32,
+						Value: nl.AttrU32(ul >> 8),
+					},
+					{
+						Type:  gtp5gnl.QER_MBR_UL_LOW8,
+						Value: nl.AttrU8(ul),
+					},
+					{
+						Type:  gtp5gnl.QER_MBR_DL_HIGH32,
+						Value: nl.AttrU32(dl >> 8),
+					},
+					{
+						Type:  gtp5gnl.QER_MBR_DL_LOW8,
+						Value: nl.AttrU8(dl),
+					},
+				},
+			})
+		case ie.GBR:
+			// C
+			ul, err := i.GBRUL()
+			if err != nil {
+				break
+			}
+			dl, err := i.GBRDL()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type: gtp5gnl.QER_GBR,
+				Value: nl.AttrList{
+					{
+						Type:  gtp5gnl.QER_GBR_UL_HIGH32,
+						Value: nl.AttrU32(ul >> 8),
+					},
+					{
+						Type:  gtp5gnl.QER_GBR_UL_LOW8,
+						Value: nl.AttrU8(ul),
+					},
+					{
+						Type:  gtp5gnl.QER_GBR_DL_HIGH32,
+						Value: nl.AttrU32(dl >> 8),
+					},
+					{
+						Type:  gtp5gnl.QER_GBR_DL_LOW8,
+						Value: nl.AttrU8(dl),
+					},
+				},
+			})
+		case ie.QFI:
+			// C
+			v, err := i.QFI()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_QFI,
+				Value: nl.AttrU8(v),
+			})
+		case ie.RQI:
+			// C
+			v, err := i.RQI()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_RQI,
+				Value: nl.AttrU8(v),
+			})
+		case ie.PagingPolicyIndicator:
+			// C
+			v, err := i.PagingPolicyIndicator()
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.QER_PPI,
+				Value: nl.AttrU8(v),
+			})
+		}
+	}
+
+	oid := gtp5gnl.OID{lSeid, qerid}
+	return gtp5gnl.UpdateQEROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) RemoveQER(lSeid uint64, req *ie.IE) error {
+	v, err := req.QERID()
+	if err != nil {
+		return errors.New("not found QERID")
+	}
+	oid := gtp5gnl.OID{lSeid, uint64(v)}
+	return gtp5gnl.RemoveQEROID(g.client, g.link.link, oid)
 }
 
 func (g *Gtp5g) newVolumeThreshold(i *ie.IE) (nl.AttrList, error) {
@@ -538,6 +1104,354 @@ func (g *Gtp5g) newVolumeQuota(i *ie.IE) (nl.AttrList, error) {
 	}
 
 	return attrs, nil
+}
+
+func (g *Gtp5g) CreateURR(lSeid uint64, req *ie.IE) error {
+	var urrid uint32
+	var measureMethod uint8
+	var rptTrig report.ReportingTrigger
+	var measurePeriod time.Duration
+	var attrs []nl.Attr
+
+	ies, err := req.CreateURR()
+	if err != nil {
+		return err
+	}
+	for _, i := range ies {
+		switch i.Type {
+		case ie.URRID:
+			urrid, err = i.URRID()
+			if err != nil {
+				return err
+			}
+		case ie.MeasurementMethod:
+			measureMethod, err = i.MeasurementMethod()
+			if err != nil {
+				return err
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_MEASUREMENT_METHOD,
+				Value: nl.AttrU8(measureMethod),
+			})
+		case ie.ReportingTriggers:
+			var v []byte
+			v, err = i.ReportingTriggers()
+			if err != nil {
+				return err
+			}
+			err = rptTrig.Unmarshal(v)
+			if err != nil {
+				return err
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_REPORTING_TRIGGER,
+				Value: nl.AttrU32(rptTrig.Flags),
+			})
+		case ie.MeasurementPeriod:
+			measurePeriod, err = i.MeasurementPeriod()
+			if err != nil {
+				return err
+			}
+			if measurePeriod <= 0 {
+				return errors.New("invalid measurement period")
+			}
+			// TODO: convert time.Duration -> ?
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_MEASUREMENT_PERIOD,
+				Value: nl.AttrU32(measurePeriod),
+			})
+		case ie.MeasurementInformation:
+			v, err := i.MeasurementInformation()
+			if err != nil {
+				return err
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_MEASUREMENT_INFO,
+				Value: nl.AttrU64(v),
+			})
+		case ie.VolumeThreshold:
+			v, err := g.newVolumeThreshold(i)
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_VOLUME_THRESHOLD,
+				Value: v,
+			})
+		case ie.VolumeQuota:
+			v, err := g.newVolumeQuota(i)
+			if err != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_VOLUME_QUOTA,
+				Value: v,
+			})
+		}
+	}
+
+	if rptTrig.PERIO() {
+		if measurePeriod <= 0 {
+			return errors.New("invalid measurement period")
+		}
+		g.ps.AddPeriodReportTimer(lSeid, urrid, measurePeriod)
+	}
+
+	oid := gtp5gnl.OID{lSeid, uint64(urrid)}
+	return gtp5gnl.CreateURROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) UpdateURR(lSeid uint64, req *ie.IE) ([]report.USAReport, error) {
+	var urrid uint64
+	var attrs []nl.Attr
+	var usars []report.USAReport
+
+	ies, err := req.UpdateURR()
+	if err != nil {
+		return nil, err
+	}
+	for _, i := range ies {
+		switch i.Type {
+		case ie.URRID:
+			v, err1 := i.URRID()
+			if err1 != nil {
+				return nil, err1
+			}
+			urrid = uint64(v)
+		case ie.MeasurementMethod:
+			v, err1 := i.MeasurementMethod()
+			if err1 != nil {
+				return nil, err1
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_MEASUREMENT_METHOD,
+				Value: nl.AttrU8(v),
+			})
+		case ie.ReportingTriggers:
+			v, err1 := i.ReportingTriggers()
+			if err1 != nil {
+				return nil, err1
+			}
+			var rptTrig report.ReportingTrigger
+			err1 = rptTrig.Unmarshal(v)
+			if err1 != nil {
+				return nil, err1
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_REPORTING_TRIGGER,
+				Value: nl.AttrU32(rptTrig.Flags),
+			})
+		case ie.MeasurementPeriod:
+			v, err1 := i.MeasurementPeriod()
+			if err1 != nil {
+				return nil, err1
+			}
+			// TODO: convert time.Duration -> ?
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_MEASUREMENT_PERIOD,
+				Value: nl.AttrU32(v),
+			})
+		case ie.MeasurementInformation:
+			v, err1 := i.MeasurementInformation()
+			if err1 != nil {
+				return nil, err1
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_MEASUREMENT_INFO,
+				Value: nl.AttrU64(v),
+			})
+		case ie.VolumeThreshold:
+			v, err1 := g.newVolumeThreshold(i)
+			if err1 != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_VOLUME_THRESHOLD,
+				Value: v,
+			})
+		case ie.VolumeQuota:
+			v, err1 := g.newVolumeQuota(i)
+			if err1 != nil {
+				break
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.URR_VOLUME_QUOTA,
+				Value: v,
+			})
+		}
+
+		// TODO: should apply PERIO updateURR and receive final report from old URR
+	}
+
+	oid := gtp5gnl.OID{lSeid, urrid}
+	rs, err := gtp5gnl.UpdateURROID(g.client, g.link.link, oid, attrs)
+	if err != nil {
+		return nil, err
+	}
+
+	if rs == nil {
+		return nil, nil
+	}
+
+	for _, r := range rs {
+		usar := report.USAReport{
+			URRID:       r.URRID,
+			QueryUrrRef: r.QueryUrrRef,
+			StartTime:   r.StartTime,
+			EndTime:     r.EndTime,
+		}
+
+		usar.USARTrigger.Flags = r.USARTrigger
+		usar.VolumMeasure = report.VolumeMeasure{
+			TotalVolume:    r.VolMeasurement.TotalVolume,
+			UplinkVolume:   r.VolMeasurement.UplinkVolume,
+			DownlinkVolume: r.VolMeasurement.DownlinkVolume,
+			TotalPktNum:    r.VolMeasurement.TotalPktNum,
+			UplinkPktNum:   r.VolMeasurement.UplinkPktNum,
+			DownlinkPktNum: r.VolMeasurement.DownlinkPktNum,
+		}
+
+		usars = append(usars, usar)
+	}
+
+	return usars, err
+}
+
+func (g *Gtp5g) RemoveURR(lSeid uint64, req *ie.IE) ([]report.USAReport, error) {
+	var usars []report.USAReport
+
+	v, err := req.URRID()
+	if err != nil {
+		return nil, errors.New("not found URRID")
+	}
+
+	g.ps.DelPeriodReportTimer(lSeid, v)
+
+	oid := gtp5gnl.OID{lSeid, uint64(v)}
+	rs, err := gtp5gnl.RemoveURROID(g.client, g.link.link, oid)
+	if err != nil {
+		return nil, err
+	}
+
+	if rs == nil {
+		return nil, nil
+	}
+
+	for _, r := range rs {
+		usar := report.USAReport{
+			URRID:       r.URRID,
+			QueryUrrRef: r.QueryUrrRef,
+			StartTime:   r.StartTime,
+			EndTime:     r.EndTime,
+		}
+
+		usar.USARTrigger.Flags = r.USARTrigger
+		usar.VolumMeasure = report.VolumeMeasure{
+			TotalVolume:    r.VolMeasurement.TotalVolume,
+			UplinkVolume:   r.VolMeasurement.UplinkVolume,
+			DownlinkVolume: r.VolMeasurement.DownlinkVolume,
+			TotalPktNum:    r.VolMeasurement.TotalPktNum,
+			UplinkPktNum:   r.VolMeasurement.UplinkPktNum,
+			DownlinkPktNum: r.VolMeasurement.DownlinkPktNum,
+		}
+
+		usars = append(usars, usar)
+	}
+
+	return usars, err
+}
+
+func (g *Gtp5g) CreateBAR(lSeid uint64, req *ie.IE) error {
+	var barid uint64
+	var attrs []nl.Attr
+
+	ies, err := req.CreateBAR()
+	if err != nil {
+		return err
+	}
+	for _, i := range ies {
+		switch i.Type {
+		case ie.BARID:
+			v, err := i.BARID()
+			if err != nil {
+				return err
+			}
+			barid = uint64(v)
+		case ie.DownlinkDataNotificationDelay:
+			v, err := i.DownlinkDataNotificationDelay()
+			if err != nil {
+				return err
+			}
+			// TODO: convert time.Duration -> ?
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.BAR_DOWNLINK_DATA_NOTIFICATION_DELAY,
+				Value: nl.AttrU8(v),
+			})
+		case ie.SuggestedBufferingPacketsCount:
+			v, err := i.SuggestedBufferingPacketsCount()
+			if err != nil {
+				return err
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.BAR_BUFFERING_PACKETS_COUNT,
+				Value: nl.AttrU16(v),
+			})
+		}
+	}
+
+	oid := gtp5gnl.OID{lSeid, barid}
+	return gtp5gnl.CreateBAROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) UpdateBAR(lSeid uint64, req *ie.IE) error {
+	var barid uint64
+	var attrs []nl.Attr
+
+	ies, err := req.UpdateBAR()
+	if err != nil {
+		return err
+	}
+	for _, i := range ies {
+		switch i.Type {
+		case ie.BARID:
+			v, err := i.BARID()
+			if err != nil {
+				return err
+			}
+			barid = uint64(v)
+		case ie.DownlinkDataNotificationDelay:
+			v, err := i.DownlinkDataNotificationDelay()
+			if err != nil {
+				return err
+			}
+			// TODO: convert time.Duration -> ?
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.BAR_DOWNLINK_DATA_NOTIFICATION_DELAY,
+				Value: nl.AttrU8(v),
+			})
+		case ie.SuggestedBufferingPacketsCount:
+			v, err := i.SuggestedBufferingPacketsCount()
+			if err != nil {
+				return err
+			}
+			attrs = append(attrs, nl.Attr{
+				Type:  gtp5gnl.BAR_BUFFERING_PACKETS_COUNT,
+				Value: nl.AttrU16(v),
+			})
+		}
+	}
+
+	oid := gtp5gnl.OID{lSeid, barid}
+	return gtp5gnl.UpdateBAROID(g.client, g.link.link, oid, attrs)
+}
+
+func (g *Gtp5g) RemoveBAR(lSeid uint64, req *ie.IE) error {
+	v, err := req.BARID()
+	if err != nil {
+		return errors.New("not found BARID")
+	}
+	oid := gtp5gnl.OID{lSeid, uint64(v)}
+	return gtp5gnl.RemoveBAROID(g.client, g.link.link, oid)
 }
 
 func (g *Gtp5g) QueryURR(lSeid uint64, urrid uint32) ([]report.USAReport, error) {
@@ -760,1140 +1674,4 @@ func (g *Gtp5g) WritePacket(far *gtp5gnl.FAR, qer *gtp5gnl.QER, pkt []byte) erro
 	}
 	_, err = g.link.WriteTo(b, addr)
 	return err
-}
-
-// ============================================================================
-// Plan-based methods for two-phase commit (validation + execution)
-// ============================================================================
-
-func (g *Gtp5g) BuildCreatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
-	var pdrid uint64
-	var attrs []nl.Attr
-	var urrids []uint32
-
-	ies, err := req.CreatePDR()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.PDRID:
-			v, err := i.PDRID()
-			if err != nil {
-				return nil, errors.Wrap(err, "CreatePDR: failed to parse PDRID")
-			}
-			pdrid = uint64(v)
-		case ie.Precedence:
-			v, err := i.Precedence()
-			if err != nil {
-				return nil, errors.Wrap(err, "CreatePDR: failed to parse Precedence")
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_PRECEDENCE,
-				Value: nl.AttrU32(v),
-			})
-		case ie.PDI:
-			v, err := g.newPdi(i)
-			if err != nil {
-				return nil, errors.Wrap(err, "CreatePDR: failed to parse PDI")
-			}
-			if v != nil {
-				attrs = append(attrs, nl.Attr{
-					Type:  gtp5gnl.PDR_PDI,
-					Value: v,
-				})
-			}
-		case ie.OuterHeaderRemoval:
-			v, err := i.OuterHeaderRemovalDescription()
-			if err != nil {
-				return nil, errors.Wrap(err, "CreatePDR: failed to parse OuterHeaderRemoval")
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_OUTER_HEADER_REMOVAL,
-				Value: nl.AttrU8(v),
-			})
-			// ignore GTPUExternsionHeaderDeletion
-		case ie.FARID:
-			v, err := i.FARID()
-			if err != nil {
-				return nil, errors.Wrap(err, "CreatePDR: failed to parse FARID")
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_FAR_ID,
-				Value: nl.AttrU32(v),
-			})
-		case ie.QERID:
-			v, err := i.QERID()
-			if err != nil {
-				// QER is optional, log but continue
-				logger.FwderLog.Warnf("CreatePDR: Failed to parse QERID: %v", err)
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_QER_ID,
-				Value: nl.AttrU32(v),
-			})
-		case ie.URRID:
-			v, err := i.URRID()
-			if err != nil {
-				// URR is optional, log but continue
-				logger.FwderLog.Warnf("CreatePDR: Failed to parse URRID: %v", err)
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_URR_ID,
-				Value: nl.AttrU32(v),
-			})
-			urrids = append(urrids, v)
-		}
-	}
-
-	// TODO:
-	// Not in 3GPP spec, just used for routing
-	// var roleAddrIpv4 net.IP
-	// roleAddrIpv4 = net.IPv4(34, 35, 36, 37)
-	// pdr.RoleAddrIpv4 = &roleAddrIpv4
-
-	// TODO:
-	// Not in 3GPP spec, just used for buffering
-	attrs = append(attrs, nl.Attr{
-		Type:  gtp5gnl.PDR_UNIX_SOCKET_PATH,
-		Value: nl.AttrString(gtp5gnl.PdrAddrForNetlink),
-	})
-
-	return &PDRPlan{
-		Op:         OpCreate,
-		OID:        gtp5gnl.OID{lSeid, pdrid},
-		Attrs:      attrs,
-		OriginalIE: req,
-		PDRID:      uint16(pdrid),
-		URRIDs:     urrids,
-	}, nil
-}
-
-func (g *Gtp5g) BuildUpdatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
-	var pdrid uint64
-	var attrs []nl.Attr
-	var urrids []uint32
-
-	ies, err := req.UpdatePDR()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.PDRID:
-			v, err := i.PDRID()
-			if err != nil {
-				return nil, errors.Wrap(err, "UpdatePDR: failed to parse PDRID")
-			}
-			pdrid = uint64(v)
-		case ie.Precedence:
-			v, err := i.Precedence()
-			if err != nil {
-				// Precedence is optional in Update, log but continue
-				logger.FwderLog.Warnf("UpdatePDR: Failed to parse Precedence: %v", err)
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_PRECEDENCE,
-				Value: nl.AttrU32(v),
-			})
-		case ie.PDI:
-			v, err := g.newPdi(i)
-			if err != nil {
-				return nil, errors.Wrap(err, "UpdatePDR: failed to parse PDI")
-			}
-			if v != nil {
-				attrs = append(attrs, nl.Attr{
-					Type:  gtp5gnl.PDR_PDI,
-					Value: v,
-				})
-			}
-		case ie.OuterHeaderRemoval:
-			v, err := i.OuterHeaderRemovalDescription()
-			if err != nil {
-				logger.FwderLog.Warnf("UpdatePDR: Failed to parse OuterHeaderRemoval: %v", err)
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_OUTER_HEADER_REMOVAL,
-				Value: nl.AttrU8(v),
-			})
-			// ignore GTPUExternsionHeaderDeletion
-		case ie.FARID:
-			v, err := i.FARID()
-			if err != nil {
-				logger.FwderLog.Warnf("UpdatePDR: Failed to parse FARID: %v", err)
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_FAR_ID,
-				Value: nl.AttrU32(v),
-			})
-		case ie.QERID:
-			v, err := i.QERID()
-			if err != nil {
-				logger.FwderLog.Warnf("UpdatePDR: Failed to parse QERID: %v", err)
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_QER_ID,
-				Value: nl.AttrU32(v),
-			})
-		case ie.URRID:
-			v, err := i.URRID()
-			if err != nil {
-				logger.FwderLog.Warnf("UpdatePDR: Failed to parse URRID: %v", err)
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.PDR_URR_ID,
-				Value: nl.AttrU32(v),
-			})
-			urrids = append(urrids, v)
-		}
-	}
-
-	return &PDRPlan{
-		Op:         OpUpdate,
-		OID:        gtp5gnl.OID{lSeid, pdrid},
-		Attrs:      attrs,
-		OriginalIE: req,
-		PDRID:      uint16(pdrid),
-		URRIDs:     urrids,
-	}, nil
-}
-
-func (g *Gtp5g) BuildRemovePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
-	v, err := req.PDRID()
-	if err != nil {
-		return nil, errors.New("not found PDRID")
-	}
-
-	return &PDRPlan{
-		Op:         OpRemove,
-		OID:        gtp5gnl.OID{lSeid, uint64(v)},
-		Attrs:      nil,
-		OriginalIE: req,
-		PDRID:      v,
-	}, nil
-}
-
-func (g *Gtp5g) BuildCreateFARPlan(lSeid uint64, req *ie.IE) (*FARPlan, error) {
-	var farid uint64
-	var attrs []nl.Attr
-
-	ies, err := req.CreateFAR()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.FARID:
-			v, err := i.FARID()
-			if err != nil {
-				return nil, err
-			}
-			farid = uint64(v)
-		case ie.ApplyAction:
-			b, err := i.ApplyAction()
-			if err != nil {
-				return nil, err
-			}
-			var act report.ApplyAction
-			err = act.Unmarshal(b)
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.FAR_APPLY_ACTION,
-				Value: nl.AttrU16(act.Flags),
-			})
-		case ie.ForwardingParameters:
-			xs, err := i.ForwardingParameters()
-			if err != nil {
-				return nil, err
-			}
-			v, err := g.newForwardingParameter(xs)
-			if err != nil {
-				break
-			}
-			if v != nil {
-				attrs = append(attrs, nl.Attr{
-					Type:  gtp5gnl.FAR_FORWARDING_PARAMETER,
-					Value: v,
-				})
-			}
-		case ie.BARID:
-			v, err := i.BARID()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.FAR_BAR_ID,
-				Value: nl.AttrU8(v),
-			})
-		}
-	}
-
-	return &FARPlan{
-		Op:         OpCreate,
-		OID:        gtp5gnl.OID{lSeid, farid},
-		Attrs:      attrs,
-		OriginalIE: req,
-		FARID:      uint32(farid),
-	}, nil
-}
-
-func (g *Gtp5g) BuildUpdateFARPlan(lSeid uint64, req *ie.IE) (*FARPlan, error) {
-	var farid uint64
-	var attrs []nl.Attr
-	var applyAction *report.ApplyAction
-
-	ies, err := req.UpdateFAR()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.FARID:
-			v, err := i.FARID()
-			if err != nil {
-				return nil, err
-			}
-			farid = uint64(v)
-		case ie.ApplyAction:
-			b, err := i.ApplyAction()
-			if err != nil {
-				return nil, err
-			}
-			var act report.ApplyAction
-			err = act.Unmarshal(b)
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.FAR_APPLY_ACTION,
-				Value: nl.AttrU16(act.Flags),
-			})
-			applyAction = &act
-		case ie.UpdateForwardingParameters:
-			xs, err := i.UpdateForwardingParameters()
-			if err != nil {
-				return nil, err
-			}
-			v, err := g.newForwardingParameter(xs)
-			if err != nil {
-				break
-			}
-			if v != nil {
-				attrs = append(attrs, nl.Attr{
-					Type:  gtp5gnl.FAR_FORWARDING_PARAMETER,
-					Value: v,
-				})
-			}
-		case ie.BARID:
-			v, err := i.BARID()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.FAR_BAR_ID,
-				Value: nl.AttrU8(v),
-			})
-		}
-	}
-
-	return &FARPlan{
-		Op:          OpUpdate,
-		OID:         gtp5gnl.OID{lSeid, farid},
-		Attrs:       attrs,
-		OriginalIE:  req,
-		FARID:       uint32(farid),
-		ApplyAction: applyAction,
-	}, nil
-}
-
-func (g *Gtp5g) BuildRemoveFARPlan(lSeid uint64, req *ie.IE) (*FARPlan, error) {
-	v, err := req.FARID()
-	if err != nil {
-		return nil, errors.New("not found FARID")
-	}
-
-	return &FARPlan{
-		Op:         OpRemove,
-		OID:        gtp5gnl.OID{lSeid, uint64(v)},
-		Attrs:      nil,
-		OriginalIE: req,
-		FARID:      v,
-	}, nil
-}
-
-func (g *Gtp5g) BuildCreateQERPlan(lSeid uint64, req *ie.IE) (*QERPlan, error) {
-	var qerid uint64
-	var attrs []nl.Attr
-
-	ies, err := req.CreateQER()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.QERID:
-			v, err := i.QERID()
-			if err != nil {
-				break
-			}
-			qerid = uint64(v)
-		case ie.QERCorrelationID:
-			v, err := i.QERCorrelationID()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_CORR_ID,
-				Value: nl.AttrU32(v),
-			})
-		case ie.GateStatus:
-			v, err := i.GateStatus()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_GATE,
-				Value: nl.AttrU8(v),
-			})
-		case ie.MBR:
-			ul, err := i.MBRUL()
-			if err != nil {
-				break
-			}
-			dl, err := i.MBRDL()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type: gtp5gnl.QER_MBR,
-				Value: nl.AttrList{
-					{Type: gtp5gnl.QER_MBR_UL_HIGH32, Value: nl.AttrU32(ul >> 8)},
-					{Type: gtp5gnl.QER_MBR_UL_LOW8, Value: nl.AttrU8(ul)},
-					{Type: gtp5gnl.QER_MBR_DL_HIGH32, Value: nl.AttrU32(dl >> 8)},
-					{Type: gtp5gnl.QER_MBR_DL_LOW8, Value: nl.AttrU8(dl)},
-				},
-			})
-		case ie.GBR:
-			ul, err := i.GBRUL()
-			if err != nil {
-				break
-			}
-			dl, err := i.GBRDL()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type: gtp5gnl.QER_GBR,
-				Value: nl.AttrList{
-					{Type: gtp5gnl.QER_GBR_UL_HIGH32, Value: nl.AttrU32(ul >> 8)},
-					{Type: gtp5gnl.QER_GBR_UL_LOW8, Value: nl.AttrU8(ul)},
-					{Type: gtp5gnl.QER_GBR_DL_HIGH32, Value: nl.AttrU32(dl >> 8)},
-					{Type: gtp5gnl.QER_GBR_DL_LOW8, Value: nl.AttrU8(dl)},
-				},
-			})
-		case ie.QFI:
-			v, err := i.QFI()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_QFI,
-				Value: nl.AttrU8(v),
-			})
-		case ie.RQI:
-			v, err := i.RQI()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_RQI,
-				Value: nl.AttrU8(v),
-			})
-		case ie.PagingPolicyIndicator:
-			v, err := i.PagingPolicyIndicator()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_PPI,
-				Value: nl.AttrU8(v),
-			})
-		}
-	}
-
-	return &QERPlan{
-		Op:         OpCreate,
-		OID:        gtp5gnl.OID{lSeid, qerid},
-		Attrs:      attrs,
-		OriginalIE: req,
-		QERID:      uint32(qerid),
-	}, nil
-}
-
-func (g *Gtp5g) BuildUpdateQERPlan(lSeid uint64, req *ie.IE) (*QERPlan, error) {
-	var qerid uint64
-	var attrs []nl.Attr
-
-	ies, err := req.UpdateQER()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.QERID:
-			v, err := i.QERID()
-			if err != nil {
-				break
-			}
-			qerid = uint64(v)
-		case ie.QERCorrelationID:
-			v, err := i.QERCorrelationID()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_CORR_ID,
-				Value: nl.AttrU32(v),
-			})
-		case ie.GateStatus:
-			v, err := i.GateStatus()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_GATE,
-				Value: nl.AttrU8(v),
-			})
-		case ie.MBR:
-			ul, err := i.MBRUL()
-			if err != nil {
-				break
-			}
-			dl, err := i.MBRDL()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type: gtp5gnl.QER_MBR,
-				Value: nl.AttrList{
-					{Type: gtp5gnl.QER_MBR_UL_HIGH32, Value: nl.AttrU32(ul >> 8)},
-					{Type: gtp5gnl.QER_MBR_UL_LOW8, Value: nl.AttrU8(ul)},
-					{Type: gtp5gnl.QER_MBR_DL_HIGH32, Value: nl.AttrU32(dl >> 8)},
-					{Type: gtp5gnl.QER_MBR_DL_LOW8, Value: nl.AttrU8(dl)},
-				},
-			})
-		case ie.GBR:
-			ul, err := i.GBRUL()
-			if err != nil {
-				break
-			}
-			dl, err := i.GBRDL()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type: gtp5gnl.QER_GBR,
-				Value: nl.AttrList{
-					{Type: gtp5gnl.QER_GBR_UL_HIGH32, Value: nl.AttrU32(ul >> 8)},
-					{Type: gtp5gnl.QER_GBR_UL_LOW8, Value: nl.AttrU8(ul)},
-					{Type: gtp5gnl.QER_GBR_DL_HIGH32, Value: nl.AttrU32(dl >> 8)},
-					{Type: gtp5gnl.QER_GBR_DL_LOW8, Value: nl.AttrU8(dl)},
-				},
-			})
-		case ie.QFI:
-			v, err := i.QFI()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_QFI,
-				Value: nl.AttrU8(v),
-			})
-		case ie.RQI:
-			v, err := i.RQI()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_RQI,
-				Value: nl.AttrU8(v),
-			})
-		case ie.PagingPolicyIndicator:
-			v, err := i.PagingPolicyIndicator()
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.QER_PPI,
-				Value: nl.AttrU8(v),
-			})
-		}
-	}
-
-	return &QERPlan{
-		Op:         OpUpdate,
-		OID:        gtp5gnl.OID{lSeid, qerid},
-		Attrs:      attrs,
-		OriginalIE: req,
-		QERID:      uint32(qerid),
-	}, nil
-}
-
-func (g *Gtp5g) BuildRemoveQERPlan(lSeid uint64, req *ie.IE) (*QERPlan, error) {
-	v, err := req.QERID()
-	if err != nil {
-		return nil, errors.New("not found QERID")
-	}
-
-	return &QERPlan{
-		Op:         OpRemove,
-		OID:        gtp5gnl.OID{lSeid, uint64(v)},
-		Attrs:      nil,
-		OriginalIE: req,
-		QERID:      v,
-	}, nil
-}
-
-func (g *Gtp5g) BuildCreateURRPlan(lSeid uint64, req *ie.IE) (*URRPlan, error) {
-	var urrid uint32
-	var measureMethod uint8
-	var rptTrig report.ReportingTrigger
-	var measurePeriod time.Duration
-	var measureInfoIE *ie.IE
-	var attrs []nl.Attr
-
-	ies, err := req.CreateURR()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.URRID:
-			urrid, err = i.URRID()
-			if err != nil {
-				return nil, err
-			}
-		case ie.MeasurementMethod:
-			measureMethod, err = i.MeasurementMethod()
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_MEASUREMENT_METHOD,
-				Value: nl.AttrU8(measureMethod),
-			})
-		case ie.ReportingTriggers:
-			var v []byte
-			v, err = i.ReportingTriggers()
-			if err != nil {
-				return nil, err
-			}
-			err = rptTrig.Unmarshal(v)
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_REPORTING_TRIGGER,
-				Value: nl.AttrU32(rptTrig.Flags),
-			})
-		case ie.MeasurementPeriod:
-			measurePeriod, err = i.MeasurementPeriod()
-			if err != nil {
-				return nil, err
-			}
-			if measurePeriod <= 0 {
-				return nil, errors.New("invalid measurement period")
-			}
-			// TODO: convert time.Duration -> ?
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_MEASUREMENT_PERIOD,
-				Value: nl.AttrU32(measurePeriod),
-			})
-		case ie.MeasurementInformation:
-			measureInfoIE = i
-			v, err := i.MeasurementInformation()
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_MEASUREMENT_INFO,
-				Value: nl.AttrU64(v),
-			})
-		case ie.VolumeThreshold:
-			v, err := g.newVolumeThreshold(i)
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_VOLUME_THRESHOLD,
-				Value: v,
-			})
-		case ie.VolumeQuota:
-			v, err := g.newVolumeQuota(i)
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_VOLUME_QUOTA,
-				Value: v,
-			})
-		}
-	}
-
-	if rptTrig.PERIO() && measurePeriod <= 0 {
-		return nil, errors.New("invalid measurement period for PERIO trigger")
-	}
-
-	return &URRPlan{
-		Op:               OpCreate,
-		OID:              gtp5gnl.OID{lSeid, uint64(urrid)},
-		Attrs:            attrs,
-		OriginalIE:       req,
-		URRID:            urrid,
-		MeasureMethod:    measureMethod,
-		ReportingTrigger: rptTrig,
-		MeasurePeriod:    measurePeriod,
-		MeasureInfoIE:    measureInfoIE,
-	}, nil
-}
-
-// BuildUpdateURRPlan parses and validates UpdateURR IE without executing
-func (g *Gtp5g) BuildUpdateURRPlan(lSeid uint64, req *ie.IE) (*URRPlan, error) {
-	var urrid uint64
-	var measureMethod uint8
-	var measureInfoIE *ie.IE
-	var attrs []nl.Attr
-
-	ies, err := req.UpdateURR()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.URRID:
-			v, err := i.URRID()
-			if err != nil {
-				return nil, err
-			}
-			urrid = uint64(v)
-		case ie.MeasurementMethod:
-			v, err := i.MeasurementMethod()
-			if err != nil {
-				return nil, err
-			}
-			measureMethod = v
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_MEASUREMENT_METHOD,
-				Value: nl.AttrU8(v),
-			})
-		case ie.ReportingTriggers:
-			v, err := i.ReportingTriggers()
-			if err != nil {
-				return nil, err
-			}
-			var rptTrig report.ReportingTrigger
-			err = rptTrig.Unmarshal(v)
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_REPORTING_TRIGGER,
-				Value: nl.AttrU32(rptTrig.Flags),
-			})
-		case ie.MeasurementPeriod:
-			v, err := i.MeasurementPeriod()
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_MEASUREMENT_PERIOD,
-				Value: nl.AttrU32(v),
-			})
-		case ie.MeasurementInformation:
-			measureInfoIE = i
-			v, err := i.MeasurementInformation()
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_MEASUREMENT_INFO,
-				Value: nl.AttrU64(v),
-			})
-		case ie.VolumeThreshold:
-			v, err := g.newVolumeThreshold(i)
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_VOLUME_THRESHOLD,
-				Value: v,
-			})
-		case ie.VolumeQuota:
-			v, err := g.newVolumeQuota(i)
-			if err != nil {
-				break
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.URR_VOLUME_QUOTA,
-				Value: v,
-			})
-		}
-
-		// TODO: should apply PERIO updateURR and receive final report from old URR
-	}
-
-	return &URRPlan{
-		Op:            OpUpdate,
-		OID:           gtp5gnl.OID{lSeid, urrid},
-		Attrs:         attrs,
-		OriginalIE:    req,
-		URRID:         uint32(urrid),
-		MeasureMethod: measureMethod,
-		MeasureInfoIE: measureInfoIE,
-	}, nil
-}
-
-func (g *Gtp5g) BuildRemoveURRPlan(lSeid uint64, req *ie.IE) (*URRPlan, error) {
-	v, err := req.URRID()
-	if err != nil {
-		return nil, errors.New("not found URRID")
-	}
-
-	return &URRPlan{
-		Op:         OpRemove,
-		OID:        gtp5gnl.OID{lSeid, uint64(v)},
-		Attrs:      nil,
-		OriginalIE: req,
-		URRID:      v,
-	}, nil
-}
-
-func (g *Gtp5g) BuildQueryURRPlan(lSeid uint64, req *ie.IE) (*URRPlan, error) {
-	v, err := req.URRID()
-	if err != nil {
-		return nil, errors.New("not found URRID")
-	}
-
-	return &URRPlan{
-		Op:         OpRemove, // Query is not Create/Update/Remove, but we need a value
-		OID:        gtp5gnl.OID{lSeid, uint64(v)},
-		Attrs:      nil,
-		OriginalIE: req,
-		QueryURRID: v,
-	}, nil
-}
-
-func (g *Gtp5g) BuildCreateBARPlan(lSeid uint64, req *ie.IE) (*BARPlan, error) {
-	var barid uint64
-	var attrs []nl.Attr
-
-	ies, err := req.CreateBAR()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.BARID:
-			v, err := i.BARID()
-			if err != nil {
-				return nil, err
-			}
-			barid = uint64(v)
-		case ie.DownlinkDataNotificationDelay:
-			v, err := i.DownlinkDataNotificationDelay()
-			if err != nil {
-				return nil, err
-			}
-			// TODO: convert time.Duration -> ?
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.BAR_DOWNLINK_DATA_NOTIFICATION_DELAY,
-				Value: nl.AttrU8(v),
-			})
-		case ie.SuggestedBufferingPacketsCount:
-			v, err := i.SuggestedBufferingPacketsCount()
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.BAR_BUFFERING_PACKETS_COUNT,
-				Value: nl.AttrU16(v),
-			})
-		}
-	}
-
-	return &BARPlan{
-		Op:         OpCreate,
-		OID:        gtp5gnl.OID{lSeid, barid},
-		Attrs:      attrs,
-		OriginalIE: req,
-		BARID:      uint8(barid),
-	}, nil
-}
-
-func (g *Gtp5g) BuildUpdateBARPlan(lSeid uint64, req *ie.IE) (*BARPlan, error) {
-	var barid uint64
-	var attrs []nl.Attr
-
-	ies, err := req.UpdateBAR()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, i := range ies {
-		switch i.Type {
-		case ie.BARID:
-			v, err := i.BARID()
-			if err != nil {
-				return nil, err
-			}
-			barid = uint64(v)
-		case ie.DownlinkDataNotificationDelay:
-			v, err := i.DownlinkDataNotificationDelay()
-			if err != nil {
-				return nil, err
-			}
-			// TODO: convert time.Duration -> ?
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.BAR_DOWNLINK_DATA_NOTIFICATION_DELAY,
-				Value: nl.AttrU8(v),
-			})
-		case ie.SuggestedBufferingPacketsCount:
-			v, err := i.SuggestedBufferingPacketsCount()
-			if err != nil {
-				return nil, err
-			}
-			attrs = append(attrs, nl.Attr{
-				Type:  gtp5gnl.BAR_BUFFERING_PACKETS_COUNT,
-				Value: nl.AttrU16(v),
-			})
-		}
-	}
-
-	return &BARPlan{
-		Op:         OpUpdate,
-		OID:        gtp5gnl.OID{lSeid, barid},
-		Attrs:      attrs,
-		OriginalIE: req,
-		BARID:      uint8(barid),
-	}, nil
-}
-
-func (g *Gtp5g) BuildRemoveBARPlan(lSeid uint64, req *ie.IE) (*BARPlan, error) {
-	v, err := req.BARID()
-	if err != nil {
-		return nil, errors.New("not found BARID")
-	}
-
-	return &BARPlan{
-		Op:         OpRemove,
-		OID:        gtp5gnl.OID{lSeid, uint64(v)},
-		Attrs:      nil,
-		OriginalIE: req,
-		BARID:      v,
-	}, nil
-}
-
-// ExecuteModificationPlan executes all operations in the plan
-// Uses best-effort execution: continues on failure, logs errors
-func (g *Gtp5g) ExecuteModificationPlan(plan *ModificationPlan) (*ExecutionResult, error) {
-	result := NewExecutionResult()
-
-	for _, p := range plan.CreateFARs {
-		if err := gtp5gnl.CreateFAROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: CreateFAR[%#x] failed: %v", p.FARID, err)
-		}
-	}
-
-	for _, p := range plan.CreateQERs {
-		if err := gtp5gnl.CreateQEROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: CreateQER[%#x] failed: %v", p.QERID, err)
-		}
-	}
-
-	for _, p := range plan.CreateURRs {
-		if p.ReportingTrigger.PERIO() && p.MeasurePeriod > 0 {
-			g.ps.AddPeriodReportTimer(plan.SEID, p.URRID, p.MeasurePeriod)
-		}
-		if err := gtp5gnl.CreateURROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: CreateURR[%#x] failed: %v", p.URRID, err)
-		}
-	}
-
-	for _, p := range plan.CreateBARs {
-		if err := gtp5gnl.CreateBAROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: CreateBAR[%#x] failed: %v", p.BARID, err)
-		}
-	}
-
-	for _, p := range plan.CreatePDRs {
-		if err := gtp5gnl.CreatePDROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: CreatePDR[%#x] failed: %v", p.PDRID, err)
-		}
-	}
-
-	for _, p := range plan.RemovePDRs {
-		if err := gtp5gnl.RemovePDROID(g.client, g.link.link, p.OID); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: RemovePDR[%#x] failed: %v", p.PDRID, err)
-		}
-	}
-
-	for _, p := range plan.RemoveBARs {
-		if err := gtp5gnl.RemoveBAROID(g.client, g.link.link, p.OID); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: RemoveBAR[%#x] failed: %v", p.BARID, err)
-		}
-	}
-
-	for _, p := range plan.RemoveURRs {
-		g.ps.DelPeriodReportTimer(plan.SEID, p.URRID)
-		rs, err := gtp5gnl.RemoveURROID(g.client, g.link.link, p.OID)
-		if err != nil {
-			g.log.Errorf("ExecuteModificationPlan: RemoveURR[%#x] failed: %v", p.URRID, err)
-		}
-		for _, r := range rs {
-			result.USAReports = append(result.USAReports, g.convertUSAReport(r))
-		}
-	}
-
-	for _, p := range plan.RemoveQERs {
-		if err := gtp5gnl.RemoveQEROID(g.client, g.link.link, p.OID); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: RemoveQER[%#x] failed: %v", p.QERID, err)
-		}
-	}
-
-	for _, p := range plan.RemoveFARs {
-		if err := gtp5gnl.RemoveFAROID(g.client, g.link.link, p.OID); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: RemoveFAR[%#x] failed: %v", p.FARID, err)
-		}
-	}
-
-	for _, p := range plan.UpdateFARs {
-		if err := gtp5gnl.UpdateFAROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: UpdateFAR[%#x] failed: %v", p.FARID, err)
-		}
-
-		if p.ApplyAction != nil {
-			g.applyAction(plan.SEID, int(p.FARID), *p.ApplyAction)
-		}
-	}
-
-	for _, p := range plan.UpdateQERs {
-		if err := gtp5gnl.UpdateQEROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: UpdateQER[%#x] failed: %v", p.QERID, err)
-		}
-	}
-
-	for _, p := range plan.UpdateURRs {
-		rs, err := gtp5gnl.UpdateURROID(g.client, g.link.link, p.OID, p.Attrs)
-		if err != nil {
-			g.log.Errorf("ExecuteModificationPlan: UpdateURR[%#x] failed: %v", p.URRID, err)
-		}
-		for _, r := range rs {
-			result.USAReports = append(result.USAReports, g.convertUSAReport(r))
-		}
-	}
-
-	for _, p := range plan.UpdateBARs {
-		if err := gtp5gnl.UpdateBAROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: UpdateBAR[%#x] failed: %v", p.BARID, err)
-		}
-	}
-
-	for _, p := range plan.UpdatePDRs {
-		if err := gtp5gnl.UpdatePDROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			g.log.Errorf("ExecuteModificationPlan: UpdatePDR[%#x] failed: %v", p.PDRID, err)
-		}
-	}
-
-	// Execute Query operations
-	for _, p := range plan.QueryURRs {
-		rs, err := gtp5gnl.GetReportOID(g.client, g.link.link, p.OID)
-		if err != nil {
-			g.log.Errorf("ExecuteModificationPlan: QueryURR[%#x] failed: %v", p.QueryURRID, err)
-			continue
-		}
-		for _, r := range rs {
-			result.USAReports = append(result.USAReports, g.convertUSAReport(r))
-		}
-	}
-
-	return result, nil
-}
-
-// ExecuteEstablishmentPlan executes Create operations for session establishment.
-// Uses fail-fast semantics: returns error on first failure.
-func (g *Gtp5g) ExecuteEstablishmentPlan(plan *ModificationPlan) (*ExecutionResult, error) {
-	result := NewExecutionResult()
-
-	for _, p := range plan.CreateFARs {
-		if err := gtp5gnl.CreateFAROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			return nil, errors.Wrapf(err, "EstablishmentPlan: CreateFAR[%#x] failed", p.FARID)
-		}
-	}
-
-	for _, p := range plan.CreateQERs {
-		if err := gtp5gnl.CreateQEROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			return nil, errors.Wrapf(err, "EstablishmentPlan: CreateQER[%#x] failed", p.QERID)
-		}
-	}
-
-	for _, p := range plan.CreateURRs {
-		if p.ReportingTrigger.PERIO() && p.MeasurePeriod > 0 {
-			g.ps.AddPeriodReportTimer(plan.SEID, p.URRID, p.MeasurePeriod)
-		}
-		if err := gtp5gnl.CreateURROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			return nil, errors.Wrapf(err, "EstablishmentPlan: CreateURR[%#x] failed", p.URRID)
-		}
-	}
-
-	for _, p := range plan.CreateBARs {
-		if err := gtp5gnl.CreateBAROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			return nil, errors.Wrapf(err, "EstablishmentPlan: CreateBAR[%#x] failed", p.BARID)
-		}
-	}
-
-	for _, p := range plan.CreatePDRs {
-		if err := gtp5gnl.CreatePDROID(g.client, g.link.link, p.OID, p.Attrs); err != nil {
-			return nil, errors.Wrapf(err, "EstablishmentPlan: CreatePDR[%#x] failed", p.PDRID)
-		}
-	}
-
-	return result, nil
-}
-
-// convertUSAReport converts gtp5gnl.USAReport to report.USAReport
-func (g *Gtp5g) convertUSAReport(r gtp5gnl.USAReport) report.USAReport {
-	usar := report.USAReport{
-		URRID:       r.URRID,
-		QueryUrrRef: r.QueryUrrRef,
-		StartTime:   r.StartTime,
-		EndTime:     r.EndTime,
-	}
-	usar.USARTrigger.Flags = r.USARTrigger
-	usar.VolumMeasure = report.VolumeMeasure{
-		TotalVolume:    r.VolMeasurement.TotalVolume,
-		UplinkVolume:   r.VolMeasurement.UplinkVolume,
-		DownlinkVolume: r.VolMeasurement.DownlinkVolume,
-		TotalPktNum:    r.VolMeasurement.TotalPktNum,
-		UplinkPktNum:   r.VolMeasurement.UplinkPktNum,
-		DownlinkPktNum: r.VolMeasurement.DownlinkPktNum,
-	}
-	return usar
 }

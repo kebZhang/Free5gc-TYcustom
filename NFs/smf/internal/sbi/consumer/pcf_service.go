@@ -14,6 +14,7 @@ import (
 	"github.com/free5gc/nas/nasType"
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/pcf/SMPolicyControl"
+	"github.com/free5gc/smf/internal/accesslog" // [SMF port 1122]
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/util/flowdesc"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
@@ -41,6 +42,7 @@ func (s *npcfService) getSMPolicyControlClient(uri string) *SMPolicyControl.APIC
 	configuration := SMPolicyControl.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [SMF port 1122]
 	client = SMPolicyControl.NewAPIClient(configuration)
 
 	s.SMPolicyControlMu.RUnlock()

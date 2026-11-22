@@ -45,7 +45,7 @@ const srcNF = "PCF"
 //     building their arguments too.
 //
 // Being a constant, the disabled branches are removed by the compiler.
-const Enabled = false
+const Enabled = true // [logON 1122] was false ([OFF 1026]); set back to false to turn every log off again
 
 // recKind distinguishes which file a record belongs to.
 type recKind uint8

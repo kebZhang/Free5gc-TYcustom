@@ -171,7 +171,7 @@ func SendPfcpSessionEstablishmentRequest(
 	logger.PduSessLog.Traceln("[SMF] Send SendPfcpSessionEstablishmentRequest")
 	logger.PduSessLog.Traceln("Send to addr ", upaddr.String())
 
-	resMsg, err = udp.SendPfcpRequest(message, upaddr)
+	resMsg, err = udp.SendPfcpRequestUE(message, upaddr, ctx.Supi) // [PFCPlog 1122] SUPI goes into PFCP_log
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +254,7 @@ func SendPfcpSessionModificationRequest(
 		Port: pfcpUdp.PFCP_PORT,
 	}
 
-	resMsg, err = udp.SendPfcpRequest(message, upaddr)
+	resMsg, err = udp.SendPfcpRequestUE(message, upaddr, ctx.Supi) // [PFCPlog 1122] SUPI goes into PFCP_log
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +330,7 @@ func SendPfcpSessionDeletionRequest(
 		Port: pfcpUdp.PFCP_PORT,
 	}
 
-	resMsg, err = udp.SendPfcpRequest(message, upaddr)
+	resMsg, err = udp.SendPfcpRequestUE(message, upaddr, ctx.Supi) // [PFCPlog 1122] SUPI goes into PFCP_log
 	if err != nil {
 		return nil, err
 	}

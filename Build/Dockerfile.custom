@@ -27,14 +27,14 @@ RUN set -eux; \
     echo "Local xnet module found at /src/xnet"
 
 # ------------------------------------------------------------
-# 3. 检查七个需要使用本地 xnet 的 NF 是否配置 replace
+# 3. 检查八个需要使用本地 xnet 的 NF (smf 于 1122 加入) 是否配置 replace
 #
 # NFs/<nf>/go.mod 中必须存在：
 #
 # replace golang.org/x/net => ../../xnet
 # ------------------------------------------------------------
 RUN set -eux; \
-    for nf in amf ausf nrf nssf pcf udm udr; do \
+    for nf in amf ausf nrf nssf pcf smf udm udr; do \
       mod="/src/NFs/$nf/go.mod"; \
       echo "Checking $mod"; \
       test -f "$mod"; \
@@ -42,7 +42,7 @@ RUN set -eux; \
     done
 
 # ------------------------------------------------------------
-# 4. 对七个 NF 运行 go mod tidy
+# 4. 对八个 NF 运行 go mod tidy
 #
 # 作用：
 #   - 重新读取本地 /src/xnet/go.mod
@@ -54,7 +54,7 @@ RUN set -eux; \
 # 不会修改宿主机上的源代码文件。
 # ------------------------------------------------------------
 RUN set -eux; \
-    for nf in amf ausf nrf nssf pcf udm udr; do \
+    for nf in amf ausf nrf nssf pcf smf udm udr; do \
       echo "================================================"; \
       echo "Running go mod tidy for $nf"; \
       echo "================================================"; \
@@ -69,12 +69,20 @@ RUN set -eux; \
 #   amf: golang.org/x/net => /src/xnet
 # ------------------------------------------------------------
 RUN set -eux; \
-    for nf in amf ausf nrf nssf pcf udm udr; do \
+    for nf in amf ausf nrf nssf pcf smf udm udr; do \
       cd "/src/NFs/$nf"; \
       resolved="$(go list -m -f '{{with .Replace}}{{.Dir}}{{end}}' golang.org/x/net)"; \
       echo "$nf: golang.org/x/net => $resolved"; \
       test "$resolved" = "/src/xnet"; \
     done
+
+# [PFCPlog 1122] smf 还要解析到本地 pfcp 库副本 (/src/pfcp)，PFCP_log 的打点在里面
+RUN set -eux; \
+    cd /src/NFs/smf; \
+    grep -q '^replace github.com/free5gc/pfcp => ../../pfcp$' go.mod; \
+    resolved="$(go list -m -f '{{with .Replace}}{{.Dir}}{{end}}' github.com/free5gc/pfcp)"; \
+    echo "smf: github.com/free5gc/pfcp => $resolved"; \
+    test "$resolved" = "/src/pfcp"
 
 # ------------------------------------------------------------
 # 6. 重新生成 AMF NGAP dispatcher/handler
@@ -107,13 +115,13 @@ RUN set -eux; \
     done
 
 # ------------------------------------------------------------
-# 8. 验证七个 NF 的最终二进制中记录了本地 xnet replace
+# 8. 验证八个 NF 的最终二进制中记录了本地 xnet replace
 #
 # 仅仅检查 go list 还不够，这一步直接读取最终二进制中的
 # Go BuildInfo。
 # ------------------------------------------------------------
 RUN set -eux; \
-    for nf in amf ausf nrf nssf pcf udm udr; do \
+    for nf in amf ausf nrf nssf pcf smf udm udr; do \
       echo "================================================"; \
       echo "Checking xnet BuildInfo in $nf"; \
       echo "================================================"; \
@@ -124,6 +132,11 @@ RUN set -eux; \
         | grep -Eq '(/src/xnet|\.\./\.\./xnet)'; \
     done
 
+# [PFCPlog 1122] 同样检查 smf 二进制里 github.com/free5gc/pfcp 指向本地副本
+RUN set -eux; \
+    go version -m /out/smf | grep -A1 'github.com/free5gc/pfcp' \
+      | grep -Eq '(/src/pfcp|\.\./\.\./pfcp)'
+
 # ------------------------------------------------------------
 # 9. 显示所有编译结果
 # ------------------------------------------------------------
@@ -132,6 +145,36 @@ RUN set -eux; \
     for nf in amf ausf bsf nrf nssf pcf smf udm udr chf nef n3iwf tngf; do \
       test -s "/out/$nf"; \
     done
+
+
+# ============================================================
+# Stage 1b: 编译 UPF  [UPF in image 1122]
+#
+# NFs/upf 是 go-upf 922281ba，也就是 free5gc v3.4.3 的 UPF，和 chart 0.1.2
+# 默认镜像 free5gc/upf:v3.4.3 里那个二进制同一份源码（其 ldflags:
+# VERSION=v3.4.3 COMMIT_HASH=922281ba），要求 gtp5g 0.8.6 <= v < 0.9.0，
+# 与 Free5gc_K8s_Setup.sh 装的 v0.8.10 匹配。
+#
+# 按官方二进制的方式编：go1.21.8、CGO_ENABLED=0、同样的 ldflags（只把
+# VERSION 改成 v3.4.3-TYcustom）。这样相对官方 UPF 只多了 TYcustom 的代码
+# （PFCP_log、:6060、MemProfileRate=0），Go 版本不变。
+# 想改用和控制面相同的 Go 版本：把下面的 FROM 换成 golang:1.25-bookworm，
+# 并删掉检查 go1.21.8 的那一行。
+# ============================================================
+FROM golang:1.21.8-bookworm AS upf-builder
+
+WORKDIR /src/upf
+COPY NFs/upf/go.mod NFs/upf/go.sum ./
+RUN go mod download
+COPY NFs/upf/ ./
+
+RUN set -eux; \
+    CGO_ENABLED=0 go build \
+      -ldflags "-X github.com/free5gc/util/version.VERSION=v3.4.3-TYcustom -X github.com/free5gc/util/version.COMMIT_HASH=922281ba" \
+      -o /out/upf ./cmd; \
+    go version /out/upf | grep -q 'go1\.21\.8'; \
+    go version -m /out/upf | grep -q 'CGO_ENABLED=0'; \
+    ls -lh /out/upf
 
 
 # ============================================================
@@ -166,9 +209,20 @@ RUN apk add --no-cache \
 # 因为 xnet 已经在编译阶段链接进 NF 二进制。
 COPY --from=builder /out/ /free5gc/
 
+# [UPF in image 1122] UPF 也放进同一个镜像。chart 的 UPF 主容器在 /free5gc
+# 下跑 ./upf -c ./config/upfcfg.yaml；init 容器 tun-create 用同一个镜像跑
+# /bin/bash -c /upf-iptables.sh（只用 iptables 加 MASQUERADE / FORWARD），
+# 上面装的 bash、iptables 已覆盖。官方 UPF 镜像里另外的 gtp5g-tunnel 只是
+# 调试工具，upf 本身不调用。config/、log/ 与官方镜像的目录布局保持一致。
+COPY --from=upf-builder /out/upf /free5gc/upf
+RUN mkdir -p /free5gc/config /free5gc/log
+
+# deploy.sh 读这个 label 判断镜像里有没有 upf（没有就让 UPF 用官方镜像）
+LABEL tycustom.nfs="amf ausf bsf nrf nssf pcf smf udm udr chf nef n3iwf tngf upf"
+
 # 确认 runtime image 内所有二进制存在
 RUN set -eux; \
-    for nf in amf ausf bsf nrf nssf pcf smf udm udr chf nef n3iwf tngf; do \
+    for nf in amf ausf bsf nrf nssf pcf smf udm udr chf nef n3iwf tngf upf; do \
       test -x "/free5gc/$nf"; \
     done; \
     ls -lh /free5gc

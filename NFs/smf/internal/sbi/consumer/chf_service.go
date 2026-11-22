@@ -10,6 +10,7 @@ import (
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/chf/ConvergedCharging"
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/smf/internal/accesslog" // [SMF port 1122]
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/logger"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
@@ -37,6 +38,7 @@ func (s *nchfService) getConvergedChargingClient(uri string) *ConvergedCharging.
 	configuration := ConvergedCharging.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [SMF port 1122]
 	client = ConvergedCharging.NewAPIClient(configuration)
 
 	s.ConvergedChargingMu.RUnlock()

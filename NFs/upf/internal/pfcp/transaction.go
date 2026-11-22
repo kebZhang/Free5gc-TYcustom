@@ -9,6 +9,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/wmnsk/go-pfcp/message"
 
+	"github.com/free5gc/go-upf/internal/pfcplog" // [PFCPlog 1122]
 	logger_util "github.com/free5gc/util/logger"
 )
 
@@ -24,6 +25,9 @@ type TxTransaction struct {
 	timer          *time.Timer
 	retransCount   uint8
 	log            *logrus.Entry
+	// [PFCPlog 1122] tx stamps (UnixNano), touched only on the main loop.
+	tySendStart  int64 // send() entered, before the request is encoded
+	tyReqWritten int64 // first WriteTo of the request returned
 }
 
 type RxTransaction struct {
@@ -35,6 +39,10 @@ type RxTransaction struct {
 	msgBuf  []byte
 	timer   *time.Timer
 	log     *logrus.Entry
+	// [PFCPlog 1122] rx stamps (UnixNano), touched only on the main loop.
+	tyRspStart   int64 // send() entered: the handler has built the response
+	tyRspWritten int64 // WriteTo of the response returned
+	tyRspType    uint8
 }
 
 func NewTxTransaction(
@@ -55,6 +63,9 @@ func NewTxTransaction(
 }
 
 func (tx *TxTransaction) send(req message.Message) error {
+	if pfcplog.Enabled { // [PFCPlog 1122]
+		tx.tySendStart = pfcplog.Now()
+	}
 	tx.log.Debugf("send req")
 
 	setReqSeq(req, tx.seq)
@@ -72,6 +83,9 @@ func (tx *TxTransaction) send(req message.Message) error {
 	_, err = tx.server.conn.WriteTo(b, tx.raddr)
 	if err != nil {
 		return err
+	}
+	if pfcplog.Enabled { // [PFCPlog 1122]
+		tx.tyReqWritten = pfcplog.Now()
 	}
 
 	return nil
@@ -100,6 +114,21 @@ func (tx *TxTransaction) handleTimeout() {
 		tx.timer = tx.startTimer()
 	} else {
 		tx.log.Debugf("max retransmission reached - delete txtr")
+		if pfcplog.Enabled { // [PFCPlog 1122] tx line for a request that never got a response
+			pfcplog.Log(pfcplog.Record{
+				Role:       pfcplog.RoleTx,
+				Outcome:    pfcplog.OutcomeTimeout,
+				MsgType:    tx.req.MessageType(),
+				Attempts:   tx.retransCount + 1,
+				Seq:        tx.seq,
+				SEID:       tx.req.SEID(),
+				Local:      tx.server.conn.LocalAddr(),
+				Peer:       tx.raddr,
+				SendStart:  tx.tySendStart,
+				ReqWritten: tx.tyReqWritten,
+				Done:       pfcplog.Now(),
+			})
+		}
 		delete(tx.server.txTrans, tx.id)
 		err := tx.server.txtoDispacher(tx.req, tx.raddr)
 		if err != nil {
@@ -138,6 +167,10 @@ func NewRxTransaction(
 }
 
 func (rx *RxTransaction) send(rsp message.Message) error {
+	if pfcplog.Enabled { // [PFCPlog 1122]
+		rx.tyRspStart = pfcplog.Now()
+		rx.tyRspType = rsp.MessageType()
+	}
 	rx.log.Debugf("send rsp")
 
 	b := make([]byte, rsp.MarshalLen())
@@ -150,6 +183,9 @@ func (rx *RxTransaction) send(rsp message.Message) error {
 	_, err = rx.server.conn.WriteTo(b, rx.raddr)
 	if err != nil {
 		return err
+	}
+	if pfcplog.Enabled { // [PFCPlog 1122]
+		rx.tyRspWritten = pfcplog.Now()
 	}
 
 	return nil

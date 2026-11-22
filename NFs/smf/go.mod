@@ -24,6 +24,14 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 )
 
+// [SMF port 1122] use the local x/net fork, like the seven other instrumented NFs:
+// it carries the HTTP_log stamps and readFrameCh capacity 0 (xnet/http2/server.go).
+replace golang.org/x/net => ../../xnet
+
+// [PFCPlog 1122] local copy of github.com/free5gc/pfcp v1.1.1 with the PFCP_log
+// stamps (receive time, first write, attempts); see pfcp/ at the repo root.
+replace github.com/free5gc/pfcp => ../../pfcp
+
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bytedance/sonic v1.11.6 // indirect

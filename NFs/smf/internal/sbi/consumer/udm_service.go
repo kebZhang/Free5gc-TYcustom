@@ -11,6 +11,7 @@ import (
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/udm/SubscriberDataManagement"
 	"github.com/free5gc/openapi/udm/UEContextManagement"
+	"github.com/free5gc/smf/internal/accesslog" // [SMF port 1122]
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/logger"
 	"github.com/free5gc/smf/internal/util"
@@ -41,6 +42,7 @@ func (s *nudmService) getSubscribeDataManagementClient(uri string) *SubscriberDa
 	configuration := SubscriberDataManagement.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [SMF port 1122]
 	client = SubscriberDataManagement.NewAPIClient(configuration)
 
 	s.SubscriberDataManagementMu.RUnlock()
@@ -64,6 +66,7 @@ func (s *nudmService) getUEContextManagementClient(uri string) *UEContextManagem
 	configuration := UEContextManagement.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [SMF port 1122]
 	client = UEContextManagement.NewAPIClient(configuration)
 
 	s.UEContextManagementMu.RUnlock()

@@ -111,6 +111,11 @@ const (
 // after the opening dial -- is that overflow, not a sign the setting was
 // ignored. Which of them a request takes is then the transport's own choice
 // (the first connection that can take another stream), not round-robin.
+//
+// [logON 1122] The next build after that pair keeps this 1 and the
+// readFrameCh capacity of 0, but turns accesslog.Enabled back to true in every
+// instrumented NF (SMF included from then on), so each request carries the
+// full stamp set again.
 const connsPerPeer = 1 // [conn1 1120] was 8 (commit b247426); set back to 8 to restore
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and

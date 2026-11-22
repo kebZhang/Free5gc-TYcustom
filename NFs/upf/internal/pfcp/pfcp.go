@@ -14,6 +14,7 @@ import (
 
 	"github.com/free5gc/go-upf/internal/forwarder"
 	"github.com/free5gc/go-upf/internal/logger"
+	"github.com/free5gc/go-upf/internal/pfcplog" // [PFCPlog 1122]
 	"github.com/free5gc/go-upf/internal/report"
 	"github.com/free5gc/go-upf/pkg/factory"
 	logger_util "github.com/free5gc/util/logger"
@@ -29,6 +30,7 @@ const (
 type ReceivePacket struct {
 	RemoteAddr net.Addr
 	Buf        []byte
+	RecvTime   int64 // [PFCPlog 1122] UnixNano when ReadFrom returned; 0 if pfcplog is off
 }
 
 type TransType int
@@ -117,23 +119,19 @@ func (s *PfcpServer) main(wg *sync.WaitGroup) {
 			s.log.Tracef("receive SessReport from srCh")
 			s.ServeReport(&sr)
 		case rcvPkt := <-s.rcvCh:
+			var deqTime int64 // [PFCPlog 1122] req_deq / rsp_deq: this loop took the packet off rcvCh
+			if pfcplog.Enabled {
+				deqTime = pfcplog.Now()
+			}
 			s.log.Tracef("receive buf(len=%d) from rcvCh", len(rcvPkt.Buf))
 			if len(rcvPkt.Buf) == 0 {
 				// receiver closed
 				return
 			}
-
 			msg, err := message.Parse(rcvPkt.Buf)
 			if err != nil {
 				s.log.Errorln(err)
 				s.log.Tracef("ignored undecodable message:\n%+v", hex.Dump(rcvPkt.Buf))
-				continue
-			}
-
-			// This prevents malformed packets with inconsistent length fields
-			if err = validatePfcpPacketLength(rcvPkt.Buf); err != nil {
-				s.log.Warnf("Invalid PFCP packet from %s: %v", rcvPkt.RemoteAddr, err)
-				s.log.Tracef("Rejected packet:\n%+v", hex.Dump(rcvPkt.Buf))
 				continue
 			}
 
@@ -145,7 +143,11 @@ func (s *PfcpServer) main(wg *sync.WaitGroup) {
 					rx = NewRxTransaction(s, rcvPkt.RemoteAddr, msg.Sequence())
 					s.rxTrans[trID] = rx
 				}
+				hadRsp := pfcplog.Enabled && ok && len(rx.msgBuf) != 0 // [PFCPlog 1122] read before recv() resends it
 				needDispatch, err1 := rx.recv(msg, ok)
+				if pfcplog.Enabled && ok { // [PFCPlog 1122] retransmitted request
+					s.logRxDup(msg, &rcvPkt, deqTime, hadRsp, err1)
+				}
 				if err1 != nil {
 					s.log.Warnf("rcvCh: %v", err1)
 					continue
@@ -154,6 +156,9 @@ func (s *PfcpServer) main(wg *sync.WaitGroup) {
 					continue
 				}
 				err = s.reqDispacher(msg, rcvPkt.RemoteAddr)
+				if pfcplog.Enabled { // [PFCPlog 1122]
+					s.logRx(msg, &rcvPkt, deqTime, rx, err)
+				}
 				if err != nil {
 					s.log.Errorln(err)
 					s.log.Tracef("ignored undecodable message:\n%+v", hex.Dump(rcvPkt.Buf))
@@ -167,6 +172,9 @@ func (s *PfcpServer) main(wg *sync.WaitGroup) {
 				}
 				req := tx.recv(msg)
 				err = s.rspDispacher(msg, rcvPkt.RemoteAddr, req)
+				if pfcplog.Enabled { // [PFCPlog 1122]
+					s.logTx(tx, msg, &rcvPkt, deqTime, err)
+				}
 				if err != nil {
 					s.log.Errorln(err)
 					s.log.Tracef("ignored undecodable message:\n%+v", hex.Dump(rcvPkt.Buf))
@@ -208,6 +216,10 @@ func (s *PfcpServer) receiver(wg *sync.WaitGroup) {
 	for {
 		s.log.Tracef("receiver starts to read...")
 		n, addr, err := s.conn.ReadFrom(buf)
+		var recvTime int64 // [PFCPlog 1122] req_recv / rsp_recv
+		if pfcplog.Enabled {
+			recvTime = pfcplog.Now()
+		}
 		if err != nil {
 			s.log.Errorf("%+v", err)
 			s.rcvCh <- ReceivePacket{}
@@ -220,6 +232,7 @@ func (s *PfcpServer) receiver(wg *sync.WaitGroup) {
 		s.rcvCh <- ReceivePacket{
 			RemoteAddr: addr,
 			Buf:        msgBuf,
+			RecvTime:   recvTime, // [PFCPlog 1122]
 		}
 	}
 }
@@ -406,26 +419,4 @@ func setReqSeq(msgtmp message.Message, seq uint32) {
 		msg.SetSequenceNumber(seq)
 	default:
 	}
-}
-
-func validatePfcpPacketLength(buf []byte) error {
-	// Minimum PFCP message: 8 bytes (header without SEID)
-	if len(buf) < 8 {
-		return fmt.Errorf("packet too short: %d bytes (minimum 8 bytes required)", len(buf))
-	}
-
-	// Read Message Length field (bytes 2-3, big-endian)
-	declaredLen := uint16(buf[2])<<8 | uint16(buf[3])
-
-	// Total = 4 bytes (fixed header) + declared message length
-	expectedTotalLen := int(declaredLen) + 4
-
-	// Check if declared length matches actual received length
-	actualLen := len(buf)
-	if actualLen != expectedTotalLen {
-		return fmt.Errorf("message length mismatch: header declares %d bytes total, but received %d bytes",
-			expectedTotalLen, actualLen)
-	}
-
-	return nil
 }

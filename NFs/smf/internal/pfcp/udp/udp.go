@@ -5,12 +5,14 @@ import (
 	"net"
 	"runtime/debug"
 	"strings"
+	"sync" // [PFCPlog 1122]
 	"time"
 
 	"github.com/free5gc/pfcp"
 	"github.com/free5gc/pfcp/pfcpUdp"
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/logger"
+	"github.com/free5gc/smf/internal/pfcplog" // [PFCPlog 1122]
 )
 
 const MaxPfcpUdpDataSize = 1024
@@ -31,6 +33,7 @@ func Run(dispatch func(*pfcpUdp.Message)) {
 
 	serverIP := smfContext.ListenIP().To4()
 	Server = pfcpUdp.NewPfcpServer(serverIP.String())
+	Server.StampRecv = pfcplog.Enabled // [PFCPlog 1122] receive stamp in the local pfcp library
 
 	err := Server.Listen()
 	if err != nil {
@@ -68,7 +71,11 @@ func Run(dispatch func(*pfcpUdp.Message)) {
 			}
 
 			if msg.PfcpMessage.IsRequest() {
-				go dispatch(msg)
+				if pfcplog.Enabled { // [PFCPlog 1122]
+					go dispatchLogged(dispatch, msg)
+				} else {
+					go dispatch(msg)
+				}
 			}
 		}
 	}(Server)
@@ -79,14 +86,122 @@ func Run(dispatch func(*pfcpUdp.Message)) {
 }
 
 func SendPfcpResponse(sndMsg *pfcp.Message, addr *net.UDPAddr) {
-	Server.WriteResponseTo(sndMsg, addr)
+	if !pfcplog.Enabled { // [PFCPlog 1122]
+		Server.WriteResponseTo(sndMsg, addr)
+		return
+	}
+	// [PFCPlog 1122] rx line: pick up what dispatchLogged recorded for the
+	// request this answers (same peer, same seq), add the response stamps, and
+	// log once the response has been written.
+	rspStart := pfcplog.Now()
+	h := sndMsg.Header
+	var rec pfcplog.Record
+	if v, ok := pendingRx.LoadAndDelete(pendingKey{peer: addr.String(), seq: h.SequenceNumber}); ok {
+		rec = v.(pfcplog.Record)
+	} else {
+		// No dispatch record (should not happen): a PFCP response type is its
+		// request type + 1 (29.244 Table 7.3-1).
+		rec = pfcplog.Record{
+			Role: pfcplog.RoleRx, MsgType: uint8(h.MessageType) - 1, Seq: h.SequenceNumber,
+			Local: Server.Conn.LocalAddr(), Peer: addr,
+		}
+	}
+	rec.RspStart = rspStart
+	rec.RspType = uint8(h.MessageType)
+	Server.WriteResponseToTraced(sndMsg, addr, func(written time.Time) {
+		rec.RspWritten = pfcplog.Stamp(written)
+		pfcplog.Log(rec)
+	})
 }
 
 func SendPfcpRequest(sndMsg *pfcp.Message, addr *net.UDPAddr) (rsvMsg *pfcpUdp.Message, err error) {
+	return SendPfcpRequestUE(sndMsg, addr, "") // [PFCPlog 1122] body moved
+}
+
+// SendPfcpRequestUE [PFCPlog 1122] is SendPfcpRequest that also names the UE the
+// request is for (SUPI, or "" for node-level messages such as heartbeat and
+// association), for the tx line in PFCP_log. With pfcplog off it is exactly the
+// old SendPfcpRequest.
+func SendPfcpRequestUE(sndMsg *pfcp.Message, addr *net.UDPAddr, ueID string) (*pfcpUdp.Message, error) {
 	if addr.IP.Equal(net.IPv4zero) {
 		return nil, errors.New("no destination IP address is specified")
 	}
-	return Server.WriteRequestTo(sndMsg, addr)
+	if !pfcplog.Enabled {
+		return Server.WriteRequestTo(sndMsg, addr)
+	}
+
+	// send_start is taken before the library encodes the request; req_written
+	// after its first WriteToUDP; rsp_recv when the library's read loop got the
+	// response off the socket; done when it is back here. rsp_recv -> done
+	// includes the read loop handing the response over an unbuffered channel
+	// to this goroutine and this goroutine being scheduled.
+	sendStart := pfcplog.Now()
+	rsvMsg, tr, err := Server.WriteRequestToTraced(sndMsg, addr)
+	done := pfcplog.Now()
+
+	h := sndMsg.Header
+	rec := pfcplog.Record{
+		Role:       pfcplog.RoleTx,
+		MsgType:    uint8(h.MessageType),
+		Seq:        h.SequenceNumber,
+		SEID:       h.SEID,
+		Local:      Server.Conn.LocalAddr(),
+		Peer:       addr,
+		UEID:       ueID,
+		SendStart:  sendStart,
+		ReqWritten: pfcplog.Stamp(tr.FirstWrite),
+		RspRecv:    pfcplog.Stamp(tr.RspRecv),
+		Done:       done,
+		Attempts:   uint8(tr.Attempts),
+	}
+	switch {
+	case err == nil:
+		if rsvMsg != nil && rsvMsg.PfcpMessage != nil {
+			rec.RspType = uint8(rsvMsg.PfcpMessage.Header.MessageType)
+		}
+	case tr.Attempts >= pfcp.NumOfResend && tr.RspRecv.IsZero():
+		rec.Outcome = pfcplog.OutcomeTimeout
+	default:
+		rec.Outcome = pfcplog.OutcomeError
+	}
+	pfcplog.Log(rec)
+	return rsvMsg, err
+}
+
+// [PFCPlog 1122] Requests this SMF receives (in practice only Session Report
+// Requests from the UPF) are dispatched on their own goroutine, and the handler
+// answers through SendPfcpResponse. pendingRx carries the request's stamps from
+// one to the other, keyed by (peer, seq) -- the handlers always answer to
+// msg.RemoteAddr with the request's sequence number.
+type pendingKey struct {
+	peer string
+	seq  uint32
+}
+
+var pendingRx sync.Map // pendingKey -> pfcplog.Record
+
+func dispatchLogged(dispatch func(*pfcpUdp.Message), msg *pfcpUdp.Message) {
+	deq := pfcplog.Now() // req_deq: this dispatch goroutine is running
+	h := msg.PfcpMessage.Header
+	key := pendingKey{peer: msg.RemoteAddr.String(), seq: h.SequenceNumber}
+	pendingRx.Store(key, pfcplog.Record{
+		Role:    pfcplog.RoleRx,
+		MsgType: uint8(h.MessageType),
+		Seq:     h.SequenceNumber,
+		SEID:    h.SEID,
+		Local:   Server.Conn.LocalAddr(),
+		Peer:    msg.RemoteAddr,
+		ReqRecv: pfcplog.Stamp(msg.RecvTime),
+		ReqDeq:  deq,
+	})
+	dispatch(msg)
+	// Still pending means the handler returned without answering.
+	if v, ok := pendingRx.LoadAndDelete(key); ok {
+		rec := v.(pfcplog.Record)
+		rec.Done = pfcplog.Now()
+		rec.Outcome = pfcplog.OutcomeNoRsp
+		pfcplog.Log(rec)
+	}
 }
 
 func ClosePfcp() error {

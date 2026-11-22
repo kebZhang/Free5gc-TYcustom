@@ -7,6 +7,7 @@ import (
 
 	"github.com/free5gc/openapi/amf/Communication"
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/smf/internal/accesslog" // [SMF port 1122]
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
 )
 
@@ -32,6 +33,7 @@ func (s *namfService) getCommunicationClient(uri string) *Communication.APIClien
 	configuration := Communication.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [SMF port 1122]
 	client = Communication.NewAPIClient(configuration)
 
 	s.CommunicationMu.RUnlock()

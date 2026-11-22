@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/smf/internal/accesslog" // [SMF port 1122]
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/logger"
 	"github.com/free5gc/smf/internal/sbi/consumer"
@@ -74,6 +75,12 @@ func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 
 	router.Use(metrics.InboundMetrics())
+	// [SMF port 1122] Same position as in the other instrumented NFs: right
+	// after InboundMetrics, before any group, so every incoming request --
+	// callbacks included -- gets one server-view line in HTTP_log.
+	if accesslog.Enabled {
+		router.Use(accesslog.InboundLogger())
+	}
 	smfCallbackGroup := router.Group(factory.SmfCallbackUriPrefix)
 	smPolicyCallbackAuthCheck := util_oauth.NewRouterAuthorizationCheck(models.ServiceName_NPCF_SMPOLICYCONTROL)
 	smfCallbackGroup.Use(func(c *gin.Context) {
@@ -226,6 +233,12 @@ func newHttp2ServerWithIdleTimeout(
 
 	h2Server := &http2.Server{
 		IdleTimeout: idleTimeoutPeriod,
+		// TYcustom [SMF port 1122]: without this sink the fork has no consumer
+		// for response-header-flushed events and the run yields zero of them.
+		// h2c.NewHandler below wraps this very *http2.Server, so setting it here
+		// is what makes it take effect. Nil (accesslog.Enabled false) switches
+		// the fork's server-side stamps off.
+		ResponseHeadersFlushed: accesslog.WEventSink(),
 	}
 	server := &http.Server{
 		Addr:    bindAddr,

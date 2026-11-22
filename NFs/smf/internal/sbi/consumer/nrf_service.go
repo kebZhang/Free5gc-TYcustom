@@ -14,6 +14,7 @@ import (
 	"github.com/free5gc/openapi/nrf/NFDiscovery"
 	"github.com/free5gc/openapi/nrf/NFManagement"
 	"github.com/free5gc/openapi/udm/SubscriberDataManagement"
+	"github.com/free5gc/smf/internal/accesslog" // [SMF port 1122]
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/disccache"
 	"github.com/free5gc/smf/internal/logger"
@@ -44,6 +45,7 @@ func (s *nnrfService) getNFManagementClient(uri string) *NFManagement.APIClient 
 	configuration := NFManagement.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [SMF port 1122]
 	client = NFManagement.NewAPIClient(configuration)
 
 	s.NFManagementgMu.RUnlock()
@@ -67,6 +69,7 @@ func (s *nnrfService) getNFDiscoveryClient(uri string) *NFDiscovery.APIClient {
 	configuration := NFDiscovery.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [SMF port 1122]
 	client = NFDiscovery.NewAPIClient(configuration)
 
 	s.NFDiscoveryMu.RUnlock()

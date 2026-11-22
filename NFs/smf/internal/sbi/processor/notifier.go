@@ -10,6 +10,7 @@ import (
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/smf/EventExposure"
+	"github.com/free5gc/smf/internal/accesslog" // [SMF port 1122]
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/logger"
 	"github.com/free5gc/util/metrics/sbi"
@@ -129,6 +130,7 @@ func SendUpPathChgEventExposureNotification(
 	uri string, notification *models.NsmfEventExposureNotification,
 ) {
 	configuration := EventExposure.NewConfiguration()
+	configuration.SetHTTPClient(accesslog.Client()) // [SMF port 1122]
 	client := EventExposure.NewAPIClient(configuration)
 	request := &EventExposure.CreateIndividualSubcriptionMyNotificationPostRequest{
 		NsmfEventExposureNotification: notification,
