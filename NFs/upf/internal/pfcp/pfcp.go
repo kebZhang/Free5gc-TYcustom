@@ -21,7 +21,14 @@ import (
 )
 
 const (
-	RECEIVE_CHANNEL_LEN       = 512
+	// [rcvCh8192 1123] was 512 (upstream go-upf); set back to 512 to restore.
+	// receiver() blocks on a full rcvCh and stops reading the PFCP socket, so the
+	// kernel receive buffer (net.core.rmem_default, 212992 B ~= 166 datagrams on
+	// node-0) fills and drops requests; the SMF then resends after 3 s. Seen
+	// 2026-11-22 at 1000 UE / pduTr 1 ms: 358 drops (= RcvbufErrors) per run.
+	// 8192 holds every PFCP request of a 1000-UE run, so receiver() keeps draining
+	// the socket; the backlog now waits in this channel instead of being dropped.
+	RECEIVE_CHANNEL_LEN       = 8192
 	REPORT_CHANNEL_LEN        = 128
 	TRANS_TIMEOUT_CHANNEL_LEN = 64
 	MAX_PFCP_MSG_LEN          = 65536
