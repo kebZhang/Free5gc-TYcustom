@@ -8,6 +8,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/free5gc/chf/internal/accesslog" // [CHF port 1124]
 	chf_context "github.com/free5gc/chf/internal/context"
 	"github.com/free5gc/chf/internal/disccache"
 	"github.com/free5gc/chf/internal/logger"
@@ -42,6 +43,7 @@ func (s *nnrfService) getNFManagementClient(uri string) *Nnrf_NFManagement.APICl
 	configuration := Nnrf_NFManagement.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [CHF port 1124]
 	client = Nnrf_NFManagement.NewAPIClient(configuration)
 
 	s.nfMngmntMu.RUnlock()
@@ -65,6 +67,7 @@ func (s *nnrfService) getNFDiscClient(uri string) *Nnrf_NFDiscovery.APIClient {
 	configuration := Nnrf_NFDiscovery.NewConfiguration()
 	configuration.SetBasePath(uri)
 	configuration.SetMetrics(sbi_metrics.SbiMetricHook)
+	configuration.SetHTTPClient(accesslog.Client()) // [CHF port 1124]
 	client = Nnrf_NFDiscovery.NewAPIClient(configuration)
 
 	s.nfDiscMu.RUnlock()

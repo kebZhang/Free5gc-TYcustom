@@ -25,6 +25,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
+	"github.com/free5gc/chf/internal/accesslog" // [profON 1124] for RegisterSchedStat, see main()
 	"github.com/free5gc/chf/internal/logger"
 	"github.com/free5gc/chf/pkg/factory"
 	"github.com/free5gc/chf/pkg/service"
@@ -35,10 +36,14 @@ import (
 var CHF *service.ChfApp
 
 func main() {
-	// TYcustom: no profiling or sampling. The heap-allocation profiler is the
-	// one profiler the Go runtime runs by default (MemProfileRate = 512 KiB), so
-	// switch it off too, as early as possible per the runtime docs.
-	runtime.MemProfileRate = 0
+	// TYcustom: heap-allocation sampling.
+	// [profON 1124] Back on (was [OFF 1026]), same as the 8 NFs turned on in
+	// [profON 1122]: the line below is commented out, so the runtime keeps its
+	// default MemProfileRate (one sample per 512 KiB allocated) and
+	// /debug/pprof/allocs and heap have samples again. Runs with and without it
+	// are not directly comparable: it changes the GC count. To turn it off
+	// again, uncomment the line; keep it first in main, as the runtime docs ask.
+	// runtime.MemProfileRate = 0
 
 	defer func() {
 		if p := recover(); p != nil {
@@ -47,12 +52,23 @@ func main() {
 		}
 	}()
 
+	// --- Lock-contention + scheduler profiling (TYcustom) ---
+	// [profON 1124] Added, same three lines as amf/ausf/pcf/udm/udr/smf/nssf,
+	// so that trace_cpu_sche_block_mutex_allNF_gctrace_allocM.sh collects block,
+	// mutex and schedstat from this NF. block/mutex are cumulative since process
+	// start; only the PRE/AFTER difference is meaningful. To turn it off again:
+	// comment out the three code lines below and the accesslog import marked
+	// [profON 1124], and uncomment runtime.MemProfileRate = 0 at the top of main.
+	runtime.SetMutexProfileFraction(5) // sample ~1/5 of mutex contention events
+	runtime.SetBlockProfileRate(10000) // sample a blocking event ~every 10us blocked
+	accesslog.RegisterSchedStat()      // must precede the ListenAndServe below
+
 	// --- pprof on :6060 (TYcustom, noGC experiment) ---
-	// [ON 1120] Turned back on (was [OFF 1026]). runtime.MemProfileRate = 0
-	// stays at the top of main: serving the endpoints turns on no sampling; the
-	// heap profile is then empty, but the runtime.MemStats it ends with (what
-	// force_gc_allNF.sh reads) is still there. To turn it off again: comment
-	// out the block below and the two imports marked [ON 1120].
+	// [ON 1120] Turned back on (was [OFF 1026]). Serving the endpoints turns on
+	// no sampling by itself; the sampling is the mutex/block rates above and
+	// MemProfileRate at the top of main, all on since [profON 1124]. To turn
+	// the listener off again: comment out the block below and the two imports
+	// marked [ON 1120].
 	//
 	// Same listener as amf/ausf/pcf/udm/udr. GoRuntime_NoGC_Readme.md runs every
 	// NF with GOGC=off and collects it by hand between runs through

@@ -27,14 +27,14 @@ RUN set -eux; \
     echo "Local xnet module found at /src/xnet"
 
 # ------------------------------------------------------------
-# 3. 检查八个需要使用本地 xnet 的 NF (smf 于 1122 加入) 是否配置 replace
+# 3. 检查九个需要使用本地 xnet 的 NF (smf 于 1122 加入, chf 于 1124 加入) 是否配置 replace
 #
 # NFs/<nf>/go.mod 中必须存在：
 #
 # replace golang.org/x/net => ../../xnet
 # ------------------------------------------------------------
 RUN set -eux; \
-    for nf in amf ausf nrf nssf pcf smf udm udr; do \
+    for nf in amf ausf nrf nssf pcf smf udm udr chf; do \
       mod="/src/NFs/$nf/go.mod"; \
       echo "Checking $mod"; \
       test -f "$mod"; \
@@ -42,7 +42,7 @@ RUN set -eux; \
     done
 
 # ------------------------------------------------------------
-# 4. 对八个 NF 运行 go mod tidy
+# 4. 对九个 NF 运行 go mod tidy
 #
 # 作用：
 #   - 重新读取本地 /src/xnet/go.mod
@@ -54,7 +54,7 @@ RUN set -eux; \
 # 不会修改宿主机上的源代码文件。
 # ------------------------------------------------------------
 RUN set -eux; \
-    for nf in amf ausf nrf nssf pcf smf udm udr; do \
+    for nf in amf ausf nrf nssf pcf smf udm udr chf; do \
       echo "================================================"; \
       echo "Running go mod tidy for $nf"; \
       echo "================================================"; \
@@ -69,7 +69,7 @@ RUN set -eux; \
 #   amf: golang.org/x/net => /src/xnet
 # ------------------------------------------------------------
 RUN set -eux; \
-    for nf in amf ausf nrf nssf pcf smf udm udr; do \
+    for nf in amf ausf nrf nssf pcf smf udm udr chf; do \
       cd "/src/NFs/$nf"; \
       resolved="$(go list -m -f '{{with .Replace}}{{.Dir}}{{end}}' golang.org/x/net)"; \
       echo "$nf: golang.org/x/net => $resolved"; \
@@ -115,13 +115,13 @@ RUN set -eux; \
     done
 
 # ------------------------------------------------------------
-# 8. 验证八个 NF 的最终二进制中记录了本地 xnet replace
+# 8. 验证九个 NF 的最终二进制中记录了本地 xnet replace
 #
 # 仅仅检查 go list 还不够，这一步直接读取最终二进制中的
 # Go BuildInfo。
 # ------------------------------------------------------------
 RUN set -eux; \
-    for nf in amf ausf nrf nssf pcf smf udm udr; do \
+    for nf in amf ausf nrf nssf pcf smf udm udr chf; do \
       echo "================================================"; \
       echo "Checking xnet BuildInfo in $nf"; \
       echo "================================================"; \

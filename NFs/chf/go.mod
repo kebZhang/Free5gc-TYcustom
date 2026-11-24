@@ -21,6 +21,10 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 )
 
+// [CHF port 1124] use the local x/net fork, like the other instrumented NFs:
+// it carries the HTTP_log stamps and readFrameCh capacity 0 (xnet/http2/server.go).
+replace golang.org/x/net => ../../xnet
+
 require (
 	github.com/h2non/gock v1.2.0
 	github.com/pkg/errors v0.9.1

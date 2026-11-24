@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 
+	"github.com/free5gc/chf/internal/accesslog" // [CHF port 1124]
 	"github.com/free5gc/chf/internal/logger"
 	"github.com/free5gc/chf/internal/sbi/consumer"
 	"github.com/free5gc/chf/internal/sbi/processor"
@@ -67,6 +68,12 @@ func NewServer(chf ServerChf, tlsKeyLogPath string) (*Server, error) {
 func newRouter(s *Server) *gin.Engine {
 	router := logger_util.NewGinWithLogrus(logger.GinLog)
 	router.Use(metrics.InboundMetrics())
+	// [CHF port 1124] Same position as in the other instrumented NFs: right
+	// after InboundMetrics, before any group, so every incoming request gets
+	// one server-view line in HTTP_log.
+	if accesslog.Enabled {
+		router.Use(accesslog.InboundLogger())
+	}
 
 	for _, serviceName := range s.Config().Configuration.ServiceNameList {
 		switch models.ServiceName(serviceName) {
@@ -206,6 +213,12 @@ func newHttp2ServerWithIdleTimeout(
 
 	h2Server := &http2.Server{
 		IdleTimeout: idleTimeoutPeriod,
+		// TYcustom [CHF port 1124]: without this sink the fork has no consumer
+		// for response-header-flushed events and the run yields zero of them.
+		// h2c.NewHandler below wraps this very *http2.Server, so setting it here
+		// is what makes it take effect. Nil (accesslog.Enabled false) switches
+		// the fork's server-side stamps off.
+		ResponseHeadersFlushed: accesslog.WEventSink(),
 	}
 	server := &http.Server{
 		Addr:    bindAddr,
