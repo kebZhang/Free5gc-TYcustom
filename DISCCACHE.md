@@ -63,6 +63,15 @@ Cache is applied at each NF's primary discovery entry point
 - **SMF, CHF, NEF, UDR** — their primary discovery entry point only. SMF/NEF have
   additional helpers that call `client.NFInstancesStoreApi.SearchNFInstances`
   directly (PDU-session / non-registration paths); those are **not** cached.
+- **SMF PDU-session path (added 2026-11-24, `[TYcustom 1124 SMF disccache]`)** —
+  the 5 per-session lookups (UDM, serving AMF, BSF, PCF, CHF) plus the
+  BSF-bound PCF-by-id lookup now go through `SendSearchNFInstances`. SMF's key
+  additionally includes `target-nf-instance-id` and `preferred-locality`. SMF
+  does NOT cache an empty result (target not registered yet / just
+  deregistered), so it behaves as before the cache in that window; the only
+  exception is BSF (not deployed), whose empty result is cached. Still uncached and off
+  the PDU path: `NFDiscoveryPCF` / `SendNFDiscoveryPCF` and the generic
+  `nnrfService.SearchNFInstances` helper.
 
 NSSF, BSF, and the NRF's own consumer issue no `nnrf-disc` on these paths and are
 unchanged.

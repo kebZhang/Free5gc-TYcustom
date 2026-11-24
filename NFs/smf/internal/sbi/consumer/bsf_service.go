@@ -33,10 +33,11 @@ func (s *nbsfService) getHTTPClient() *http.Client {
 // BSFSelection discovers and selects BSF for PCF binding operations
 func (s *nbsfService) BSFSelection() (string, error) {
 	// Discover BSF via NRF
-	ctx, _, err := s.consumer.Context().GetTokenCtx(models.ServiceName_NNRF_DISC, models.NrfNfManagementNfType_NRF)
-	if err != nil {
-		return "", fmt.Errorf("failed to get token context: %w", err)
-	}
+	// [TYcustom 1124 SMF disccache] token ctx is now obtained inside SendSearchNFInstances.
+	// ctx, _, err := s.consumer.Context().GetTokenCtx(models.ServiceName_NNRF_DISC, models.NrfNfManagementNfType_NRF)
+	// if err != nil {
+	// 	return "", fmt.Errorf("failed to get token context: %w", err)
+	// }
 
 	targetNfType := models.NrfNfManagementNfType_BSF
 	requesterNfType := models.NrfNfManagementNfType_SMF
@@ -45,18 +46,23 @@ func (s *nbsfService) BSFSelection() (string, error) {
 		RequesterNfType: &requesterNfType,
 	}
 
-	client := s.consumer.nnrfService.getNFDiscoveryClient(s.consumer.Context().NrfUri)
-	res, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// [TYcustom 1124 SMF disccache] was an uncached direct NRF query per session:
+	// client := s.consumer.nnrfService.getNFDiscoveryClient(s.consumer.Context().NrfUri)
+	// res, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// NOTE: NRF answers "no BSF registered" with 200 + empty list, which is
+	// cached too, so a BSF deployed later is seen only after disccache.TTL.
+	res, err := s.consumer.nnrfService.SendSearchNFInstances(
+		s.consumer.Context().NrfUri, targetNfType, requesterNfType, request)
 	if err != nil {
 		return "", fmt.Errorf("BSF discovery failed: %w", err)
 	}
 
-	if res == nil || len(res.SearchResult.NfInstances) == 0 {
+	if res == nil || len(res.NfInstances) == 0 {
 		return "", fmt.Errorf("no BSF instances found")
 	}
 
 	// Select first BSF instance and find management service URI
-	bsfProfile := res.SearchResult.NfInstances[0]
+	bsfProfile := res.NfInstances[0]
 	for _, service := range bsfProfile.NfServices {
 		if service.ServiceName == models.ServiceName_NBSF_MANAGEMENT &&
 			service.NfServiceStatus == models.NfServiceStatus_REGISTERED {
@@ -161,11 +167,12 @@ func (s *nbsfService) PCFSelectionWithBSF(smContext *smf_context.SMContext) erro
 		logger.ConsumerLog.Infof("Using existing PCF from BSF binding: %s", pcfBinding.PcfId)
 
 		// Discover the specific PCF instance from NRF
-		ctx, _, tokenErr := s.consumer.Context().GetTokenCtx(models.ServiceName_NNRF_DISC, models.NrfNfManagementNfType_NRF)
-		if tokenErr != nil {
-			logger.ConsumerLog.Warnf("Failed to get token context for PCF discovery: %v", tokenErr)
-			return s.consumer.nnrfService.PCFSelection(smContext)
-		}
+		// [TYcustom 1124 SMF disccache] token ctx is now obtained inside SendSearchNFInstances.
+		// ctx, _, tokenErr := s.consumer.Context().GetTokenCtx(models.ServiceName_NNRF_DISC, models.NrfNfManagementNfType_NRF)
+		// if tokenErr != nil {
+		// 	logger.ConsumerLog.Warnf("Failed to get token context for PCF discovery: %v", tokenErr)
+		// 	return s.consumer.nnrfService.PCFSelection(smContext)
+		// }
 
 		targetNfType := models.NrfNfManagementNfType_PCF
 		requesterNfType := models.NrfNfManagementNfType_SMF
@@ -175,16 +182,20 @@ func (s *nbsfService) PCFSelectionWithBSF(smContext *smf_context.SMContext) erro
 			TargetNfInstanceId: &pcfBinding.PcfId,
 		}
 
-		client := s.consumer.nnrfService.getNFDiscoveryClient(s.consumer.Context().NrfUri)
-		res, searchErr := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
-		if searchErr != nil || res == nil || len(res.SearchResult.NfInstances) == 0 {
+		// [TYcustom 1124 SMF disccache] was an uncached direct NRF query:
+		// client := s.consumer.nnrfService.getNFDiscoveryClient(s.consumer.Context().NrfUri)
+		// res, searchErr := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+		// Key includes target-nf-instance-id (see SendSearchNFInstances).
+		res, searchErr := s.consumer.nnrfService.SendSearchNFInstances(
+			s.consumer.Context().NrfUri, targetNfType, requesterNfType, request)
+		if searchErr != nil || res == nil || len(res.NfInstances) == 0 {
 			logger.ConsumerLog.Warnf("Failed to discover PCF %s from NRF, falling back to general PCF selection: %v",
 				pcfBinding.PcfId, searchErr)
 			return s.consumer.nnrfService.PCFSelection(smContext)
 		}
 
 		// Use the discovered PCF
-		smContext.SelectedPCFProfile = res.SearchResult.NfInstances[0]
+		smContext.SelectedPCFProfile = res.NfInstances[0]
 		logger.ConsumerLog.Infof("Successfully discovered PCF %s for existing BSF binding", pcfBinding.PcfId)
 		return nil
 	}

@@ -194,6 +194,16 @@ func (s *nnrfService) SendSearchNFInstances(
 	// Discovery cache: on a hit, return the cached result without contacting the
 	// NRF (no nnrf-disc, no NRF->Mongo read).
 	cacheKey := disccache.Key(targetNfType, requestNfType, param.ServiceNames)
+	// [TYcustom 1124 SMF disccache] Unlike the other NFs, some SMF lookups select
+	// a specific instance (serving AMF / BSF-bound PCF by target-nf-instance-id)
+	// or carry preferred-locality, so those fields are part of the key: a
+	// restarted AMF gets a new NfInstanceId and therefore a fresh entry.
+	if param.TargetNfInstanceId != nil {
+		cacheKey += "|id=" + *param.TargetNfInstanceId
+	}
+	if param.PreferredLocality != nil {
+		cacheKey += "|loc=" + *param.PreferredLocality
+	}
 	if cached, ok := disccache.Get(cacheKey); ok {
 		return cached, nil
 	}
@@ -217,7 +227,14 @@ func (s *nnrfService) SendSearchNFInstances(
 		return nil, err
 	}
 	result := res.SearchResult
-	disccache.Put(cacheKey, &result)
+	// [TYcustom 1124 SMF disccache] Do not cache an empty answer (target not yet
+	// registered / just deregistered), otherwise SMF would see "no UDM/PCF/CHF"
+	// for a whole TTL. BSF is the exception: it is not deployed, and caching its
+	// empty answer keeps the per-session BSF lookup off the NRF.
+	// disccache.Put(cacheKey, &result)
+	if len(result.NfInstances) > 0 || targetNfType == models.NrfNfManagementNfType_BSF {
+		disccache.Put(cacheKey, &result)
+	}
 	return &result, err
 }
 
@@ -233,11 +250,15 @@ func (s *nnrfService) NFDiscoveryUDM(ctx context.Context) (
 
 	smfContext := s.consumer.Context()
 
-	client := s.getNFDiscoveryClient(smfContext.NrfUri)
-	// Check data
-	res, localErr := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// [TYcustom 1124 SMF disccache] was an uncached direct NRF query per session:
+	// client := s.getNFDiscoveryClient(smfContext.NrfUri)
+	// res, localErr := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// if res != nil {
+	// 	result = res.SearchResult
+	// }
+	res, localErr := s.SendSearchNFInstances(smfContext.NrfUri, targetNfType, requesterNfType, request)
 	if res != nil {
-		result = res.SearchResult
+		result = *res
 	}
 	return result, localErr
 }
@@ -276,11 +297,16 @@ func (s *nnrfService) NFDiscoveryAMF(smContext *smf_context.SMContext, ctx conte
 
 	smfContext := s.consumer.Context()
 
-	client := s.getNFDiscoveryClient(smfContext.NrfUri)
-	// Check data
-	res, localErr := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// [TYcustom 1124 SMF disccache] was an uncached direct NRF query per session:
+	// client := s.getNFDiscoveryClient(smfContext.NrfUri)
+	// res, localErr := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// if res != nil {
+	// 	result = res.SearchResult
+	// }
+	// Key includes target-nf-instance-id (see SendSearchNFInstances).
+	res, localErr := s.SendSearchNFInstances(smfContext.NrfUri, targetNfType, requesterNfType, request)
 	if res != nil {
-		result = res.SearchResult
+		result = *res
 	}
 	return result, localErr
 }
@@ -403,22 +429,28 @@ func (s *nnrfService) CHFSelection(smContext *smf_context.SMContext) error {
 		// Supi:            &smContext.Supi,
 	}
 
-	ctx, _, err := s.consumer.Context().GetTokenCtx(models.ServiceName_NNRF_DISC, models.NrfNfManagementNfType_NRF)
+	// [TYcustom 1124 SMF disccache] was an uncached direct NRF query per session
+	// (SendSearchNFInstances gets the token ctx and logs the error itself):
+	// ctx, _, err := s.consumer.Context().GetTokenCtx(models.ServiceName_NNRF_DISC, models.NrfNfManagementNfType_NRF)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// client := s.getNFDiscoveryClient(s.consumer.Context().NrfUri)
+	// // Check data
+	// res, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// if err != nil {
+	// 	logger.ConsumerLog.Errorf("SearchNFInstances failed: %+v", err)
+	// 	return err
+	// }
+	res, err := s.SendSearchNFInstances(s.consumer.Context().NrfUri, targetNfType, requesterNfType, request)
 	if err != nil {
-		return err
-	}
-
-	client := s.getNFDiscoveryClient(s.consumer.Context().NrfUri)
-	// Check data
-	res, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
-	if err != nil {
-		logger.ConsumerLog.Errorf("SearchNFInstances failed: %+v", err)
 		return err
 	}
 
 	// Select CHF from available CHF
-	if res != nil && len(res.SearchResult.NfInstances) > 0 {
-		smContext.SelectedCHFProfile = res.SearchResult.NfInstances[0]
+	if res != nil && len(res.NfInstances) > 0 {
+		smContext.SelectedCHFProfile = res.NfInstances[0]
 		return nil
 	}
 	return fmt.Errorf("no CHF found in CHFSelection")
@@ -426,10 +458,11 @@ func (s *nnrfService) CHFSelection(smContext *smf_context.SMContext) error {
 
 // PCFSelection will select PCF for this SM Context
 func (s *nnrfService) PCFSelection(smContext *smf_context.SMContext) error {
-	ctx, _, errToken := s.consumer.Context().GetTokenCtx(models.ServiceName_NNRF_DISC, "NRF")
-	if errToken != nil {
-		return errToken
-	}
+	// [TYcustom 1124 SMF disccache] token ctx is now obtained inside SendSearchNFInstances.
+	// ctx, _, errToken := s.consumer.Context().GetTokenCtx(models.ServiceName_NNRF_DISC, "NRF")
+	// if errToken != nil {
+	// 	return errToken
+	// }
 	// Send NFDiscovery for find PCF
 	targetNfType := models.NrfNfManagementNfType_PCF
 	requesterNfType := models.NrfNfManagementNfType_SMF
@@ -442,16 +475,28 @@ func (s *nnrfService) PCFSelection(smContext *smf_context.SMContext) error {
 		request.PreferredLocality = &s.consumer.Context().Locality
 	}
 
-	client := s.getNFDiscoveryClient(s.consumer.Context().NrfUri)
-	// Check data
-	res, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// [TYcustom 1124 SMF disccache] was an uncached direct NRF query per session:
+	// client := s.getNFDiscoveryClient(s.consumer.Context().NrfUri)
+	// // Check data
+	// res, err := client.NFInstancesStoreApi.SearchNFInstances(ctx, request)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// // Select PCF from available PCF
+	//
+	// smContext.SelectedPCFProfile = res.SearchResult.NfInstances[0]
+	// Key includes preferred-locality (see SendSearchNFInstances).
+	res, err := s.SendSearchNFInstances(s.consumer.Context().NrfUri, targetNfType, requesterNfType, request)
 	if err != nil {
 		return err
 	}
+	if res == nil || len(res.NfInstances) == 0 {
+		return fmt.Errorf("no PCF found in PCFSelection")
+	}
 
 	// Select PCF from available PCF
-
-	smContext.SelectedPCFProfile = res.SearchResult.NfInstances[0]
+	smContext.SelectedPCFProfile = res.NfInstances[0]
 
 	return nil
 }
