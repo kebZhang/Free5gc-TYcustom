@@ -8,6 +8,7 @@ import (
 	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/pfcp"
+	"github.com/free5gc/pfcp/dnscache" // [DNSCACHE 1124]
 	"github.com/free5gc/pfcp/pfcpType"
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/logger"
@@ -36,6 +37,13 @@ func (p *Processor) ToBeAssociatedWithUPF(smfPfcpContext context.Context, upf *s
 			}
 			keepHeartbeatTo(upf, upfStr)
 			// returns when UPF heartbeat loss is detected or association is canceled
+
+			// [DNSCACHE 1124] heartbeat loss -- including a changed UPF recovery timestamp,
+			// which is not a send failure -- refreshes the DNS cache in the background before
+			// re-associating, so a UPF that came back on a new IP is found within seconds
+			// instead of at the next 1-min refresh (coalesced with the send-failure trigger
+			// in udp.SendPfcpRequestUE).
+			dnscache.RefreshNow()
 
 			p.releaseAllResourcesOfUPF(upf, upfStr)
 		}
@@ -101,6 +109,12 @@ func setupPfcpAssociation(upf *smf_context.UPF, upfStr string) error {
 	if nodeID == nil {
 		return fmt.Errorf("pfcp association needs NodeID")
 	}
+
+	// [DNSCACHE 1124] prewarm the NodeID the UPF reports about itself. It can be a different
+	// string from the configured one (in 1123 one lookup of it cost ~6x the DNS round trips
+	// of the configured name) and would otherwise first be resolved by the first PDU session
+	// (datapath.go establishPfcpSession).
+	_ = nodeID.ResolveNodeIdToIp()
 
 	logger.MainLog.Infof("Received PFCP Association Setup Accepted Response from UPF%s", upfStr)
 	logger.MainLog.Infof("UPF(%s) setup association", upf.NodeID.ResolveNodeIdToIp().String())

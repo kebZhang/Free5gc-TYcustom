@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/free5gc/pfcp"
+	"github.com/free5gc/pfcp/dnscache" // [DNSCACHE 1124]
 	"github.com/free5gc/pfcp/pfcpUdp"
 	smf_context "github.com/free5gc/smf/internal/context"
 	"github.com/free5gc/smf/internal/logger"
@@ -122,7 +123,19 @@ func SendPfcpRequest(sndMsg *pfcp.Message, addr *net.UDPAddr) (rsvMsg *pfcpUdp.M
 // request is for (SUPI, or "" for node-level messages such as heartbeat and
 // association), for the tx line in PFCP_log. With pfcplog off it is exactly the
 // old SendPfcpRequest.
-func SendPfcpRequestUE(sndMsg *pfcp.Message, addr *net.UDPAddr, ueID string) (*pfcpUdp.Message, error) {
+//
+// [DNSCACHE 1124] results are named (was: (*pfcpUdp.Message, error)) so the deferred check
+// below sees the error of every return path.
+func SendPfcpRequestUE(sndMsg *pfcp.Message, addr *net.UDPAddr, ueID string) (rsvMsg *pfcpUdp.Message, err error) {
+	// [DNSCACHE 1124] like Aether's HandlePfcpSendError (pfcp/message/send.go:464): any failed
+	// PFCP request -- retry-out after NumOfResend x 3 s, a write error, or a 0.0.0.0
+	// destination -- triggers one background DNS cache refresh (coalesced, see
+	// SMFUPF_cacheDNS_PLAN1124.md 3.6). Heartbeat requests come through here too.
+	defer func() {
+		if err != nil {
+			dnscache.RefreshNow()
+		}
+	}()
 	if addr.IP.Equal(net.IPv4zero) {
 		return nil, errors.New("no destination IP address is specified")
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/pfcp/dnscache" // [DNSCACHE 1124]
 	"github.com/free5gc/pfcp/pfcpType"
 	"github.com/free5gc/pfcp/pfcpUdp"
 	"github.com/free5gc/smf/internal/logger"
@@ -154,7 +155,11 @@ func (i *UPFInterfaceInfo) IP(pduSessType uint8) (net.IP, error) {
 	}
 
 	if i.EndpointFQDN != "" {
-		if resolvedAddr, err := net.ResolveIPAddr("ip", i.EndpointFQDN); err != nil {
+		// [DNSCACHE 1124] was a DNS query on every call (N3 endpoint: 3 per PDU session, 1123 run):
+		// if resolvedAddr, err := net.ResolveIPAddr("ip", i.EndpointFQDN); err != nil {
+		cachedIP, err := dnscache.Lookup(i.EndpointFQDN)
+		resolvedAddr := &net.IPAddr{IP: cachedIP}
+		if err != nil {
 			logger.CtxLog.Errorf("resolve addr [%s] failed", i.EndpointFQDN)
 		} else {
 			switch pduSessType {

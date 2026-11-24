@@ -11,6 +11,7 @@ import (
 
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/oauth"
+	"github.com/free5gc/pfcp/dnscache" // [DNSCACHE 1124]
 	"github.com/free5gc/pfcp/pfcpType"
 	"github.com/free5gc/smf/internal/logger"
 	"github.com/free5gc/smf/pkg/factory"
@@ -91,11 +92,17 @@ func GenerateChargingID() int32 {
 }
 
 func ResolveIP(host string) net.IP {
-	if addr, err := net.ResolveIPAddr("ip", host); err != nil {
+	// [DNSCACHE 1124] was a DNS query on every call (ExternalIP: 3 per PDU session, 1123 run):
+	// if addr, err := net.ResolveIPAddr("ip", host); err != nil {
+	// 	return nil
+	// } else {
+	// 	return addr.IP
+	// }
+	ip, err := dnscache.Lookup(host)
+	if err != nil {
 		return nil
-	} else {
-		return addr.IP
 	}
+	return ip
 }
 
 func (s *SMFContext) ExternalIP() net.IP {

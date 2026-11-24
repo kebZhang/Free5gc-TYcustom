@@ -1,11 +1,12 @@
 package pfcpType
 
 import (
-	"context"
+	// "context" // [DNSCACHE 1124] only the old per-call LookupHost below used it
 	"errors"
 	"fmt"
 	"net"
 
+	"github.com/free5gc/pfcp/dnscache"
 	"github.com/free5gc/pfcp/logger"
 )
 
@@ -110,12 +111,19 @@ func (n *NodeID) ResolveNodeIdToIp() net.IP {
 	case NodeIdTypeIpv4Address, NodeIdTypeIpv6Address:
 		return n.IP
 	case NodeIdTypeFqdn:
-		if ns, err := net.DefaultResolver.LookupHost(context.Background(), n.FQDN); err != nil {
+		// [DNSCACHE 1124] was a DNS query on every call (19 per PDU session in the SMF, 1123 run):
+		// if ns, err := net.DefaultResolver.LookupHost(context.Background(), n.FQDN); err != nil {
+		// 	logger.PFCPLog.Warnf("Host lookup failed: %+v", err)
+		// 	return net.IPv4zero
+		// } else {
+		// 	return net.ParseIP(ns[0])
+		// }
+		ip, err := dnscache.Lookup(n.FQDN)
+		if err != nil {
 			logger.PFCPLog.Warnf("Host lookup failed: %+v", err)
 			return net.IPv4zero
-		} else {
-			return net.ParseIP(ns[0])
 		}
+		return ip.To16() // same 16-byte form as the old net.ParseIP(ns[0]) (for IPv4 also a fresh copy)
 	default:
 		return net.IPv4zero
 	}

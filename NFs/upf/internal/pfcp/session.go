@@ -6,6 +6,7 @@ import (
 	"github.com/wmnsk/go-pfcp/ie"
 	"github.com/wmnsk/go-pfcp/message"
 
+	"github.com/free5gc/go-upf/internal/dnscache" // [DNSCACHE 1124]
 	"github.com/free5gc/go-upf/internal/report"
 )
 
@@ -84,9 +85,14 @@ func (s *PfcpServer) handleSessionEstablishmentRequest(
 	}
 
 	var v4 net.IP
-	addrv4, err := net.ResolveIPAddr("ip4", s.nodeID)
-	if err == nil {
-		v4 = addrv4.IP.To4()
+	// [DNSCACHE 1124] was one synchronous DNS query per Establishment, on the single PFCP
+	// main goroutine (1123 run: 2.4-3.8 ms of the 3.3-4.9 ms Establishment service time):
+	// addrv4, err := net.ResolveIPAddr("ip4", s.nodeID)
+	// if err == nil {
+	// 	v4 = addrv4.IP.To4()
+	// }
+	if ip, lookupErr := dnscache.Lookup(s.nodeID); lookupErr == nil {
+		v4 = ip.To4()
 	}
 	// TODO: support v6
 	var v6 net.IP

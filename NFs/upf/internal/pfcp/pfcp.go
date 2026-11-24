@@ -12,6 +12,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/wmnsk/go-pfcp/message"
 
+	"github.com/free5gc/go-upf/internal/dnscache" // [DNSCACHE 1124]
 	"github.com/free5gc/go-upf/internal/forwarder"
 	"github.com/free5gc/go-upf/internal/logger"
 	"github.com/free5gc/go-upf/internal/pfcplog" // [PFCPlog 1122]
@@ -246,6 +247,11 @@ func (s *PfcpServer) receiver(wg *sync.WaitGroup) {
 
 func (s *PfcpServer) Start(wg *sync.WaitGroup) {
 	s.log.Infoln("starting pfcp server")
+	// [DNSCACHE 1124] cache the UPF's own nodeID (filled into the UP F-SEID of every Session
+	// Establishment Response, session.go) before the main goroutine starts, and keep it
+	// fresh with the 1-min refresher, which runs on its own goroutine, not the main one.
+	dnscache.Start()
+	dnscache.Prewarm(s.nodeID)
 	wg.Add(1)
 	go s.main(wg)
 	s.log.Infoln("pfcp server started")
