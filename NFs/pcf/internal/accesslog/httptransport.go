@@ -116,7 +116,7 @@ const (
 // readFrameCh capacity of 0, but turns accesslog.Enabled back to true in every
 // instrumented NF (SMF included from then on), so each request carries the
 // full stamp set again.
-const connsPerPeer = 1 // [conn1 1120] was 8 (commit b247426); set back to 8 to restore
+const connsPerPeer = 8 // [conn8 1124] was 1 ([conn1 1120], commit c717d59); set back to 1 to restore
 
 // loggingRoundTripper wraps separate HTTP/2 transports for https (h2) and
 // cleartext (h2c), choosing per request by URL scheme exactly like
